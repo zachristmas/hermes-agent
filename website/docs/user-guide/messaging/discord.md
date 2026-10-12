@@ -847,6 +847,31 @@ Notes:
 - All settings live in `config.yaml` (not `.env`) — they're behavioral, not secrets.
 - When `voice_fx.enabled` is `false`, voice playback uses the original one-shot path and nothing changes.
 
+### Streaming Voice Replies and Barge-In
+
+By default the bot synthesises a whole reply before speaking it. With streaming on, it starts talking as soon as the first sentence is synthesised, and you can interrupt it by speaking.
+
+This is **off by default** and needs a TTS provider that streams (`elevenlabs`, `openai`, `gemini` or `xai`; Edge TTS does not stream). Enable it in `config.yaml`:
+
+```yaml
+discord:
+  voice_streaming:
+    enabled: true
+    buffer_ms: 1000              # audio buffered ahead of playback (100–10000)
+    stall_timeout_seconds: 5     # no playback progress for this long ends the reply
+    producer_timeout_seconds: 60 # no new speech produced for this long ends the reply (1–600)
+    barge_in: true               # speaking over the bot cuts its reply
+    barge_in_ms: 300             # how long you must speak before it stops (60–3000)
+    barge_in_rms: 500            # loudness that counts as speech (50–32767)
+```
+
+Notes:
+- Streaming applies only to the text channel bound to the voice session. Anything it can't stream (provider unavailable, other audio already playing, an unsupported format) falls back to the normal whole-file reply, and a reply that was partly heard is never replayed from the start.
+- With `voice_fx.enabled`, streamed speech plays through the mixer, so the ambient bed and acks keep working.
+- A reply stays open while the agent works between spoken parts (for example a tool call). If no new speech arrives for `producer_timeout_seconds` the streamed reply ends and the rest of that turn is not spoken (it is still posted as text); raise the value if your tools run longer. The gateway also waits for a long reply to finish playing instead of cutting it off ten seconds after the text is complete, so a reply that is still being spoken delays the text answer until it ends.
+- Barge-in honours the same allowlists as voice input (`DISCORD_ALLOWED_USERS` / `DISCORD_ALLOWED_ROLES`). Other people talking, short interjections ("mm-hm") and the bot's own audio never interrupt it. What you said is transcribed as usual and interrupts the agent's turn.
+- Barge-in keeps listening while the bot speaks. If your microphone picks up the bot (speakers without echo cancellation), raise `barge_in_rms` or set `barge_in: false`. Without `voice_fx`, `barge_in: false` also pauses listening while a reply plays, as whole-file replies do.
+
 
 ## Forum Channels
 

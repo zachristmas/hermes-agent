@@ -11,12 +11,13 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 import weakref
 from contextlib import suppress
 from difflib import SequenceMatcher
 from types import SimpleNamespace
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.i18n import t
 from gateway.config import Platform
@@ -53,8 +54,10 @@ class GatewayVoiceMixin:
     def _bind_voice_input_callback(self, adapter) -> None:
         """Route voice transcripts back through the adapter that captured them."""
         if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = functools.partial(
-                self._handle_voice_channel_input, adapter=adapter)
+            async def _dispatch_voice_input(*, on_realtime_event_created=None, **kwargs):
+                return await self._handle_voice_channel_input(
+                    adapter=adapter, on_realtime_event_created=on_realtime_event_created, **kwargs)
+            adapter._voice_input_callback = _dispatch_voice_input
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
@@ -290,7 +293,7 @@ class GatewayVoiceMixin:
         return source
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str, *, adapter=None
+        self, guild_id: int, user_id: int, transcript: str, *, adapter=None, on_realtime_event_created=None
     ):
         """Handle transcribed voice from a voice channel. ``adapter`` captured the audio; under
         multiplexing each profile's bot dispatches through its own adapter, never the default's."""
@@ -351,8 +354,37 @@ class GatewayVoiceMixin:
         event = MessageEvent(
             source=source, text=transcript, message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
-            channel_prompt=channel_prompt, auto_skill=auto_skill)
+            channel_prompt=channel_prompt, auto_skill=auto_skill,
+            # Realtime's generated transcript may not resolve pending gateway controls such as /approve.
+            allow_gateway_control=on_realtime_event_created is None)
+        if on_realtime_event_created is not None:
+            # Preserve the latest regular Discord chat conversation when a Realtime session starts fresh.
+            key_for_source = getattr(self, "_session_key_for_source", None)
+            store = getattr(self, "session_store", None)
+            lookup = getattr(store, "lookup_by_session_key", None)
+            if callable(key_for_source) and callable(lookup):
+                try:
+                    chat_session_key = await asyncio.to_thread(key_for_source, source)
+                    previous = await asyncio.to_thread(lookup, chat_session_key)
+                    previous_id = getattr(previous, "session_id", None)
+                    if previous is not None and previous_id:
+                        event.metadata["gateway_session_key"] = chat_session_key
+                        event.metadata["gateway_session_id"] = str(previous_id)
+                        event.metadata["gateway_session_strict"] = True
+                except Exception:
+                    logger.debug("Could not resolve latest Discord chat session for voice continuity", exc_info=True)
+        # Stable correlation key links this exact dispatched event to its Realtime delegate job.
+        if on_realtime_event_created is not None:
+            event.metadata["realtime_delegate_event_key"] = secrets.token_urlsafe(18)
+            on_realtime_event_created(event)
         await adapter.handle_message(event)
+
+    def _realtime_relays_voice_reply(self, event: MessageEvent, response: Optional[str] = None) -> bool:
+        """Claim/capture audio only for a matching, pending Realtime delegation."""
+        adapter = getattr(self, "_delivery_adapter_for", lambda _source: None)(event.source)
+        if response is None:
+            return getattr(adapter, "_realtime_relays_event", lambda _event: False)(event) is True
+        return getattr(adapter, "_realtime_capture_result", lambda _event, _text: False)(event, response) is True
 
     def _should_send_voice_reply(
         self, event: MessageEvent, response: str, agent_messages: list, already_sent: bool = False

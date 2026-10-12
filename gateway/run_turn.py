@@ -1931,7 +1931,14 @@ class GatewayTurnMixin:
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
-        if not _streaming_tts_done and self._should_send_voice_reply(
+        # Realtime only claims an exact pending delegated event. Capture before normal delivery so
+        # that its session can speak the answer without Hermes emitting a duplicate voice reply.
+        _realtime_relayed = bool(response) and bool(self._realtime_relays_voice_reply(
+            event, "" if response.startswith("Error:") else response,
+        ))
+        if _realtime_relayed:
+            event._realtime_final_response = "" if response.startswith("Error:") else response
+        if not (_streaming_tts_done or _realtime_relayed) and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
             await self._send_voice_reply(event, response)
@@ -2210,6 +2217,7 @@ class GatewayTurnMixin:
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                voice_relay_event=event,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -3227,6 +3235,7 @@ class GatewayTurnMixin:
     def _run_agent_start_streaming_tts(
         self, source: SessionSource, message_type: Optional[str],
         _status_thread_metadata: Optional[Dict[str, Any]], streaming_tts_consumer_holder: list,
+        relay_event: Optional[Any] = None,
     ) -> None:
         """Start the streaming-TTS consumer for a voice-input turn on an auto-TTS chat.
 
@@ -3242,6 +3251,8 @@ class GatewayTurnMixin:
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
         )
         if _stts_adapter is None or not _is_voice_input or not _stts_adapter._should_auto_tts_for_chat(source.chat_id):
+            return
+        if relay_event is not None and self._realtime_relays_voice_reply(relay_event):
             return
         try:
             from gateway.streaming_tts_consumer import StreamingTTSConsumer
@@ -3607,14 +3618,15 @@ class GatewayTurnMixin:
 
     async def _run_agent_finalize_streaming_tts(self, turn_ctx: TurnContext, adapter: Any) -> None:
         """Finalize the streaming-TTS consumer on the outer event-loop thread (covers early returns
-        from run_sync). On drain timeout abort to free the task — audible streams keep whole-file
-        suppression, silent streams stay eligible for the whole-file fallback."""
+        from run_sync). When the drain makes no progress for 10 s abort to free the task — audible
+        streams keep whole-file suppression, silent streams stay eligible for the whole-file fallback."""
         _stts = turn_ctx.streaming_tts_consumer_holder[0]
         if _stts is None:
             return
         _stts.finish()
         try:
-            await _stts.wait_complete(timeout=10.0)
+            # Idle timeout, not a flat one: a real-time sink may still be speaking a long reply.
+            await _stts.wait_while_progressing(idle_timeout=10.0)
         except Exception as _stts_done_err:
             logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
         if not _stts.done:
@@ -4274,6 +4286,7 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        voice_relay_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4319,9 +4332,17 @@ class GatewayTurnMixin:
         )
         # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
         if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
-            self._run_agent_start_streaming_tts(
-                source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
-            )
+            if voice_relay_event is None:
+                self._run_agent_start_streaming_tts(
+                    source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
+                )
+            elif self._realtime_relays_voice_reply(voice_relay_event):
+                # The Realtime session owns this exact delegated turn, so it speaks the captured final reply.
+                pass
+            else:
+                self._run_agent_start_streaming_tts(
+                    source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
+                )
 
         # Progress sender drains BOTH tool-progress lines and thinking bubbles (needs_progress_queue).
         spawn = asyncio.create_task

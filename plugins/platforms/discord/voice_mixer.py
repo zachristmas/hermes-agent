@@ -75,6 +75,49 @@ class MixerChild:
         return samples
 
 
+class StreamChild:
+    """Speech child fed live from a ``voice_stream.FrameQueue``: silence while the writer is
+    behind (the duck holds), None once the queue is drained or cut."""
+
+    __slots__ = ("_frames", "gain")
+
+    def __init__(self, frames, *, gain: float = 1.0):
+        self._frames, self.gain = frames, float(gain)
+
+    def drop(self) -> None:
+        """Removed from the mix before its turn ended: end the turn so its writer stops."""
+        if not self._frames.finished:
+            self._frames.cut("player-stopped")
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        frame = self._frames.read()
+        if frame is None:
+            return None
+        np = _require_numpy()
+        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+        return samples * self.gain if self.gain != 1.0 else samples
+
+
+class StreamSource(discord.AudioSource):
+    """A streaming-TTS turn as the VoiceClient's only source (no mixer installed). ``read`` returns
+    b"" once the turn is over, which ends discord.py's player and fires its ``after`` callback."""
+
+    def __init__(self, frames):
+        self.frames = frames
+
+    def is_opus(self) -> bool:  # pragma: no cover - trivial
+        return False
+
+    def read(self) -> bytes:
+        return self.frames.read() or b""
+
+    def cleanup(self) -> None:
+        # Stopped from outside (vc.stop) before the turn ended: drop the rest instead of
+        # buffering audio no player will ever pull.
+        if not self.frames.finished:
+            self.frames.cut("player-stopped")
+
+
 class VoiceMixer(discord.AudioSource):
     """Continuous ``discord.AudioSource`` mixing N children: :meth:`set_ambient` installs the
     looping idle bed, :meth:`play_speech` layers a one-shot clip over it (ducking the bed).
@@ -105,14 +148,26 @@ class VoiceMixer(discord.AudioSource):
             gain_now = self._duck_gain if self._speech_active else self._ambient_gain
             self._ambient = MixerChild(pcm, loop=True, gain=gain_now, fade_in_ms=200)
 
-    def play_speech(self, pcm: bytes, *, gain: Optional[float] = None, fade_in_ms: int = 40) -> None:
-        """Layer a one-shot speech clip over the ambient bed (ducks ambient)."""
+    def play_speech(self, pcm: bytes, *, gain: Optional[float] = None, fade_in_ms: int = 40):
+        """Layer a one-shot speech clip over the ambient bed (ducks ambient). Returns the clip's
+        child (None for empty audio): pass it to :meth:`speech_playing` / :meth:`stop_speech` to
+        wait on or stop just this clip."""
         if not pcm:
-            return
+            return None
+        child = MixerChild(
+            pcm, gain=self._speech_gain if gain is None else float(gain), fade_in_ms=fade_in_ms,
+        )
+        self._add_speech(child)
+        return child
+
+    def play_speech_stream(self, frames, *, gain: Optional[float] = None) -> None:
+        """Layer live streaming speech (a ``voice_stream.FrameQueue``) over the bed; it leaves the
+        mix when the queue ends or is cut, without disturbing other speech or the ambient bed."""
+        self._add_speech(StreamChild(frames, gain=self._speech_gain if gain is None else float(gain)))
+
+    def _add_speech(self, child) -> None:
         with self._lock:
-            self._speech.append(MixerChild(
-                pcm, gain=self._speech_gain if gain is None else float(gain), fade_in_ms=fade_in_ms,
-            ))
+            self._speech.append(child)
             self._speech_active = True
             self._duck_release_left = 0
             if self._ambient is not None:
@@ -123,11 +178,30 @@ class VoiceMixer(discord.AudioSource):
         with self._lock:
             return self._speech_active
 
-    def stop_speech(self) -> None:
-        """Drop any in-flight speech immediately and release the duck."""
+    def speech_playing(self, child) -> bool:
+        """True while *child* (from :meth:`play_speech`) is still in the mix."""
         with self._lock:
-            self._speech.clear()
-            self._begin_duck_release_locked()
+            return child is not None and any(c is child for c in self._speech)
+
+    def stop_speech(self, child=None) -> None:
+        """Drop *child* (from :meth:`play_speech`) immediately, or with no argument all in-flight
+        speech, streamed turns included. The duck is released once no speech is left."""
+        with self._lock:
+            if child is None:
+                self._drop_speech_locked()
+            else:
+                for c in [c for c in self._speech if c is child]:
+                    if isinstance(c, StreamChild):
+                        c.drop()
+                    self._speech.remove(c)
+            if not self._speech:
+                self._begin_duck_release_locked()
+
+    def _drop_speech_locked(self) -> None:
+        for child in self._speech:
+            if isinstance(child, StreamChild):
+                child.drop()
+        self._speech.clear()
 
     def _begin_duck_release_locked(self) -> None:
         self._speech_active = False
@@ -173,7 +247,7 @@ class VoiceMixer(discord.AudioSource):
         with self._lock:
             self._closed = True
             self._ambient = None
-            self._speech.clear()
+            self._drop_speech_locked()
 
 
 def decode_to_pcm(path: str, *, timeout: float = 30.0) -> Optional[bytes]:

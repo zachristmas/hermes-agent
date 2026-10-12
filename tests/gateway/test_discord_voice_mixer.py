@@ -98,15 +98,14 @@ class TestPlayInVoiceChannelMixerPath:
         vc.is_connected.return_value = True
         adapter._voice_clients[111] = vc
 
-        # speech_active returns True once (so play_speech is observed) then
+        # speech_playing returns True once (so play_speech is observed) then
         # False so the wait loop exits promptly.
         class _Mixer:
             def __init__(self):
                 self._polls = 0
                 self.play_speech = MagicMock()
 
-            @property
-            def speech_active(self):
+            def speech_playing(self, clip):
                 self._polls += 1
                 return self._polls <= 1
 
