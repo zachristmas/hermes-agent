@@ -288,7 +288,7 @@ class GatewayVoiceDelegate:
             try:
                 await asyncio.wait_for(asyncio.shield(job.started), cfg.delegate_admit_s)
             except asyncio.TimeoutError:
-                return DelegationResult("not-admitted", delivered_by="hermes")
+                return DelegationResult("not-admitted", delivered_by="voice")
             try:
                 ok = await asyncio.wait_for(asyncio.shield(job.done), cfg.delegate_slot_max_s)
             except asyncio.TimeoutError:

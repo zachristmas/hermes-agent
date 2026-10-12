@@ -699,7 +699,7 @@ async def test_gateway_delegate_uses_the_spoken_input_entry_and_completion_hook(
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
     result = await asyncio.wait_for(job, 1)
     assert result.status == "done" and result.delivered_by == "hermes"
-    assert adapter._realtime_pending_jobs[GUILD] == []
+    assert adapter._realtime_pending_jobs.get(GUILD, []) == []
 
 
 @pytest.mark.asyncio
@@ -893,7 +893,7 @@ async def test_a_request_hermes_silently_drops_frees_the_slot_and_is_reported(ma
             break
     await asyncio.sleep(0)
     assert done[0].status == "not-admitted" and done[0].delivered_by == "voice"
-    assert bridge.inflight == 0 and adapter._realtime_pending_jobs[GUILD] == []
+    assert bridge.inflight == 0 and adapter._realtime_pending_jobs.get(GUILD, []) == []
     assert bridge.submit(GUILD, ALLOWED_USER, "and tomorrow")["status"] == "started"
 
 
@@ -915,7 +915,7 @@ async def test_an_admitted_job_releases_its_slot_at_the_hard_cap(make_rt_adapter
         await adapter.on_processing_start(event)            # Hermes admitted it ...
     result = await asyncio.wait_for(job, 1)                 # ... and never finished (e.g. approval wait)
     assert result.status == "timeout" and result.delivered_by == "hermes"
-    assert adapter._realtime_pending_jobs[GUILD] == []
+    assert adapter._realtime_pending_jobs.get(GUILD, []) == []
 
 
 @pytest.mark.asyncio
