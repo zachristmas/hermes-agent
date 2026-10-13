@@ -290,10 +290,13 @@ class GatewayVoiceMixin:
         return source
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str, *, adapter=None
+        self, guild_id: int, user_id: int, transcript: str, *, adapter=None,
+        resume_chat_session: bool = False, on_event_created=None,
     ):
         """Handle transcribed voice from a voice channel. ``adapter`` captured the audio; under
-        multiplexing each profile's bot dispatches through its own adapter, never the default's."""
+        multiplexing each profile's bot dispatches through its own adapter, never the default's.
+        ``resume_chat_session`` pins the event to the text channel's latest conversation;
+        ``on_event_created(event)`` runs on the built event just before it is dispatched."""
         if adapter is None:
             adapter = self.adapters.get(Platform.DISCORD)
         text_ch_id = adapter._voice_text_channels.get(guild_id) if adapter else None
@@ -352,6 +355,23 @@ class GatewayVoiceMixin:
             source=source, text=transcript, message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt, auto_skill=auto_skill)
+        if resume_chat_session:
+            key_for_source = getattr(self, "_session_key_for_source", None)
+            store = getattr(self, "session_store", None)
+            lookup = getattr(store, "lookup_by_session_key", None)
+            if callable(key_for_source) and callable(lookup):
+                try:
+                    chat_session_key = await asyncio.to_thread(key_for_source, source)
+                    previous = await asyncio.to_thread(lookup, chat_session_key)
+                    previous_id = getattr(previous, "session_id", None)
+                    if previous is not None and previous_id:
+                        event.metadata["gateway_session_key"] = chat_session_key
+                        event.metadata["gateway_session_id"] = str(previous_id)
+                        event.metadata["gateway_session_strict"] = True
+                except Exception:
+                    logger.debug("Could not resolve latest Discord chat session for voice continuity", exc_info=True)
+        if on_event_created is not None:
+            on_event_created(event)
         await adapter.handle_message(event)
 
     def _should_send_voice_reply(

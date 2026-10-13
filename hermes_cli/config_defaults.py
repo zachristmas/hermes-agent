@@ -1617,6 +1617,13 @@ DEFAULT_CONFIG = {
                 "On it.",
             ],
         },
+        # Opt-in streaming TTS in voice channels (needs elevenlabs/openai/gemini/xai TTS, else whole-file).
+        # buffer_ms 100-10000; stall_timeout_seconds without playback progress ends the reply;
+        # producer_timeout_seconds (1-600) with no new audio queued (e.g. a long tool call) ends it too;
+        # barge_in: an allowed user speaking barge_in_ms (60-3000) at >= barge_in_rms (50-32767) cuts it.
+        "voice_streaming": {"enabled": False, "buffer_ms": 1000, "stall_timeout_seconds": 5,
+                            "producer_timeout_seconds": 60,
+                            "barge_in": True, "barge_in_ms": 300, "barge_in_rms": 500},
     },
 
     "whatsapp": {

@@ -31,6 +31,8 @@ class _HandleDeclined(Exception):
 class StreamingTTSConsumer:
     """Consumes LLM text deltas and produces streaming PCM audio for an adapter."""
 
+    _progress = 0  # clauses started + chunks written: lets a finaliser tell "slow" from "stuck"
+
     def __init__(self, adapter: Any, chat_id: str, tts_config: dict[str, Any],
                  loop: asyncio.AbstractEventLoop, *, metadata: Optional[dict[str, Any]] = None,
                  audio_format: Optional[AudioFormat] = None) -> None:
@@ -61,6 +63,7 @@ class StreamingTTSConsumer:
     dropped = property(lambda self: self._dropped)  # queue saturation dropped >= 1 clause
     suppress_whole_file = property(lambda self: self._suppress_whole_file)  # skip whole-file TTS
     done = property(lambda self: self._task is not None and self._task.done())  # drain task ended
+    progress = property(lambda self: self._progress)  # grows while clauses are synthesised/written
 
     def _enqueue_clauses(self, clauses, full_msg: str, *, log_errors: bool) -> None:
         try:
@@ -192,6 +195,7 @@ class StreamingTTSConsumer:
                 self._strip_markdown = lambda t: t
         if not (cleaned := self._strip_markdown(clause).strip()):
             return
+        self._progress += 1
         iterator = iter(self._streamer.stream(cleaned))
         while True:
             # next() runs in a thread so a blocking provider never stalls the loop.
@@ -204,6 +208,7 @@ class StreamingTTSConsumer:
                 raise _HandleDeclined()
             was_audible = self._handle.audible
             await self._adapter.write_streaming_tts(self._handle, chunk)
+            self._progress += 1
             if not was_audible:
                 self._handle.audible = self._suppress_whole_file = True
 
@@ -230,6 +235,23 @@ class StreamingTTSConsumer:
         if self._handle is not None and not self._handle.aborted:
             with contextlib.suppress(Exception):
                 self._loop.call_soon_threadsafe(asyncio.create_task, self._safe_abort(reason))
+
+    async def wait_while_progressing(self, idle_timeout: float = 10.0) -> bool:
+        """Like :meth:`wait_complete`, but ``idle_timeout`` is time *without progress*: it restarts
+        whenever a clause starts or a chunk is written. A real-time sink (a voice channel) plays a
+        long reply for as long as the reply lasts, so a flat timeout would cut it off mid-sentence;
+        a drain task that stops making progress still times out. Never cancels the task."""
+        if self._task is None:
+            return self._completed
+        clock = self._loop.time
+        seen, deadline = self._progress, clock() + idle_timeout
+        while not self._task.done():
+            await asyncio.wait({self._task}, timeout=min(0.25, idle_timeout))
+            if self._progress != seen:
+                seen, deadline = self._progress, clock() + idle_timeout
+            elif clock() >= deadline:
+                break
+        return self._completed
 
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""

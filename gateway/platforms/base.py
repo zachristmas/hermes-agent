@@ -2145,6 +2145,11 @@ class BasePlatformAdapter(ABC):
     fatal_error_code = property(lambda self: self._fatal_error_code)
     fatal_error_retryable = property(lambda self: self._fatal_error_retryable)
 
+    def claim_voice_reply(self, event: MessageEvent, text: str) -> bool:
+        """True when this adapter speaks the final reply ``text`` for ``event`` itself, so the gateway
+        skips its own voice reply for that turn."""
+        return False
+
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
         """Whether auto-TTS fires for ``chat_id``: explicit ``/voice on|tts`` wins,
         then explicit ``/voice off``, then the global ``voice.auto_tts`` default.

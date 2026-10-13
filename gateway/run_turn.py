@@ -1931,7 +1931,9 @@ class GatewayTurnMixin:
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
-        if not _streaming_tts_done and self._should_send_voice_reply(
+        # An adapter may speak this reply itself (``claim_voice_reply``); then no second voice reply.
+        _voice_claimed = bool(response) and adapter is not None and adapter.claim_voice_reply(event, response)
+        if not (_streaming_tts_done or _voice_claimed) and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
             await self._send_voice_reply(event, response)
@@ -3607,14 +3609,15 @@ class GatewayTurnMixin:
 
     async def _run_agent_finalize_streaming_tts(self, turn_ctx: TurnContext, adapter: Any) -> None:
         """Finalize the streaming-TTS consumer on the outer event-loop thread (covers early returns
-        from run_sync). On drain timeout abort to free the task — audible streams keep whole-file
-        suppression, silent streams stay eligible for the whole-file fallback."""
+        from run_sync). When the drain makes no progress for 10 s abort to free the task — audible
+        streams keep whole-file suppression, silent streams stay eligible for the whole-file fallback."""
         _stts = turn_ctx.streaming_tts_consumer_holder[0]
         if _stts is None:
             return
         _stts.finish()
         try:
-            await _stts.wait_complete(timeout=10.0)
+            # Idle timeout, not a flat one: a real-time sink may still be speaking a long reply.
+            await _stts.wait_while_progressing(idle_timeout=10.0)
         except Exception as _stts_done_err:
             logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
         if not _stts.done:

@@ -704,7 +704,7 @@ class VoiceReceiver:
     """Captures voice audio from a Discord voice channel: hooks the VoiceClient socket, decrypts
     RTP (NaCl + DAVE E2EE), decodes Opus per user; a polling loop delivers utterances on silence."""
 
-    SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
+    SILENCE_THRESHOLD = 0.8    # seconds of silence → end of utterance
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
@@ -737,6 +737,7 @@ class VoiceReceiver:
         self._decoders: dict[int, object] = {}
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
+        self.frame_sink = lambda user_id, pcm: None  # decoded 20 ms frames (streaming barge-in)
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
 
@@ -1096,11 +1097,13 @@ class VoiceReceiver:
             with self._lock:
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
+                speaker = self._ssrc_to_user.get(ssrc, 0)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
             return
+        self.frame_sink(speaker, pcm)
 
     # --- Silence detection ---
 
@@ -1260,10 +1263,14 @@ def _read_discord_prompt_timeout() -> int:
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
 from plugins.platforms.discord.adapter_slash_auth import DiscordSlashAuthMixin
 from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesMixin, SemanticThreadRenames
+from plugins.platforms.discord.adapter_voice_config import DiscordVoiceConfigMixin
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
+from plugins.platforms.discord.adapter_voice_stream import DiscordVoiceStreamMixin
+from plugins.platforms.discord.adapter_realtime_voice import DiscordRealtimeVoiceMixin
 
 
 class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin, DiscordSlashAuthMixin,
+                     DiscordVoiceConfigMixin, DiscordVoiceStreamMixin, DiscordRealtimeVoiceMixin,
                      BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
@@ -1325,6 +1332,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         self._voice_mixers: dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: dict[str, Any] = self._load_voice_fx_config()
+        self._init_voice_streaming()  # opt-in streaming TTS + barge-in (adapter_voice_stream.py)
+        self._init_realtime_voice()  # opt-in full-duplex realtime voice (adapter_realtime_voice.py)
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
         self._threads = ThreadParticipationTracker("discord")
         self._semantic_thread_renames = SemanticThreadRenames()
@@ -2266,9 +2275,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 for command in tree.get_commands()
             ]
         desired.sort(key=lambda item: (item.get("type", 1), item.get("name", "")))
-        # Descriptions are baked into Discord at sync time, so the language is part of the identity:
-        # a display.language change must re-sync even if the texts happened to be identical.
-        payload = json.dumps({"language": get_language(), "commands": desired}, sort_keys=True, separators=(",", ":"))
+        payload = json.dumps(
+            {"language": get_language(), "commands": desired,
+             "realtime_voice_feature_enabled": bool(getattr(getattr(self, "_realtime_cfg", None), "enabled", False))},
+            sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _command_sync_skip_reason(self, app_id: Any, fingerprint: str) -> Optional[str]:
@@ -3230,6 +3240,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
+        self._realtime_note_processing_start(event)
         message = event.raw_message
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
@@ -3239,6 +3250,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
+        self._realtime_note_processing_complete(event, outcome == ProcessingOutcome.SUCCESS)
         if not self._reactions_enabled():
             return
         message = event.raw_message
@@ -3633,61 +3645,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     # --- Voice channel methods (join / leave / play) ---
 
-    def _load_voice_fx_config(self) -> dict[str, Any]:
-        """Read ``discord.voice_fx`` from config.yaml (not .env; off by default) with safe defaults."""
-        defaults: dict[str, Any] = {
-            "enabled": False,        # master switch for the mixer subsystem
-            "ambient_enabled": True, # idle "thinking" bed while tools run
-            "ambient_path": "",      # optional custom loop file; "" = synthesised
-            "ambient_gain": 0.18,    # idle bed loudness (0..1)
-            "duck_gain": 0.06,       # ambient loudness while speech plays
-            "speech_gain": 1.0,      # TTS / ack loudness
-            "lead_silence_ms": 200,  # silence prepended to each clip so the
-                                     # voice socket's warm-up doesn't clip the first word
-            "ack_enabled": True,     # speak a short phrase before tool calls
-            "ack_phrases": None,     # None = the localized defaults (``_default_voice_ack_phrases``)
-        }
-        try:
-            from hermes_cli.config import read_raw_config
-            cfg = read_raw_config() or {}
-            fx = ((cfg.get("discord") or {}).get("voice_fx") or {})
-            if isinstance(fx, dict):
-                for k, v in fx.items():
-                    if k in defaults and v is not None:
-                        defaults[k] = v
-        except Exception as e:
-            logger.debug("Could not load discord.voice_fx config: %s", e)
-        return defaults
-
-    def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
-        """Read a non-secret integer from the top-level ``discord`` config."""
-        try:
-            from hermes_cli.config import read_raw_config
-            cfg = read_raw_config() or {}
-            raw = (cfg.get("discord") or {}).get(key, default)
-            value = int(raw)
-            return max(minimum, value)
-        except Exception as e:
-            logger.debug("Could not load discord.%s config: %s", key, e)
-            return default
-
-    def _load_voice_timeout(self) -> int:
-        """Return voice-channel inactivity timeout seconds; 0 disables it."""
-        return self._load_discord_int_config(
-            "voice_channel_inactivity_timeout_seconds", self.VOICE_TIMEOUT, minimum=0,
-        )
-
-    def _load_playback_timeout(self) -> int:
-        """Return minimum playback wait seconds for Discord VC audio."""
-        return self._load_discord_int_config(
-            "voice_playback_timeout_seconds", self.PLAYBACK_TIMEOUT, minimum=1,
-        )
-
     def _voice_timeout_limit(self) -> int:
         return int(getattr(self, "_voice_timeout_seconds", self.VOICE_TIMEOUT))
 
     def _playback_timeout_limit(self) -> int:
         return int(getattr(self, "_playback_timeout_seconds", self.PLAYBACK_TIMEOUT))
+
 
     def _probe_audio_duration_seconds(self, audio_path: str) -> Optional[float]:
         """Best-effort audio duration probe used to size playback timeouts."""
@@ -3851,6 +3814,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             self._bind_voice_text_channel(guild_id, text_channel_id, source)
             try:
                 receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver.frame_sink = self._voice_frame_sink(guild_id)
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -3869,10 +3833,13 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            await self._close_voice_stream(guild_id, "left")
+            realtime_was_active = self.realtime_voice_active(guild_id)
+            await self.stop_realtime_voice(guild_id, "left")
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
             if receiver:
-                pending_inputs = receiver.flush_pending()
+                pending_inputs = [] if realtime_was_active else receiver.flush_pending()
                 receiver.stop()
             listen_task = self._voice_listen_tasks.pop(guild_id, None)
             if listen_task:
@@ -3907,6 +3874,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             return False
         # Playback counts as activity: suspend the inactivity timer, re-arm in finally.
         self._cancel_voice_timeout(guild_id)
+        # A Hermes reply owns the floor, also during realtime: cut realtime audio and release only
+        # its own direct source before the legacy player claims VoiceClient (mixer speech needs only
+        # its queue cut). Realtime stays silent until the finally below hands the floor back.
+        await self._realtime_hermes_floor(guild_id, True)
         try:
             playback_timeout = await self._playback_timeout_for_audio(audio_path)
             # ── Mixer path (overlap + ducking) ──────────────────────────────
@@ -3916,19 +3887,23 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
                 if pcm:
                     speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
-                    mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
-                    # Block until speech drains so callers serialise replies; ambient keeps playing.
+                    clip = mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
+                    # Block until this clip drains so callers serialise replies; ambient keeps playing.
+                    # The wait and its timeout are scoped to this clip: a streamed turn sharing the
+                    # mixer is sized by its own stall timeout and must never be stopped from here.
                     wait_start = time.monotonic()
-                    while mixer.speech_active:
+                    while mixer.speech_playing(clip):
                         if time.monotonic() - wait_start > playback_timeout:
                             logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
-                            mixer.stop_speech()
+                            mixer.stop_speech(clip)
                             break
                         await asyncio.sleep(0.05)
                     return True
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
             # Legacy one-shot path: pause receiver while playing (echo prevention).
             receiver = self._voice_receivers.get(guild_id)
+            if self.realtime_voice_active(guild_id):
+                receiver = None  # full duplex: keep listening (realtime barge-in) during playback
             if receiver:
                 receiver.pause()
             try:
@@ -3970,6 +3945,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 if receiver:
                     receiver.resume()
         finally:
+            await self._realtime_hermes_floor(guild_id, False)
             self._reset_voice_timeout(guild_id)
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
@@ -4069,6 +4045,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                             vc._connection.send_packet(b'\xf8\xff\xfe')
                     except Exception:
                         pass
+                if self.realtime_voice_active(guild_id):
+                    receiver.discard_pending()  # realtime answers speech itself; no second STT turn
+                    continue
                 completed = receiver.check_silence()
                 # Each utterance keeps the binding it was collected under, not one set during an earlier STT.
                 captured_for = self._voice_text_channels.get(guild_id)
@@ -4622,6 +4601,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         if not self._client:
             return
         tree = self._client.tree
+        # Dedicated authenticated control path; never route this through generic slash dispatch.
+        self._register_realtime_voice_slash(tree)
         for name, description, args, template, followup in _native_slash_commands():
             if template is None:
                 self._register_thread_slash(tree, name, description)
