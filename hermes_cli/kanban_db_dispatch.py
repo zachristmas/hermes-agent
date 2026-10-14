@@ -1784,6 +1784,43 @@ def dispatch_profile_allowlist_summary() -> str:
             "profile, or the config could not be read — omit the key to allow any)")
 
 
+def _direct_herdr_dispatch_boards() -> frozenset:
+    """Boards opted into the direct-Herdr bridge worker (``kanban.direct_herdr_dispatch_boards``,
+    card t_cb0795f9).
+
+    The fail direction is the OPPOSITE of ``_dispatch_profile_allowlist``: there, "can't tell"
+    must mean "claim nothing" (fail-closed on a claim-widening question). Here, "can't tell" must
+    mean "use the existing worker argv" — an unreadable config must never silently switch a board
+    onto a path that drives external Herdr panes and coding agents. Absent, empty, or unreadable
+    all resolve to the empty set.
+    """
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+    except Exception as exc:
+        _kb._log.warning(
+            "kanban: could not read kanban.direct_herdr_dispatch_boards (%s: %s) — "
+            "every board keeps the existing worker argv until the config is readable",
+            type(exc).__name__, exc,
+        )
+        return frozenset()
+    if not isinstance(kanban, Mapping):
+        return frozenset()
+    raw = kanban.get("direct_herdr_dispatch_boards")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return frozenset()
+    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    return frozenset(
+        slug for slug in (_kb._normalize_board_slug(n) or n.strip() or None for n in names) if slug
+    )
+
+
+def _board_uses_direct_herdr_dispatch(board: Optional[str]) -> bool:
+    """True when ``board`` (or the current board, if None) opted into the direct-Herdr bridge."""
+    slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    return slug in _direct_herdr_dispatch_boards()
+
+
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
@@ -2748,6 +2785,21 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
 
 
+def _direct_herdr_worker_argv() -> list[str]:
+    """Build the direct-Herdr bridge worker command (titan-only opt-in, card t_cb0795f9).
+
+    This is the board-gated alternative to ``_worker_argv``: instead of the usual worker command,
+    it runs a small synchronous bridge (``hermes_cli.kanban_direct_herdr_worker``) that drives a
+    Herdr pane + coding agent itself per the herdr-dispatch skill's playbook, then marks the card
+    and exits. Every env var ``_default_spawn`` already sets (HERMES_KANBAN_TASK/WORKSPACE/
+    BOARD/BRANCH/RUN_ID/CLAIM_LOCK, HERMES_HOME/HERMES_PROFILE, ...) still reaches this child
+    unchanged — only this argv differs from ``_worker_argv``'s. ``_propagate_module_import_root``
+    pins the package root on PYTHONPATH for any ``-m hermes_cli.<module>`` child, this one
+    included.
+    """
+    return [sys.executable, "-m", "hermes_cli.kanban_direct_herdr_worker"]
+
+
 def _open_worker_log(task: Task, board: Optional[str]):
     """Append-mode per-task log (a re-run on unblock appends, never overwrites),
     rotated first. Anchored at the board root (not the shared kanban root) so
@@ -2907,7 +2959,16 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    if _board_uses_direct_herdr_dispatch(board):
+        # Titan-only opt-in (card t_cb0795f9): swap the usual worker argv for the direct-Herdr
+        # bridge. Everything above this line (profile env, secret scrubbing, HERMES_KANBAN_* vars,
+        # log file) and everything below it (PID tracking, restart-safe wrapping, Popen) is
+        # unchanged — only the argv and these two extra env vars differ.
+        env["HERMES_KANBAN_HERDR_MODEL"] = task.model_override or "claude-sonnet-5-5"
+        env["HERMES_KANBAN_HERDR_EFFORT"] = task.reasoning_effort or "medium"
+        cmd = _direct_herdr_worker_argv()
+    else:
+        cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # The worker is `-m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
     # bootstrap. The routed-profile scrub above strips Hermes-owned PYTHONPATH entries (user
     # children must not see our tree), so a PYTHONPATH-launched dispatcher spawned a child that
