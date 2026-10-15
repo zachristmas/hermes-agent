@@ -23,10 +23,6 @@ class EnvVarUpdate(BaseModel):
     # xAI...) then still counts as a provider setup in shared metrics.
     provider_setup: bool = False
 
-class HerdrReopenBody(BaseModel):
-    target: str
-    machine: Optional[str] = None
-
 class EnvVarDelete(BaseModel):
     key: str
     profile: Optional[str] = None

@@ -754,14 +754,6 @@ class GatewaySlashCommandsMixin(
                 msg += "\n" + t(i18n_key, files=", ".join(files[:5]) + more)
         return msg
 
-    async def _handle_herdr_command(self, event: MessageEvent) -> str:
-        """Handle /herdr close|reopen|list from chat/Discord/etc -- close a Herdr agent's pane
-        while recording enough to reopen the same session later, including cross-machine via
-        --machine (see hermes_cli/herdr_pane_lifecycle.py). Synchronous Herdr CLI calls run in a
-        thread so this coroutine never blocks the gateway's event loop."""
-        from hermes_cli.herdr_slash import dispatch_herdr_slash
-        return await asyncio.to_thread(dispatch_herdr_slash, event.get_command_args())
-
     async def _handle_diff_command(self, event: MessageEvent) -> str:
         """Handle /diff — show git changes in the working directory.  Diff body is truncated hard
         here (chat is not a pager); platform senders clamp further."""

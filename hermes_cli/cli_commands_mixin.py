@@ -523,7 +523,7 @@ _BROWSER_SUBCOMMANDS = {
 
 
 class CLICommandsMixin(CLICommandsSessionToolsMixin):
-    """Mixin holding the interactive-CLI slash-command handlers."""; from hermes_cli.herdr_slash import handle_cli_command as _handle_herdr_command  # body: herdr_slash.py
+    """Mixin holding the interactive-CLI slash-command handlers."""
 
     # ---- /rollback ------------------------------------------------------------------------
     def _checkpoint_manager(self, disabled_lines):
