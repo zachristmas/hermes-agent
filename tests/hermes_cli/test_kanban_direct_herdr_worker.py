@@ -127,7 +127,10 @@ if a[:2] == ["agent", "start"]:
     sys.stderr.write(json.dumps({"error": {"code": "agent_not_ready", "message": "input not confirmed"}}))
     sys.exit(1)
 elif a[:2] == ["agent", "get"]:
-    print(json.dumps({"result": {"agent": {}}}))
+    # Verified live (herdr 0.9.3): a truly missing agent is this structured error, not an empty
+    # agent object -- see test_agent_status_reports_empty_for_a_truly_missing_agent_rather_than_raising.
+    sys.stderr.write(json.dumps({"error": {"code": "agent_not_found", "message": "agent target titan-t_x not found"}}))
+    sys.exit(1)
 '''
 
 _AGENT_BLOCKED_ON_PROMPT_STUB = _STUB_PRELUDE + r'''
@@ -391,6 +394,43 @@ def test_agent_not_ready_is_fatal_when_agent_is_truly_absent(tmp_path, monkeypat
         bridge.start_agent("titan-t_x", "w1:p2", "claude-sonnet-5-5", "medium")
 
 
+_AGENT_NOT_READY_EMPTY_STATUS_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "start"]:
+    sys.stderr.write(json.dumps({"error": {"code": "agent_not_ready", "message": "input not confirmed"}}))
+    sys.exit(1)
+elif a[:2] == ["agent", "get"]:
+    # The agent genuinely exists (pane_id present, matching) but its status field is empty --
+    # agent_status() alone can't tell this apart from "doesn't exist" (both read as falsy).
+    print(json.dumps({"result": {"agent": {"agent_status": "", "pane_id": "w1:p2"}}}))
+'''
+
+
+def test_agent_not_ready_is_not_fatal_when_agent_exists_with_an_empty_status(tmp_path, monkeypatch):
+    """An existing agent with an empty/unrecognized status field is not the same thing as no agent
+    at all -- agent_status()'s single falsy return conflates the two, so this must go through the
+    existence-aware _agent_info check instead, not agent_status()."""
+    _stub(tmp_path, monkeypatch, _AGENT_NOT_READY_EMPTY_STATUS_STUB)
+    bridge.start_agent("titan-t_x", "w1:p2", "claude-sonnet-5-5", "medium")  # must not raise
+
+
+_AGENT_NOT_READY_WRONG_PANE_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "start"]:
+    sys.stderr.write(json.dumps({"error": {"code": "agent_not_ready", "message": "input not confirmed"}}))
+    sys.exit(1)
+elif a[:2] == ["agent", "get"]:
+    # A same-named agent exists, but in a DIFFERENT pane than the one just created here.
+    print(json.dumps({"result": {"agent": {"agent_status": "idle", "pane_id": "w9:p9"}}}))
+'''
+
+
+def test_agent_not_ready_is_fatal_when_the_same_named_agent_is_in_a_different_pane(tmp_path, monkeypatch):
+    """A name match isn't a pane match -- this bridge tracks state by pane_id, so a same-named
+    agent reported in some other pane isn't this card's agent and must not be silently adopted."""
+    _stub(tmp_path, monkeypatch, _AGENT_NOT_READY_WRONG_PANE_STUB)
+    with pytest.raises(bridge.BridgeError, match="not the pane just created"):
+        bridge.start_agent("titan-t_x", "w1:p2", "claude-sonnet-5-5", "medium")
+
+
 _START_TIMEOUT_BUT_AGENT_EXISTS_STUB = _STUB_PRELUDE + r'''
 if a[:2] == ["workspace", "list"]:
     print(json.dumps({"result": {"workspaces": [{"label": "titan", "workspace_id": "wTitan"}]}}))
@@ -586,6 +626,48 @@ def test_settle_and_close_reports_pane_preserved_when_close_itself_fails(tmp_pat
     assert success is True
     assert pane_preserved is True
     assert report == "done"
+
+
+def test_annotate_preserved_pane_surfaces_the_signal_only_on_a_preserved_success():
+    """Computing pane_preserved and then dropping it on the floor would make all of
+    _settle_and_close's TOCTOU/close-failure handling pointless -- nothing downstream (the card
+    summary a human reads) would ever learn the pane needs a look."""
+    assert bridge._annotate_preserved_pane(True, "report body", False) == "report body"
+    assert bridge._annotate_preserved_pane(False, "report body", True) == "report body"
+    annotated = bridge._annotate_preserved_pane(True, "report body", True)
+    assert "report body" in annotated
+    assert "manual follow-up" in annotated.lower()
+
+
+_REUSE_CLOSE_FAILS_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "list"]:
+    print(json.dumps({"result": {"agents": [{"name": "titan-t_cb0795f9", "pane_id": "w1:p9", "agent_status": "working"}]}}))
+elif a[:2] == ["pane", "report-metadata"]:
+    pass
+elif a[:2] == ["pane", "get"]:
+    print(json.dumps({"result": {"pane": {"tokens": {"kanban_task": "t_cb0795f9", "kanban_board": "titan"}}}}))
+elif a[:2] == ["agent", "wait"]:
+    print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+elif a[:2] == ["agent", "get"]:
+    print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+elif a[:2] == ["agent", "read"]:
+    print(json.dumps({"result": {"text": "Card done: fixed the thing."}}))
+elif a[:2] == ["pane", "close"]:
+    sys.stderr.write(json.dumps({"error": {"code": "pane_close_failed", "message": "herdr could not close the pane"}}))
+    sys.exit(1)
+'''
+
+
+def test_run_surfaces_a_preserved_pane_in_its_returned_report(tmp_path, monkeypatch):
+    """End-to-end: a reused agent whose pane fails to close on a genuine success still reports
+    that the pane needs a look, instead of a clean-looking report that hides it."""
+    _stub(tmp_path, monkeypatch, _REUSE_CLOSE_FAILS_STUB)
+    success, report = bridge.run(
+        "t_cb0795f9", "titan", "C:\\workspace\\t_cb0795f9", "claude-sonnet-5-5", "medium",
+    )
+    assert success is True
+    assert "Card done: fixed the thing." in report
+    assert "manual follow-up" in report.lower()
 
 
 def test_compose_prompt_falls_back_to_the_bare_instruction_when_the_board_is_unreachable():

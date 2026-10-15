@@ -277,23 +277,37 @@ def _pane_tokens(pane_id: str) -> dict:
     return pane.get("tokens") or {}
 
 
-def agent_status(name: str) -> str:
-    """The agent's live status, or ``""`` if no agent by that name exists.
-
-    Verified live (herdr 0.9.3): ``agent get`` on a name with no agent returns the structured
-    error ``agent_not_found``, not an empty/absent result -- callers throughout this file
-    (``start_agent``'s ``agent_not_ready`` fallback among them) rely on a falsy return here for
-    "not present yet", so that specific code is swallowed rather than raised.
+def _agent_info(name: str) -> Optional[dict]:
+    """The raw ``agent get <name>`` response's ``agent`` dict, or ``None`` if the agent truly
+    doesn't exist (``agent_not_found``). Lower-level than :func:`agent_status`: a caller that needs
+    to tell "doesn't exist" apart from "exists but reports an empty/unrecognized status" -- which
+    collapsing straight to a status string can't do -- uses this instead.
     """
     try:
         result = _run_herdr(["agent", "get", name])
     except HerdrCliError as exc:
         if exc.code == "agent_not_found":
-            return ""
+            return None
         raise
     agent = result.get("agent") or result if isinstance(result, dict) else {}
+    return agent if isinstance(agent, dict) else {}
+
+
+def agent_exists(name: str) -> bool:
+    """Whether Herdr knows an agent by this name at all, regardless of its status field's value."""
+    return _agent_info(name) is not None
+
+
+def agent_status(name: str) -> str:
+    """The agent's live status, or ``""`` if no agent by that name exists (or one exists but
+    doesn't report a status -- see :func:`agent_exists` when that distinction matters).
+
+    Verified live (herdr 0.9.3): ``agent get`` on a name with no agent returns the structured
+    error ``agent_not_found``, not an empty/absent result.
+    """
+    agent = _agent_info(name)
     # Verified live (herdr 0.9.3): the field is `agent_status`, not `status`.
-    return str(agent.get("agent_status") or "").lower()
+    return str((agent or {}).get("agent_status") or "").lower()
 
 
 def find_existing_agent(name: str) -> Optional[dict]:
@@ -358,7 +372,11 @@ def start_agent(name: str, pane_id: str, model: str, effort: str) -> None:
 
     ``agent_not_ready`` is not treated as fatal on its own: Herdr returns it when it could not
     confirm input-readiness in time, but the agent may still be present and about to become
-    ready — ``agent get`` decides, not the start call's own exit status.
+    ready — ``agent get`` decides, not the start call's own exit status. Existence alone isn't
+    enough, though: a same-named agent reported in a *different* pane than the one just created
+    here is not this card's agent (this bridge's caller tracks state by ``pane_id``, not just by
+    name, so prompting/closing would then act on the wrong pane while leaving the real one
+    orphaned) and is refused rather than silently adopted.
     """
     try:
         _run_herdr([
@@ -368,9 +386,18 @@ def start_agent(name: str, pane_id: str, model: str, effort: str) -> None:
     except HerdrCliError as exc:
         if exc.code != "agent_not_ready":
             raise
-        if not agent_status(name):
+        info = _agent_info(name)
+        if info is None:
             raise BridgeError(f"agent {name} start reported agent_not_ready and no agent is present") from exc
-        # Present, just not confirmed ready yet -- the prompt/wait steps observe its real state.
+        other_pane = info.get("pane_id")
+        if other_pane not in (None, pane_id):
+            raise BridgeError(
+                f"agent {name} start reported agent_not_ready, and an agent by that name exists "
+                f"but in pane {other_pane!r}, not the pane just created ({pane_id!r}); refusing to "
+                f"treat it as this card's own"
+            ) from exc
+        # Present in this pane (or pane_id unreported), just not confirmed ready yet -- the
+        # prompt/wait steps observe its real state.
 
 
 def prompt_agent(name: str, text: str) -> None:
@@ -456,6 +483,20 @@ def _compose_prompt(task_id: str, board: Optional[str]) -> str:
     return "\n".join(lines)
 
 
+def _annotate_preserved_pane(success: bool, report: str, pane_preserved: bool) -> str:
+    """Surface ``_settle_and_close``'s ``pane_preserved`` signal in the report text itself --
+    computing it and then dropping it on the floor would make the TOCTOU/close-failure handling in
+    ``_settle_and_close`` pointless, since nothing downstream (the card summary a human reads)
+    would ever know the pane needs a look."""
+    if success and pane_preserved:
+        return (
+            f"{report}\n\n[direct-herdr-dispatch bridge] work succeeded, but its Herdr pane/agent "
+            f"could not be confirmed closed (it may have resumed activity during cleanup, or the "
+            f"close call itself failed) -- needs manual follow-up to verify/close it."
+        )
+    return report
+
+
 def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
         herdr_workspace: Optional[str] = None) -> tuple[bool, str]:
     """Drive one card through the herdr-dispatch skill's workspace -> pane -> link -> agent
@@ -481,6 +522,16 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
     starting this agent and ever prompting it, and resending to an agent that already finished the
     work is a safe no-op (it just re-confirms), while silently waiting on a never-prompted agent
     would report a false success built from an unrelated transcript.
+
+    Known residual risk, accepted rather than chased further: the ownership read above and the
+    close-safety recheck in ``_settle_and_close`` are both check-then-act, not atomic. Something
+    else retagging this exact pane between the read and ``link_pane``'s write, or an agent resuming
+    in the instant between the final status recheck and the close call, are both real TOCTOU
+    windows this bridge cannot fully close without an atomic conditional-update primitive from
+    Herdr that isn't known to exist. Narrowing these further would mean guessing at unverified CLI
+    behavior, which this file deliberately avoids; both are narrow enough in practice (local
+    subprocess calls, not network round trips) that the live dry runs validating this bridge never
+    triggered either one.
     """
     name = pane_name(board, task_id)
     try:
@@ -511,8 +562,8 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
                         f"agent {name} is blocked on an approval/question dialog and was not "
                         f"auto-answered: {exc}"
                     )
-            success, report, _pane_preserved = _settle_and_close(name, pane_id)
-            return success, report
+            success, report, pane_preserved = _settle_and_close(name, pane_id)
+            return success, _annotate_preserved_pane(success, report, pane_preserved)
 
         if herdr_workspace:
             workspace_id, stale_root_pane_id = resolve_workspace_id(herdr_workspace), None
@@ -537,8 +588,11 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
             # Unlike link_pane, start_agent's own failure (including a bare CLI timeout) doesn't
             # prove the agent was never created -- the server may have created and started it
             # despite a lost or slow response. Check before discarding a pane that could already
-            # hold a live executor.
-            if agent_status(name):
+            # hold a live executor. Existence alone isn't enough: a same-named agent reported in a
+            # DIFFERENT pane than the one just created here isn't this card's agent either (this
+            # bridge tracks state by pane_id, not just name) -- that pane is still safe to drop.
+            info = _agent_info(name)
+            if info is not None and info.get("pane_id") in (None, pane_id):
                 return False, (
                     f"agent {name} start failed ambiguously ({exc}) but the agent exists; its "
                     f"pane is preserved for investigation rather than discarded"
@@ -552,8 +606,8 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
                 f"agent {name} is blocked on an approval/question dialog and was not "
                 f"auto-answered: {exc}"
             )
-        success, report, _pane_preserved = _settle_and_close(name, pane_id)
-        return success, report
+        success, report, pane_preserved = _settle_and_close(name, pane_id)
+        return success, _annotate_preserved_pane(success, report, pane_preserved)
     except BridgeError as exc:
         return False, str(exc)
 
