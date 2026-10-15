@@ -146,6 +146,26 @@ _BOARD_SPECS = [
     )),
 ]
 
+_REF_SPECS = [
+    _cmd("add", [
+        _TASK_ID,
+        _arg("--type", dest="ref_type", required=True,
+             help="Free-form reference kind, e.g. branch, ado-workitem, connect-ticket, pr-url"),
+        _arg("--repo", help="Repo path this reference belongs to"),
+        _arg("--ref", dest="ref_value", help="Branch name, PR URL, ticket id, or other ref value"),
+        _arg("--host", help="Hostname this reference's work lives on, if host-specific"),
+        _arg("--note", help="Free-text note, for a reference with no repo/ref/host (e.g. a ticket id)"),
+    ], help="Attach a typed reference (branch, ticket, PR, ...) to a task"),
+    _cmd("list", [_TASK_ID, _json_flag()], help="List a task's references"),
+    _cmd("rm", [_arg("ref_id", type=int)], help="Remove one reference by id"),
+    _cmd("find", [
+        _arg("--repo", help="Match references with this repo path"),
+        _arg("--ref", dest="ref_value", help="Match references with this ref value (branch/ticket/PR)"),
+        _json_flag(),
+    ], help="Find the task(s) a repo/ref value is linked to -- across every board, or just the "
+            "current one when --board is given"),
+]
+
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
@@ -275,6 +295,9 @@ _SPECS = [
     ], help="Pin a task to a specific host, or clear the pin. A direct-Herdr bridge board "
             "skips its fast local-spawn path for a task pinned elsewhere, so a card continuing "
             "a specific cross-host session falls through to the normal dispatch path instead."),
+    _cmd("ref", children=("ref_action", _REF_SPECS),
+         help="Attach/list/remove/find typed references (branch, ADO work item, Connect ticket, "
+              "PR URL, ...) a task corresponds to -- a task can have any number, across repos"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

@@ -219,11 +219,18 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "set-default-workdir", "import",
 })
 
+# Mirrors attach/attach-rm above: writing or removing a ref is fenced the same as an attachment;
+# list/find are reads and stay open to delegated children.
+_DELEGATED_CHILD_DENIED_REF_ACTIONS: frozenset[str] = frozenset({"add", "rm"})
+
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     action = getattr(args, "kanban_action", None)
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
+            return False
+    elif action == "ref":
+        if (getattr(args, "ref_action", None) or "list") not in _DELEGATED_CHILD_DENIED_REF_ACTIONS:
             return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
@@ -509,6 +516,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        refs = kb.list_task_refs(conn, args.task_id)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
         if not want_json:
@@ -520,6 +528,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+            "refs": refs,
         })
         return 0
 
@@ -537,6 +546,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.skills:
         field("skills", ", ".join(task.skills))
     _print_task_overrides(task, field)
+    for r in refs:
+        line = f"  ref:       [{r['id']}] {r['ref_type']}"
+        for label, key in (("repo", "repo"), ("ref", "ref"), ("host", "host"), ("note", "note")):
+            if r[key]:
+                line += f"  {label}={r[key]}"
+        print(line)
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
@@ -657,6 +672,104 @@ def _cmd_set_remote(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared the host pin on {args.task_id}")
     return 0
+
+
+def _dispatch_ref(args: argparse.Namespace) -> int:
+    """``hermes kanban ref <action>`` -- same shape as ``_dispatch_boards``, a nested subparser
+    group instead of a flat handler, since a task can carry any number of refs."""
+    sub = getattr(args, "ref_action", None) or "list"
+    handler = _REF_HANDLERS.get(sub)
+    if handler is None:
+        return _err(f"kanban ref: unknown action {sub!r}", 2)
+    return handler(args)
+
+
+def _cmd_ref_add(args: argparse.Namespace) -> int:
+    try:
+        with kbc.connect_closing() as conn:
+            ref_id = kb.add_task_ref(
+                conn, args.task_id, args.ref_type, repo=getattr(args, "repo", None),
+                ref=getattr(args, "ref_value", None), host=getattr(args, "host", None),
+                note=getattr(args, "note", None),
+            )
+    except ValueError as exc:
+        return _err(f"kanban ref add: {exc}", 2)
+    print(f"Added ref {ref_id} ({args.ref_type}) to {args.task_id}")
+    return 0
+
+
+def _cmd_ref_list(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            return _err(f"no such task: {args.task_id}")
+        refs = kb.list_task_refs(conn, args.task_id)
+    if _json_out(args, refs):
+        return 0
+    if not refs:
+        print(f"No refs on {args.task_id}")
+        return 0
+    print(f"Refs on {args.task_id}:")
+    for r in refs:
+        line = f"  [{r['id']}] {r['ref_type']}"
+        for label, key in (("repo", "repo"), ("ref", "ref"), ("host", "host"), ("note", "note")):
+            if r[key]:
+                line += f"  {label}={r[key]}"
+        print(line)
+    return 0
+
+
+def _cmd_ref_rm(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        removed = kb.remove_task_ref(conn, args.ref_id)
+    if removed is None:
+        return _err(f"no such ref: {args.ref_id}")
+    print(f"Removed ref {args.ref_id} ({removed['ref_type']}) from {removed['task_id']}")
+    return 0
+
+
+def _cmd_ref_find(args: argparse.Namespace) -> int:
+    """Reverse lookup: which task(s) a repo/ref value belongs to. Scoped to the current board
+    when ``--board`` was given (same resolution every other action gets); otherwise scans every
+    non-archived board, since the whole point is not already knowing where to look."""
+    repo = getattr(args, "repo", None)
+    ref_value = getattr(args, "ref_value", None)
+    if not (repo or "").strip() and not (ref_value or "").strip():
+        return _err("kanban ref find: pass --repo and/or --ref", 2)
+    matches = []
+    if getattr(args, "board", None):
+        with kbc.connect_closing() as conn:
+            found = kb.find_task_refs(conn, repo=repo, ref=ref_value)
+        matches.extend(dict(m, board=kb.get_current_board()) for m in found)
+    else:
+        for b in kb.list_boards(include_archived=False):
+            slug = b["slug"]
+            try:
+                with kbc.connect_closing(board=slug) as conn:
+                    found = kb.find_task_refs(conn, repo=repo, ref=ref_value)
+            except Exception as exc:  # health: allow BLE001 -- cross-board scan boundary; one
+                # unreadable/corrupt board must not abort matches already found on the others.
+                kb._log.warning("kanban ref find: skipping board %r (%s: %s)", slug, type(exc).__name__, exc)
+                continue
+            matches.extend(dict(m, board=slug) for m in found)
+    if _json_out(args, matches):
+        return 0
+    if not matches:
+        print("(no matching refs)")
+        return 0
+    for m in matches:
+        line = f"{m['task_id']}  board={m['board']}  status={m['task_status']}  {m['ref_type']}"
+        if m["repo"]:
+            line += f"  repo={m['repo']}"
+        if m["ref"]:
+            line += f"  ref={m['ref']}"
+        line += f"  {m['task_title']}"
+        print(line)
+    return 0
+
+
+_REF_HANDLERS = {
+    "add": _cmd_ref_add, "list": _cmd_ref_list, "rm": _cmd_ref_rm, "find": _cmd_ref_find,
+}
 
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
@@ -1382,7 +1495,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model, "set-remote": _cmd_set_remote,
-    "set-kind": _cmd_set_kind, "set-effort": _cmd_set_effort,
+    "set-kind": _cmd_set_kind, "set-effort": _cmd_set_effort, "ref": _dispatch_ref,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
@@ -1414,6 +1527,8 @@ Common subcommands:
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
+  `ref add <id> --type branch --repo <path> --ref <name>`  Link a branch/ticket/PR to a task
+  `ref find --repo <path> --ref <name>`  Which task a branch/ticket/PR belongs to
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive

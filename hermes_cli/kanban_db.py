@@ -9,7 +9,7 @@ board-enumerating machine flows (gateway notifier/watcher/dispatcher, ``pin_firs
 always resolve through the pin, so workers physically cannot see other boards.
 Concurrency: WAL + ``BEGIN IMMEDIATE`` + compare-and-swap on ``tasks.status``/``claim_lock`` —
 SQLite serializes writers so one claimer wins, losers see zero rows (no retries, no distributed
-locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, notify subs.
+locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attachments, refs, notify subs.
 """
 
 from __future__ import annotations
@@ -30,6 +30,9 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_db_host_pin import _claimer_id, _host_prefix, set_agent_kind_override, set_remote_host
+from hermes_cli.kanban_db_refs import (
+    _require_task, _task_rows, add_task_ref, find_task_refs, list_task_refs, remove_task_ref,
+)
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 
@@ -978,6 +981,17 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     created_at   INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_refs (  -- generic multi-valued ref; ref_type is free-form, see kanban_db_refs.py
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL,
+    ref_type   TEXT NOT NULL,
+    repo       TEXT,
+    ref        TEXT,
+    host       TEXT,
+    note       TEXT,
+    created_at INTEGER NOT NULL
+);
+
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
@@ -1007,6 +1021,8 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_refs_task             ON task_refs(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_refs_lookup           ON task_refs(repo, ref);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
 
@@ -1698,17 +1714,6 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
-
-
-def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
-    if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
-        raise ValueError(f"unknown task {task_id}")
-
-
-def _task_rows(conn: sqlite3.Connection, table: str, task_id: str, order: str) -> list[sqlite3.Row]:
-    return conn.execute(
-        f"SELECT * FROM {table} WHERE task_id = ? ORDER BY {order}", (task_id,)
-    ).fetchall()
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
