@@ -45,6 +45,22 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+def _patch_review_dispatch_boards(monkeypatch: pytest.MonkeyPatch, boards) -> None:
+    """Enable (or clear) ``kanban.review_dispatch_boards`` for these tests' connections,
+    which all run against the ``default`` board (``kbc.connect()`` with no ``board=``).
+    Patches the real reader (``config_effective.load_user_config_effective``), not the
+    legacy ``cfgmod.load_config`` these tests used before the board-scoped allowlist
+    replaced the flat ``kanban.review_dispatch`` boolean (card: titan runaway-loop fix).
+    """
+    from hermes_cli import config_effective
+
+    monkeypatch.setattr(
+        config_effective,
+        "load_user_config_effective",
+        lambda *a, **k: {"kanban": {"review_dispatch_boards": boards}},
+    )
+
+
 def _row(conn, tid):
     return conn.execute(
         "SELECT status, block_kind, block_recurrences, current_run_id "
@@ -383,11 +399,10 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
 def test_review_dispatch_gate_prevents_phantom_reviewer(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With ``kanban.review_dispatch=false`` the dispatcher must NOT claim a
-    task parked in ``review`` (this deployment explicitly waits for a human).
-    Flipping the knob back on proves the gate, not
-    something else, is what suppressed the claim."""
-    import hermes_cli.config as cfgmod
+    """With the ``default`` board absent from ``kanban.review_dispatch_boards`` the
+    dispatcher must NOT claim a task parked in ``review`` (the new safe default: a
+    board not explicitly opted in stays human-only review). Listing it proves the
+    gate, not something else, is what suppressed the claim."""
     import hermes_cli.profiles as profmod
 
     with kbc.connect() as conn:
@@ -403,21 +418,14 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         # review-column dispatch from claiming it.
         monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
 
-        # Gate OFF -> review task is left alone.
-        monkeypatch.setattr(
-            cfgmod, "load_config",
-            lambda *a, **k: {"kanban": {"review_dispatch": False}},
-        )
+        # Gate OFF (the default; a board must opt in) -> review task is left alone.
+        _patch_review_dispatch_boards(monkeypatch, [])
         res_off = kbd.dispatch_once(conn, dry_run=True)
         assert tid not in [s[0] for s in res_off.spawned]
         assert kb.get_task(conn, tid).status == "review"
 
-        # Gate ON (the default; sdlc-review is bundled) -> the review task is
-        # picked up by the dispatcher.
-        monkeypatch.setattr(
-            cfgmod, "load_config",
-            lambda *a, **k: {"kanban": {"review_dispatch": True}},
-        )
+        # Gate ON (board explicitly opted in) -> the review task is picked up.
+        _patch_review_dispatch_boards(monkeypatch, ["default"])
         res_on = kbd.dispatch_once(conn, dry_run=True)
         assert tid in [s[0] for s in res_on.spawned]
 
@@ -433,14 +441,10 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
     a ready-lane task is a duplicate-work signal and stays deferred.
     Rate-limit cooldown still applies in the review lane.
     """
-    import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
     monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
-    monkeypatch.setattr(
-        cfgmod, "load_config",
-        lambda *a, **k: {"kanban": {"review_dispatch": True}},
-    )
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
     pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
 
     with kbc.connect() as conn:
@@ -504,13 +508,10 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
     The un-reassigned implementer stays guarded; a newer PR comment posted
     after the handoff (the closer's own run) guards again.
     """
-    import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
     monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
-    monkeypatch.setattr(
-        cfgmod, "load_config", lambda *a, **k: {"kanban": {"review_dispatch": True}},
-    )
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
     pr_comment = "Opened https://github.com/example/repo/pull/44 for review."
 
     with kbc.connect() as conn:
@@ -636,15 +637,10 @@ def test_dispatch_json_exposes_suppression_reasons(
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
     monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
-    monkeypatch.setattr(
-        cfgmod,
-        "load_config",
-        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
-    )
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
     captured: list[list[str]] = []
 
     def spawn(task, workspace):
@@ -688,15 +684,10 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
     monkeypatch.setattr(profmod, "profile_exists", lambda _name: True)
-    monkeypatch.setattr(
-        cfgmod,
-        "load_config",
-        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
-    )
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
 
     with kbc.connect() as conn:
         running_id = kb.create_task(conn, title="already running", assignee="builder")

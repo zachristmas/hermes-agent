@@ -1786,6 +1786,7 @@ def dispatch_profile_allowlist_summary() -> str:
 
 # Direct-Herdr bridge gate + per-board agent profile live in this sibling (line-cap offload).
 from hermes_cli.kanban_db_dispatch_herdr import _board_uses_direct_herdr_dispatch
+from hermes_cli.kanban_db_dispatch_herdr import _board_uses_review_dispatch
 from hermes_cli.kanban_db_dispatch_herdr import _direct_herdr_worker_argv
 from hermes_cli.kanban_db_dispatch_herdr import _herdr_agent_profile_for_board
 
@@ -1820,15 +1821,14 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return _has_spawnable(conn, "review")
 
 
-def review_dispatch_enabled() -> bool:
-    """Whether review tasks dispatch automatically. Default true (Hermes ships
-    ``sdlc-review``); operators disable it for human-only review boards.
+def review_dispatch_enabled(board: Optional[str] = None) -> bool:
+    """Whether review tasks dispatch automatically for ``board`` (or the current board, if
+    None). Board-scoped via ``kanban.review_dispatch_boards`` (sibling, line-cap offload):
+    default off everywhere, operators opt a board in for genuine AI-to-AI review (e.g. a
+    writer+reviewer board); a human-only-review board (the common case) needs no config at
+    all.
     """
-    try:
-        from hermes_cli.config import load_config
-        return bool((load_config() or {}).get("kanban", {}).get("review_dispatch", True))
-    except Exception:
-        return True
+    return _board_uses_review_dispatch(board)
 
 
 # Memory-aware dispatch guard: an uncapped board once OOM'd a 1 GiB host. Two
@@ -2388,7 +2388,7 @@ def _dispatch_once_locked(
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled(board) else []
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which

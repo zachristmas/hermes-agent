@@ -116,6 +116,52 @@ def _herdr_agent_profile_for_board(board: Optional[str]) -> dict:
     }
 
 
+def _review_dispatch_boards() -> frozenset:
+    """Boards opted into automatic review-lane dispatch (``kanban.review_dispatch_boards``).
+
+    Enabling automatic review is a claim-widening question (it decides whether a card already
+    sitting in Review gets a fresh agent spawned on top of it) exactly like
+    ``_direct_herdr_dispatch_boards``, so this fails closed the same way: absent, empty, or
+    unreadable config all resolve to the empty set, never "every board reviews automatically".
+    A board this function has never heard of stays human-only review, which is the safe
+    default — the previous flat ``True`` default caused a real 24-spawn runaway loop on a
+    human-only-review board (titan, 2026-10-15): a card already in Review kept getting a fresh
+    agent spawned with the same generic implement-lane prompt, which correctly found nothing
+    new to do and immediately re-requested review, forever.
+    """
+    from hermes_cli import kanban_db as _kb
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+    except Exception as exc:  # health: allow BLE001 -- config read boundary; an unreadable
+        # config must stay "off", matching _direct_herdr_dispatch_boards's own fail-closed rule.
+        _kb._log.warning(
+            "kanban: could not read kanban.review_dispatch_boards (%s: %s) — "
+            "every board stays human-only review until the config is readable",
+            type(exc).__name__, exc,
+        )
+        return frozenset()
+    if not isinstance(kanban, Mapping):
+        return frozenset()
+    raw = kanban.get("review_dispatch_boards")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return frozenset()
+    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    return frozenset(
+        slug for slug in (_kb._normalize_board_slug(n) or n.strip() or None for n in names) if slug
+    )
+
+
+def _board_uses_review_dispatch(board: Optional[str]) -> bool:
+    """True when ``board`` (or the current board, if None) opted into automatic review-lane
+    dispatch (``kanban.review_dispatch_boards``). See :func:`_review_dispatch_boards` for why
+    the default is off everywhere until a board explicitly opts in.
+    """
+    from hermes_cli import kanban_db as _kb
+    slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    return slug in _review_dispatch_boards()
+
+
 def _direct_herdr_worker_argv() -> list[str]:
     """Build the direct-Herdr bridge worker command (per-board opt-in, card t_cb0795f9).
 

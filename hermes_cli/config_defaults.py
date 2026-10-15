@@ -1894,9 +1894,9 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
-        # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
-        # sdlc-review skill. Disable where every review is done manually from the dashboard.
-        "review_dispatch": True,
+        # Per-board opt-in (list/comma-string): boards listed auto-claim review-column tasks and
+        # spawn the assignee; empty/None/unreadable all mean "off" (human-only review, the default).
+        "review_dispatch_boards": None,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
