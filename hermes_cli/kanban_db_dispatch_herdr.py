@@ -9,9 +9,22 @@ safe default (bridge off; agent profile claude/claude-sonnet-5-5/medium), never 
 """
 from __future__ import annotations
 
+import socket
 import sys
+from typing import TYPE_CHECKING
 from typing import Mapping
 from typing import Optional
+
+if TYPE_CHECKING:
+    from hermes_cli.kanban_db import Task
+
+
+def _local_hostname() -> str:
+    try:
+        return (socket.gethostname() or "").strip()
+    except Exception:  # health: allow BLE001 -- hostname lookup is best-effort;
+        # an empty string below never matches a real pin, so this fails closed.
+        return ""
 
 
 def _direct_herdr_dispatch_boards() -> frozenset:
@@ -47,11 +60,24 @@ def _direct_herdr_dispatch_boards() -> frozenset:
     )
 
 
-def _board_uses_direct_herdr_dispatch(board: Optional[str]) -> bool:
-    """True when ``board`` (or the current board, if None) opted into the direct-Herdr bridge."""
+def _board_uses_direct_herdr_dispatch(board: Optional[str], task: Optional[Task] = None) -> bool:
+    """True when ``board`` (or the current board, if None) opted into the direct-Herdr bridge,
+    AND ``task`` carries no ``remote_host`` pin to a different machine.
+
+    The bridge always spawns a fresh local Herdr pane: it has no notion of an existing
+    cross-host session. A card pinned to another host (a continuation of a specific writer/
+    reviewer session there, e.g. card t_a87265e1) must fall through to the normal worker/
+    orchestrator path, which already knows cross-host handoff, instead of getting a second,
+    unrelated fresh agent started on top of it here.
+    """
     from hermes_cli import kanban_db as _kb
     slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
-    return slug in _direct_herdr_dispatch_boards()
+    if slug not in _direct_herdr_dispatch_boards():
+        return False
+    pin = (getattr(task, "remote_host", None) or "").strip()
+    if pin and pin.lower() != _local_hostname().lower():
+        return False
+    return True
 
 
 _DEFAULT_HERDR_AGENT_PROFILE = {"kind": "claude", "model": "claude-sonnet-5-5", "effort": "medium"}

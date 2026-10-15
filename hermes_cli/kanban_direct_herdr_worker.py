@@ -103,15 +103,18 @@ class AgentBlockedError(BridgeError):
     always surfaces as a blocker on the card, never a silent retry or a fabricated answer."""
 
 
-def herdr_command() -> list[str]:
+def herdr_command(machine_id: Optional[str] = None) -> list[str]:
     """Resolve the ``herdr`` executable: ``$HERDR_BIN``, then PATH, then the standalone-release
     glob — the same resolution order ``plugins/kanban-herdr/herdr_tool.py`` uses, reimplemented
     here so this bridge has no import dependency on that separately-versioned plugin repo.
 
-    Pins ``--session`` (default ``default``, override via ``HERMES_KANBAN_HERDR_SESSION``) on
-    every call, per the herdr-dispatch skill's own rule for local work: without it, commands fall
-    back to whatever session context the calling process happened to inherit rather than the
-    recorded local session.
+    Local calls (``machine_id`` is ``None``) pin ``--session`` (default ``default``, override via
+    ``HERMES_KANBAN_HERDR_SESSION``), per the herdr-dispatch skill's own rule: without it, commands
+    fall back to whatever session context the calling process happened to inherit rather than the
+    recorded local session. A ``machine_id`` call instead targets a saved Herdr machine
+    (``herdr --machine <id> ...``, verified live against the real saved-machine list) — that
+    machine's own configured session applies server-side, so ``--session`` is never added here;
+    ``--machine`` and ``--session`` are alternate top-level modes, not meant to combine.
     """
     env = os.environ.get("HERDR_BIN")
     if env:
@@ -127,6 +130,8 @@ def herdr_command() -> list[str]:
         if not found:
             raise BridgeError("the herdr command isn't installed or isn't on PATH (set HERDR_BIN)")
         base = [found]
+    if machine_id:
+        return [*base, "--machine", machine_id]
     session = os.environ.get("HERMES_KANBAN_HERDR_SESSION") or "default"  # health: allow HX002 -- dispatcher->worker handoff, same convention as TASK/WORKSPACE/BOARD
     return [*base, "--session", session]
 
@@ -141,16 +146,17 @@ def _parse_json(text: Optional[str]) -> Any:
         return None
 
 
-def _run_herdr(args: list[str], *, timeout: float = _CLI_TIMEOUT_S) -> Any:
+def _run_herdr(args: list[str], *, timeout: float = _CLI_TIMEOUT_S, machine_id: Optional[str] = None) -> Any:
     """Run one ``herdr`` subcommand and return its parsed ``.result`` (unwrapped).
 
     Raises :class:`HerdrCliError` for a structured server error (exit 1 with a JSON error body —
     callers can branch on ``.code``), plain :class:`BridgeError` for a CLI syntax error (exit 2 —
     a bridge-side bug, not a business failure), any other non-zero exit, a timeout, or a
     missing/unreadable binary. Never hangs past ``timeout`` and never lets a subprocess failure
-    escape as an uncaught exception.
+    escape as an uncaught exception. ``machine_id`` runs the same subcommand against a saved
+    Herdr machine (``herdr --machine <id> ...``) instead of the local session.
     """
-    cmd = herdr_command() + args
+    cmd = herdr_command(machine_id) + args
     label = " ".join(args[:2])
     try:
         # Verified live (herdr 0.9.3 on Windows): `agent read`'s output can carry terminal box-
@@ -285,14 +291,14 @@ def _pane_tokens(pane_id: str) -> dict:
     return pane.get("tokens") or {}
 
 
-def _agent_info(name: str) -> Optional[dict]:
+def _agent_info(name: str, *, machine_id: Optional[str] = None) -> Optional[dict]:
     """The raw ``agent get <name>`` response's ``agent`` dict, or ``None`` if the agent truly
     doesn't exist (``agent_not_found``). Lower-level than :func:`agent_status`: a caller that needs
     to tell "doesn't exist" apart from "exists but reports an empty/unrecognized status" -- which
     collapsing straight to a status string can't do -- uses this instead.
     """
     try:
-        result = _run_herdr(["agent", "get", name])
+        result = _run_herdr(["agent", "get", name], machine_id=machine_id)
     except HerdrCliError as exc:
         if exc.code == "agent_not_found":
             return None
@@ -306,32 +312,112 @@ def agent_exists(name: str) -> bool:
     return _agent_info(name) is not None
 
 
-def agent_status(name: str) -> str:
+def agent_status(name: str, *, machine_id: Optional[str] = None) -> str:
     """The agent's live status, or ``""`` if no agent by that name exists (or one exists but
     doesn't report a status -- see :func:`agent_exists` when that distinction matters).
 
     Verified live (herdr 0.9.3): ``agent get`` on a name with no agent returns the structured
     error ``agent_not_found``, not an empty/absent result.
     """
-    agent = _agent_info(name)
+    agent = _agent_info(name, machine_id=machine_id)
     # Verified live (herdr 0.9.3): the field is `agent_status`, not `status`.
     return str((agent or {}).get("agent_status") or "").lower()
 
 
+def _list_agents(*, machine_id: Optional[str] = None) -> list[dict]:
+    """The raw ``agent list`` entries (each already carrying its own ``tokens`` dict, if tagged),
+    local or (``machine_id`` set) on a saved Herdr machine."""
+    result = _run_herdr(["agent", "list"], machine_id=machine_id)
+    agents = result.get("agents") if isinstance(result, dict) else None
+    return [a for a in (agents or ()) if isinstance(a, dict)]
+
+
 def find_existing_agent(name: str) -> Optional[dict]:
-    """The live ``agent list`` entry named ``name``, or ``None``.
+    """The live local ``agent list`` entry named ``name``, or ``None``.
 
     Goes through ``agent list`` rather than ``agent get <name>`` + :func:`agent_status`: a crashed
     attempt's existing agent is one entry among however many others are live, and ``agent list``'s
     entry shape (including ``pane_id`` alongside ``agent_status``) was captured directly from a
     real run and is already trusted.
     """
-    result = _run_herdr(["agent", "list"])
-    agents = result.get("agents") if isinstance(result, dict) else None
-    for agent in agents or ():
-        if isinstance(agent, dict) and agent.get("name") == name:
+    for agent in _list_agents():
+        if agent.get("name") == name:
             return agent
     return None
+
+
+def list_saved_herdr_machines() -> list[dict]:
+    """Every enabled saved Herdr machine (``herdr machine list --json``): ``[{"id", "label",
+    "target"}, ...]``. Unlike every other call in this file, ``machine list --json`` emits
+    pretty-printed (multi-line) JSON, not the socket API's single-line form :func:`_parse_json`
+    expects, so this parses the whole captured stdout directly instead of going through
+    :func:`_run_herdr`. Raises :class:`BridgeError` on any failure -- a caller sweeping for
+    existing sessions elsewhere must tell "no other machines" apart from "could not even ask",
+    since those mean opposite things for whether it's safe to proceed.
+    """
+    cmd = herdr_command() + ["machine", "list", "--json"]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_CLI_TIMEOUT_S, stdin=subprocess.DEVNULL, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise BridgeError(f"could not list saved Herdr machines: {exc}") from exc
+    if proc.returncode != 0:
+        raise BridgeError(
+            f"herdr machine list --json failed (exit {proc.returncode}): "
+            f"{(proc.stderr or proc.stdout or '').strip()}"
+        )
+    try:
+        machines = json.loads(proc.stdout or "[]")
+    except ValueError as exc:
+        raise BridgeError(f"herdr machine list --json returned unparsable output: {exc}") from exc
+    if not isinstance(machines, list):
+        raise BridgeError(f"herdr machine list --json returned a non-list: {machines!r}")
+    return [
+        m for m in machines
+        if isinstance(m, dict) and m.get("id") and m.get("enabled", True)
+    ]
+
+
+def sweep_other_hosts_for_task(task_id: str) -> tuple[list[dict], list[str], list[str]]:
+    """Every OTHER saved Herdr machine's panes already tagged ``kanban_task=<task_id>`` (this
+    card's own existing Herdr state elsewhere), which machines could not be checked, and which
+    machines WERE successfully checked (for an honest "checked X, found nothing" report).
+
+    Local panes are intentionally excluded: :func:`run` already has its own, more carefully
+    TOCTOU-guarded local-reuse path (matched by :func:`pane_name`, not by tag). This only covers
+    what that path cannot see -- a session on a different machine entirely, reached through one of
+    Herdr's own saved remote targets.
+
+    Returns ``(matches, unreachable_labels, checked_labels)``. A caller must treat ANY unreachable
+    machine as "cannot rule out a session existing there" -- never as "no match found" -- since a
+    card's work being spread across more than one host is normal (not every host, and not always
+    the one this dispatcher happens to run on). Not being ABLE to enumerate saved machines at all
+    (an old ``herdr`` without ``machine list --json``, or none configured) is different: that's the
+    ordinary single-machine case, not a sign something is hidden, so it resolves to "zero machines
+    to check" rather than blocking every dispatch on this install.
+    """
+    try:
+        machines = list_saved_herdr_machines()
+    except BridgeError:
+        return [], [], []
+    matches: list[dict] = []
+    unreachable: list[str] = []
+    checked: list[str] = []
+    for m in machines:
+        machine_id, label = m["id"], str(m.get("label") or m["id"])
+        try:
+            agents = _list_agents(machine_id=machine_id)
+        except BridgeError:
+            unreachable.append(label)
+            continue
+        checked.append(label)
+        for agent in agents:
+            tokens = agent.get("tokens") or {}
+            if tokens.get("kanban_task") == task_id:
+                matches.append({**agent, "_machine_id": machine_id, "_machine_label": label})
+    return matches, unreachable, checked
 
 
 def _settle_and_close(name: str, pane_id: Optional[str]) -> tuple[bool, str, bool]:
@@ -411,7 +497,7 @@ def start_agent(name: str, pane_id: str, model: str, effort: str, kind: str = _D
         # prompt/wait steps observe its real state.
 
 
-def prompt_agent(name: str, text: str) -> None:
+def prompt_agent(name: str, text: str, *, machine_id: Optional[str] = None) -> None:
     """``herdr agent prompt <name> "<text>" --wait --timeout <ms>``.
 
     ``agent_blocked`` means the agent is already at an approval/question dialog -- surfaced as
@@ -426,31 +512,39 @@ def prompt_agent(name: str, text: str) -> None:
         # room without masking an actually-wedged agent for long. Not separately verified for
         # Codex agents, but the same timeout applies to both -- the risk is the same direction
         # (too-short masks a slow-but-fine cold start), not a new one.
-        _run_herdr(["agent", "prompt", name, text, "--wait", "--timeout", "30000"], timeout=_AGENT_PROMPT_TIMEOUT_S)
+        _run_herdr(
+            ["agent", "prompt", name, text, "--wait", "--timeout", "30000"],
+            timeout=_AGENT_PROMPT_TIMEOUT_S, machine_id=machine_id,
+        )
     except HerdrCliError as exc:
         if exc.code == "agent_blocked":
             raise AgentBlockedError(f"agent {name} is already blocked on a dialog: {exc}") from exc
         if exc.code in ("agent_prompt_stalled", "timeout"):
-            status = agent_status(name)
+            status = agent_status(name, machine_id=machine_id)
             if status in ("blocked", "busy", "working", "running"):
                 return  # delivered -- this call's job (handing the prompt off) is done
             raise BridgeError(f"agent {name} prompt could not be confirmed delivered ({exc.code})") from exc
         raise
 
 
-def wait_agent(name: str, timeout_ms: int) -> str:
+def wait_agent(name: str, timeout_ms: int, *, machine_id: Optional[str] = None) -> str:
     """``herdr agent wait <name> --timeout <ms>`` with no ``--until``: settles on whichever of
     idle/done/blocked the agent reaches first. Returns the settled status."""
-    result = _run_herdr(["agent", "wait", name, "--timeout", str(timeout_ms)], timeout=(timeout_ms / 1000.0) + 30)
+    result = _run_herdr(
+        ["agent", "wait", name, "--timeout", str(timeout_ms)],
+        timeout=(timeout_ms / 1000.0) + 30, machine_id=machine_id,
+    )
     agent = result.get("agent") or result if isinstance(result, dict) else {}
     # Verified live (herdr 0.9.3): the field is `agent_status`, not `status`.
     return str(agent.get("agent_status") or "").lower()
 
 
-def read_agent(name: str) -> str:
+def read_agent(name: str, *, machine_id: Optional[str] = None) -> str:
     """``herdr agent read <name> --source recent-unwrapped --lines 120`` -- the read-only
     transcript inspection call, soft-wrapped lines joined."""
-    result = _run_herdr(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "120"])
+    result = _run_herdr(
+        ["agent", "read", name, "--source", "recent-unwrapped", "--lines", "120"], machine_id=machine_id,
+    )
     if isinstance(result, dict):
         return result.get("text") or result.get("output") or result.get("_raw") or ""
     return str(result) if result else ""
@@ -625,8 +719,97 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
         return False, str(exc)
 
 
+def _continue_remote_matches(matches: list[dict], task_id: str, board: Optional[str]) -> tuple[bool, str]:
+    """Pick up a card whose Herdr state already exists on another machine, instead of spawning an
+    unrelated fresh agent on top of it (the GSD incident, card t_a87265e1: the real writer/reviewer
+    sessions were sitting right here all along, tagged and inspectable, when a fresh local agent
+    got started over them).
+
+    This is a handshake, not a refusal: every match gets acknowledged by name/host/pane in the
+    returned report, and a still-active one is waited on (so real in-flight work gets the chance to
+    finish) rather than abandoned. Only a genuinely blocked match (sitting at an approval dialog)
+    or one that never settles within the wait budget keeps this from counting as a clean handoff --
+    and even then, the report says exactly which match and why, never just "refused".
+
+    Driving a match further than a wait+read (e.g. actively steering a remote agent toward
+    completion) is deliberately out of scope here: this bridge now acknowledges and surfaces
+    cross-host state it previously had zero awareness of, which is the actual gap the incident
+    exposed. Teaching it to run a full remote work session is a separate, larger step.
+    """
+    lines = [
+        f"[direct-herdr-dispatch bridge] found {len(matches)} existing Herdr session(s) for this "
+        f"card on another machine; continuing from there instead of starting a new one:",
+    ]
+    any_unsettled = False
+    for match in matches:
+        name = match.get("name") or "(unnamed)"
+        host = match.get("_machine_label", "unknown host")
+        machine_id = match.get("_machine_id")
+        pane_id = match.get("pane_id")
+        status = str(match.get("agent_status") or "").lower()
+        if status in ("working", "busy", "running"):
+            status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000, machine_id=machine_id)
+        if status == "blocked":
+            any_unsettled = True
+            lines.append(
+                f"- {name} on {host} (pane {pane_id}): blocked on an approval/question dialog, not "
+                f"auto-answered: {read_agent(name, machine_id=machine_id)}"
+            )
+            continue
+        if status not in _SETTLED_STATUSES:
+            any_unsettled = True
+            lines.append(
+                f"- {name} on {host} (pane {pane_id}): did not reach idle/done within the wait "
+                f"budget (status={status!r})"
+            )
+            continue
+        lines.append(
+            f"- {name} on {host} (pane {pane_id}, status={status!r}):\n"
+            f"{read_agent(name, machine_id=machine_id).strip()}"
+        )
+    return not any_unsettled, "\n\n".join(lines)
+
+
+def dispatch(
+    task_id: str, board: str, workspace_dir: str, model: str, effort: str,
+    herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND,
+) -> tuple[bool, str, str]:
+    """Entry point for :func:`main`: checks for this card's existing Herdr state on OTHER
+    machines first, then falls through to :func:`run` (which already covers the local case).
+
+    Returns ``(success, report, block_kind)`` -- ``block_kind`` only matters when ``success`` is
+    ``False`` and is ``"transient"`` (today's existing behaviour: auto-retryable) except for the
+    one case that genuinely can't be resolved mechanically: a saved machine this sweep could not
+    reach at all. That case alone gets ``"needs_input"`` -- not because a session was found, but
+    because the sweep cannot say whether one exists, and guessing either way risks exactly the
+    double-dispatch this whole check exists to prevent.
+    """
+    matches, unreachable, checked = sweep_other_hosts_for_task(task_id)
+    if unreachable:
+        return False, (
+            f"[direct-herdr-dispatch bridge] could not confirm whether this card already has a "
+            f"Herdr session on: {', '.join(unreachable)}. A card's work can be spread across more "
+            f"than one machine, so this is not safe to guess either way -- nothing was started "
+            f"here. Check connectivity to that machine, then retry."
+        ), "needs_input"
+    if matches:
+        success, report = _continue_remote_matches(matches, task_id, board)
+        return success, report, "transient"
+    success, report = run(task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind)
+    # Appended, not prepended: request_review's event payload keeps only the summary's FIRST
+    # LINE as its headline (`_first_line`), so this housekeeping note must never push the actual
+    # work's own report out of that line.
+    where = ', '.join(checked) if checked else "none configured"
+    suffix = (
+        f"\n\n[direct-herdr-dispatch bridge] checked for an existing Herdr session elsewhere "
+        f"(saved machines checked: {where}); none found; proceeded here."
+    )
+    return success, report + suffix, "transient"
+
+
 def _mark_card(
     task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str,
+    block_kind: str = "transient",
 ) -> tuple[bool, Optional[str]]:
     """Record the bridge's result on the card itself, with the same run-ownership proof
     (``expected_run_id``) a dispatcher-spawned chat worker's own ``kanban_complete``/
@@ -655,7 +838,7 @@ def _mark_card(
             ok = kb.block_task(
                 conn, task_id,
                 reason=report.strip() or "Direct Herdr dispatch failed with no further detail.",
-                kind="transient", expected_run_id=run_id,
+                kind=block_kind, expected_run_id=run_id,
             )
             reason = None
         return ok, reason
@@ -703,15 +886,17 @@ def main() -> int:
         return 1
 
     try:
-        success, report = run(task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind)
+        success, report, block_kind = dispatch(
+            task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind,
+        )
     except Exception as exc:  # health: allow BLE001 -- this is the process's top-level boundary;
         # a worker must exit cleanly with a reported reason, never hang or crash out with a
         # traceback the dispatcher's crash accounting can't read as a business failure.
-        success, report = False, f"direct-herdr bridge crashed: {exc}"
+        success, report, block_kind = False, f"direct-herdr bridge crashed: {exc}", "transient"
 
     print(report)
     try:
-        card_ok, card_reason = _mark_card(task_id, board, run_id, success, report)
+        card_ok, card_reason = _mark_card(task_id, board, run_id, success, report, block_kind)
     except Exception as exc:  # health: allow BLE001 -- the pane/agent work already happened; a
         # failure to record it must still exit non-zero (so the dispatcher's crash/failure
         # accounting sees it), not raise past this process's own top-level error handling.

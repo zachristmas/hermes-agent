@@ -471,6 +471,29 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _print_task_overrides(task, field) -> None:
+    """``show``'s per-task override lines: model/provider pin, host pin, effective retry
+    threshold. Split out of ``_cmd_show`` to keep it under the function complexity cap."""
+    if task.model_override:
+        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
+        field("model", f"{task.model_override}{_prov}")
+    if task.agent_kind_override:
+        field("agent-kind", task.agent_kind_override)
+    if task.reasoning_effort:
+        field("effort", task.reasoning_effort)
+    if task.remote_host:
+        field("remote-host", task.remote_host)
+    # Effective retry threshold (task > config > default) explains auto-blocks.
+    if task.max_retries is not None:
+        print(f"  max-retries: {task.max_retries} (task)")
+    else:
+        cfg_val = _kanban_config().get("failure_limit")
+        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
+            print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
+        else:
+            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -513,18 +536,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("branch", task.branch_name)
     if task.skills:
         field("skills", ", ".join(task.skills))
-    if task.model_override:
-        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
-        field("model", f"{task.model_override}{_prov}")
-    # Effective retry threshold (task > config > default) explains auto-blocks.
-    if task.max_retries is not None:
-        print(f"  max-retries: {task.max_retries} (task)")
-    else:
-        cfg_val = _kanban_config().get("failure_limit")
-        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
-            print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
-        else:
-            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+    _print_task_overrides(task, field)
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
@@ -595,6 +607,55 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         print(f"Set model override on {args.task_id}: {label} (applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_kind(args: argparse.Namespace) -> int:
+    kind = args.kind
+    if kind is not None and kind.lower() in {"none", "-", "null", ""}:
+        kind = None
+    with kbc.connect_closing() as conn:
+        ok = kb.set_agent_kind_override(conn, args.task_id, kind)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    if kind:
+        print(f"Pinned {args.task_id} to agent kind {kind} (applies on next dispatch)")
+    else:
+        print(f"Cleared the agent kind override on {args.task_id} (uses the board's default)")
+    return 0
+
+
+def _cmd_set_effort(args: argparse.Namespace) -> int:
+    effort = args.effort
+    if effort is not None and effort.lower() in {"none", "-", "null", ""}:
+        effort = None
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.set_reasoning_effort(conn, args.task_id, effort)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    if effort:
+        print(f"Set reasoning effort override on {args.task_id}: {effort} (applies on next dispatch)")
+    else:
+        print(f"Cleared reasoning effort override on {args.task_id}")
+    return 0
+
+
+def _cmd_set_remote(args: argparse.Namespace) -> int:
+    host = args.host
+    if host is not None and host.lower() in {"none", "-", "null", ""}:
+        host = None
+    with kbc.connect_closing() as conn:
+        ok = kb.set_remote_host(conn, args.task_id, host)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    if host:
+        print(f"Pinned {args.task_id} to host {host} (a direct-Herdr bridge board skips its "
+              f"fast path for this task until the pin is cleared or matches this machine)")
+    else:
+        print(f"Cleared the host pin on {args.task_id}")
     return 0
 
 
@@ -1320,7 +1381,8 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
-    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "assign": _cmd_assign, "set-model": _cmd_set_model, "set-remote": _cmd_set_remote,
+    "set-kind": _cmd_set_kind, "set-effort": _cmd_set_effort,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

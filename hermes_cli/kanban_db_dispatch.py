@@ -2913,14 +2913,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    if _board_uses_direct_herdr_dispatch(board):
+    if _board_uses_direct_herdr_dispatch(board, task):
         # Per-board opt-in (card t_cb0795f9): swap the usual worker argv + these three extra env
         # vars for the direct-Herdr bridge; everything else about spawn is unchanged. kind/model/
         # effort come from kanban.herdr_board_agents, with the task's own override still winning.
         agent_profile = _herdr_agent_profile_for_board(board)
         env["HERMES_KANBAN_HERDR_MODEL"] = task.model_override or agent_profile["model"]
         env["HERMES_KANBAN_HERDR_EFFORT"] = task.reasoning_effort or agent_profile["effort"]
-        env["HERMES_KANBAN_HERDR_KIND"] = agent_profile["kind"]
+        env["HERMES_KANBAN_HERDR_KIND"] = task.agent_kind_override or agent_profile["kind"]
         cmd = _direct_herdr_worker_argv()
     else:
         cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))

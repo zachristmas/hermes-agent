@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_db_host_pin import _claimer_id, _host_prefix, set_agent_kind_override, set_remote_host
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 
@@ -657,6 +658,8 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    remote_host: Optional[str] = None        # pinned hostname, or None = runs wherever dispatched
+    agent_kind_override: Optional[str] = None  # e.g. "codex"/"pi"; None = board's configured default
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -693,6 +696,7 @@ _TASK_OPTIONAL_COLUMNS = (
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
     "model_override", "provider_override", "reasoning_effort", "goal_max_turns", "block_kind",
+    "remote_host", "agent_kind_override",
 )
 
 
@@ -893,7 +897,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Hostname this task is pinned to, or NULL for no pin. See kanban_db_host_pin.py.
+    remote_host          TEXT,
+    -- Per-task Herdr agent kind override (e.g. "codex", "pi", "opencode"), or NULL to use the
+    -- board's kanban.herdr_board_agents default. See kanban_db_host_pin.py.
+    agent_kind_override  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1009,20 +1018,6 @@ def _new_task_id() -> str:
     by 10k). Idempotency belongs to ``idempotency_key``, not id uniqueness."""
     return "t_" + secrets.token_hex(4)
 
-
-def _claimer_id() -> str:
-    """Return a ``host:pid`` string that identifies this claimer."""
-    import socket
-    try:
-        host = socket.gethostname() or "unknown"
-    except Exception:
-        host = "unknown"
-    return f"{host}:{os.getpid()}"
-
-
-def _host_prefix() -> str:
-    """``"<host>:"`` prefix shared by every claim lock issued from this host."""
-    return f"{_claimer_id().split(':', 1)[0]}:"
 
 
 # --- Task creation / mutation ---

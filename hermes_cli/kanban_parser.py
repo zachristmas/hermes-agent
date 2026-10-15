@@ -257,6 +257,24 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-kind", [
+        _TASK_ID,
+        _arg("kind", nargs="?", help="Herdr agent kind for this task's worker (e.g. codex, pi, "
+                                      "opencode), or 'none' to clear and use the board's default"),
+    ], help="Pin (or clear) this task's own agent kind, overriding kanban.herdr_board_agents "
+            "for just this card (takes effect on the next dispatch)"),
+    _cmd("set-effort", [
+        _TASK_ID,
+        _arg("effort", nargs="?", help="Reasoning effort for this task's worker, or 'none' to "
+                                        "clear and use the profile/board default"),
+    ], help="Pin (or clear) this task's own reasoning effort (takes effect on the next dispatch)"),
+    _cmd("set-remote", [
+        _TASK_ID,
+        _arg("host", nargs="?",
+             help="Hostname (socket.gethostname()) this task's work is pinned to, or 'none' to clear"),
+    ], help="Pin a task to a specific host, or clear the pin. A direct-Herdr bridge board "
+            "skips its fast local-spawn path for a task pinned elsewhere, so a card continuing "
+            "a specific cross-host session falls through to the normal dispatch path instead."),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,

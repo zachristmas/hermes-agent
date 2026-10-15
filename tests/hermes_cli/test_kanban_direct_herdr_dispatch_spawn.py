@@ -193,6 +193,50 @@ def test_board_uses_direct_herdr_dispatch_helper(tmp_path, monkeypatch):
     assert kbd._board_uses_direct_herdr_dispatch(None) is False
 
 
+def test_board_uses_direct_herdr_dispatch_honors_remote_host_pin(tmp_path, monkeypatch):
+    """A task pinned to a different host must never take the bridge's fast path, even on an
+    opted-in board: it has no existing-session/cross-host handoff of its own (the GSD
+    continuation-card incident, t_a87265e1)."""
+    import socket
+
+    from hermes_cli import kanban_db as kb
+
+    root = tmp_path / ".hermes"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    _write_config(root, "kanban:\n  direct_herdr_dispatch_boards:\n    - titan\n")
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    here = socket.gethostname()
+    pinned_elsewhere = _make_task(kb, task_id="t_remote")
+    pinned_elsewhere.remote_host = "some-other-host"
+    pinned_here = _make_task(kb, task_id="t_local")
+    pinned_here.remote_host = here
+    unpinned = _make_task(kb, task_id="t_unpinned")
+
+    assert kbd._board_uses_direct_herdr_dispatch("titan", pinned_elsewhere) is False
+    assert kbd._board_uses_direct_herdr_dispatch("titan", pinned_here) is True
+    assert kbd._board_uses_direct_herdr_dispatch("titan", unpinned) is True
+
+
+def test_remote_host_pin_falls_back_to_legacy_worker(spawn_env):
+    """Full spawn path: a remote-pinned task on an opted-in board must get the usual worker
+    argv, not the direct-Herdr bridge's."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    _write_config(spawn_env["root"], "kanban:\n  direct_herdr_dispatch_boards:\n    - titan\n")
+
+    task = _make_task(kb, task_id="t_remote_spawn")
+    task.remote_host = "DESKTOP-SOME-OTHER-HOST"
+
+    kbd._default_spawn(task, str(spawn_env["workspace"]), board="titan")
+
+    cmd = spawn_env["captured"]["cmd"]
+    assert "kanban_direct_herdr_worker" not in " ".join(cmd)
+
+
 def test_herdr_board_agents_sets_kind_env_from_config(spawn_env):
     """kanban.herdr_board_agents (not a hardcoded board->kind table) drives the bridge's
     HERMES_KANBAN_HERDR_KIND — a board's own configured kind/model/effort win over the
@@ -212,6 +256,32 @@ def test_herdr_board_agents_sets_kind_env_from_config(spawn_env):
 
     env = spawn_env["captured"]["env"]
     assert env["HERMES_KANBAN_HERDR_KIND"] == "codex"
+    assert env["HERMES_KANBAN_HERDR_MODEL"] == "gpt-6.1-sol"
+    assert env["HERMES_KANBAN_HERDR_EFFORT"] == "high"
+
+
+def test_task_agent_kind_override_wins_over_board_default(spawn_env):
+    """A task's own agent_kind_override beats kanban.herdr_board_agents, same as model_override
+    and reasoning_effort already do -- the board config is only ever the default (baa-ton's
+    per-work-type profile pattern: the orchestrator or a human owns this per card, not just per
+    board)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    _write_config(
+        spawn_env["root"],
+        "kanban:\n"
+        "  direct_herdr_dispatch_boards:\n    - p5\n"
+        "  herdr_board_agents:\n"
+        "    p5: {kind: codex, model: gpt-6.1-sol, effort: high}\n",
+    )
+    task = _make_task(kb)
+    task.agent_kind_override = "pi"
+
+    kbd._default_spawn(task, str(spawn_env["workspace"]), board="p5")
+
+    env = spawn_env["captured"]["env"]
+    assert env["HERMES_KANBAN_HERDR_KIND"] == "pi"
     assert env["HERMES_KANBAN_HERDR_MODEL"] == "gpt-6.1-sol"
     assert env["HERMES_KANBAN_HERDR_EFFORT"] == "high"
 
