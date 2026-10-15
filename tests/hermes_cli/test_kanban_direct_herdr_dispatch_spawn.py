@@ -191,3 +191,74 @@ def test_board_uses_direct_herdr_dispatch_helper(tmp_path, monkeypatch):
     assert kbd._board_uses_direct_herdr_dispatch("TITAN") is True
     assert kbd._board_uses_direct_herdr_dispatch("connect") is False
     assert kbd._board_uses_direct_herdr_dispatch(None) is False
+
+
+def test_herdr_board_agents_sets_kind_env_from_config(spawn_env):
+    """kanban.herdr_board_agents (not a hardcoded board->kind table) drives the bridge's
+    HERMES_KANBAN_HERDR_KIND — a board's own configured kind/model/effort win over the
+    claude defaults."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    _write_config(
+        spawn_env["root"],
+        "kanban:\n"
+        "  direct_herdr_dispatch_boards:\n    - p5\n"
+        "  herdr_board_agents:\n"
+        "    p5: {kind: codex, model: gpt-6.1-sol, effort: high}\n",
+    )
+
+    kbd._default_spawn(_make_task(kb), str(spawn_env["workspace"]), board="p5")
+
+    env = spawn_env["captured"]["env"]
+    assert env["HERMES_KANBAN_HERDR_KIND"] == "codex"
+    assert env["HERMES_KANBAN_HERDR_MODEL"] == "gpt-6.1-sol"
+    assert env["HERMES_KANBAN_HERDR_EFFORT"] == "high"
+
+
+def test_herdr_board_agents_unlisted_board_falls_back_to_claude_default(spawn_env):
+    """A board opted into the bridge but absent from herdr_board_agents must get the safe
+    claude default, never an inherited or guessed kind."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    _write_config(
+        spawn_env["root"],
+        "kanban:\n"
+        "  direct_herdr_dispatch_boards:\n    - titan\n"
+        "  herdr_board_agents:\n"
+        "    p5: {kind: codex, model: gpt-6.1-sol, effort: high}\n",
+    )
+
+    kbd._default_spawn(_make_task(kb), str(spawn_env["workspace"]), board="titan")
+
+    env = spawn_env["captured"]["env"]
+    assert env["HERMES_KANBAN_HERDR_KIND"] == "claude"
+    assert env["HERMES_KANBAN_HERDR_MODEL"] == "claude-sonnet-5-5"
+
+
+def test_herdr_board_agents_unreadable_config_falls_back_to_claude_default(spawn_env, monkeypatch):
+    """An unreadable config must resolve the agent profile to the safe claude default, the same
+    fail direction as _direct_herdr_dispatch_boards itself -- never a silently guessed codex."""
+    from hermes_cli import config_effective
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    _write_config(spawn_env["root"], "kanban:\n  direct_herdr_dispatch_boards:\n    - p5\n")
+
+    real_load = config_effective.load_user_config_effective
+    calls = {"n": 0}
+
+    def flaky_on_second_call(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_load(**kwargs)
+        raise OSError("config unavailable")
+
+    monkeypatch.setattr(config_effective, "load_user_config_effective", flaky_on_second_call)
+
+    kbd._default_spawn(_make_task(kb), str(spawn_env["workspace"]), board="p5")
+
+    env = spawn_env["captured"]["env"]
+    assert env["HERMES_KANBAN_HERDR_KIND"] == "claude"
+    assert env["HERMES_KANBAN_HERDR_MODEL"] == "claude-sonnet-5-5"

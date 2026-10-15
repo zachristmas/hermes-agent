@@ -1953,16 +1953,15 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
-        # Explicit per-board opt-in (card t_cb0795f9): boards listed here get a small synchronous
-        # "direct Herdr bridge" worker (``hermes_cli.kanban_direct_herdr_worker``) instead of the
-        # dispatcher's usual worker argv. The bridge drives a Herdr pane + Claude Code coding agent
-        # itself (per skills/devops/herdr-dispatch), then marks the card done/blocked and exits —
-        # it still launches the coding agent through the interactive ``herdr agent start --kind
-        # claude`` path, never the Anthropic API. List or comma-separated string of board slugs;
-        # empty/None (default) = every board keeps the existing worker argv. An unreadable config
-        # always resolves to "off", never "on". Requires the ``herdr`` CLI on PATH (or
-        # ``HERDR_BIN``) and the ``kanban-herdr`` plugin's pane tagging convention.
+        # Per-board opt-in (card t_cb0795f9): boards listed here get the "direct Herdr bridge"
+        # worker (``hermes_cli.kanban_direct_herdr_worker``) instead of the usual worker argv, via
+        # ``herdr agent start`` (never a raw provider API). List/comma-string; empty/None/unreadable
+        # all resolve to "off". Requires ``herdr`` on PATH (or ``HERDR_BIN``).
         "direct_herdr_dispatch_boards": None,
+        # Per-board ``herdr agent start --kind``/model/effort for the boards above, e.g.
+        # ``{p5: {kind: codex, model: gpt-6.1-sol, effort: medium}}``. Unlisted/unreadable falls
+        # back to claude/claude-sonnet-5-5/medium. A task's own override still wins.
+        "herdr_board_agents": None,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.

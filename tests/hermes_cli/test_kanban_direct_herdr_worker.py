@@ -297,6 +297,35 @@ def test_create_pane_reads_pane_id_from_root_pane(happy_herdr):
     assert bridge.create_pane("titan-t_x", "C:\\ws", herdr_workspace="titan") == "w1:p2"
 
 
+def test_start_agent_passes_through_the_given_kind(happy_herdr):
+    bridge.start_agent("titan-t_x", "w1:p2", "gpt-6.1-sol", "medium", kind="codex")
+    calls = json.loads(happy_herdr.read_text())["calls"]
+    start_call = next(c for c in calls if tuple(c[:2]) == ("agent", "start"))
+    assert start_call[start_call.index("--kind") + 1] == "codex"
+
+
+def test_run_passes_the_given_kind_through_to_agent_start(happy_herdr):
+    """``run()`` has no board->kind table of its own: whatever ``kind`` its caller (the
+    dispatcher, resolved from kanban.herdr_board_agents) passes in reaches ``agent start``
+    unchanged, for any installed herdr agent kind, not just claude/codex."""
+    success, _report = bridge.run(
+        "t_x", "p5", "C:\\workspace\\t_x", "gpt-6.1-sol", "medium", kind="codex",
+    )
+    assert success is True
+    calls = json.loads(happy_herdr.read_text())["calls"]
+    start_call = next(c for c in calls if tuple(c[:2]) == ("agent", "start"))
+    assert start_call[start_call.index("--kind") + 1] == "codex"
+    assert start_call[start_call.index("--model") + 1] == "gpt-6.1-sol"
+
+
+def test_run_defaults_to_claude_kind_when_caller_does_not_specify_one(happy_herdr):
+    success, _report = bridge.run("t_x", "titan", "C:\\workspace\\t_x", "claude-sonnet-5-5", "medium")
+    assert success is True
+    calls = json.loads(happy_herdr.read_text())["calls"]
+    start_call = next(c for c in calls if tuple(c[:2]) == ("agent", "start"))
+    assert start_call[start_call.index("--kind") + 1] == "claude"
+
+
 def test_find_existing_agent_returns_none_when_no_agent_matches(happy_herdr):
     assert bridge.find_existing_agent("titan-t_cb0795f9") is None
 

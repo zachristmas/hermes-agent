@@ -1,14 +1,17 @@
-"""Direct Herdr dispatch bridge — titan-only opt-in (card t_cb0795f9).
+"""Direct Herdr dispatch bridge (card t_cb0795f9), per-board opt-in.
 
 For boards listed in ``kanban.direct_herdr_dispatch_boards``, ``_default_spawn`` in
 ``kanban_db_dispatch.py`` spawns THIS module instead of a full interactive
 ``hermes -p <profile> chat -q`` worker. Rather than running its own Hermes agent turn, this
 small synchronous process plays the ``skills/devops/herdr-dispatch`` SKILL.md playbook itself:
 ensure the board's Herdr workspace exists, create a pane, tag it with the card (the same tokens
-the ``kanban_herdr_link`` tool and the ``kanban-herdr`` dashboard plugin use), start a Claude
-Code coding agent in it through the interactive ``herdr agent start --kind claude`` path (never
-the Anthropic API — this is still billed through the interactive Claude subscription, exactly as
-today), prompt it, wait for it, read its report, and clean up. It then marks the kanban card
+the ``kanban_herdr_link`` tool and the ``kanban-herdr`` dashboard plugin use), start a coding
+agent in it through the interactive ``herdr agent start`` path (never a raw provider API -- this
+is still billed through whichever interactive subscription the board's own agent kind uses,
+exactly as today) -- ``--kind`` comes from ``HERMES_KANBAN_HERDR_KIND`` (resolved by the
+dispatcher from ``kanban.herdr_board_agents``; this module has no board->kind table of its own,
+defaulting to ``claude`` only when the dispatcher didn't set it) -- prompt it, wait for it, read
+its report, and clean up. It then marks the kanban card
 itself (``request_review`` on success, never ``complete_task`` — a settled Herdr status is not
 proof of correct work, so a human still reviews it — or ``block_task`` on failure) and exits with
 a real success/failure code.
@@ -64,6 +67,11 @@ from typing import Any, Optional
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _DEFAULT_MODEL = "claude-sonnet-5-5"
 _DEFAULT_EFFORT = "medium"
+# Used only when the dispatcher didn't set HERMES_KANBAN_HERDR_KIND at all (e.g. a direct manual
+# invocation of this module outside kanban_db_dispatch.py). The dispatcher itself always resolves
+# a board's real kind from kanban.herdr_board_agents before spawning; this module has no
+# board->kind table of its own.
+_DEFAULT_KIND = "claude"
 
 # Per-step timeouts (seconds). The dispatcher's own claim TTL / heartbeat is the outer backstop;
 # these are the inner one, so a wedged `herdr` call still exits this process instead of hanging
@@ -119,7 +127,7 @@ def herdr_command() -> list[str]:
         if not found:
             raise BridgeError("the herdr command isn't installed or isn't on PATH (set HERDR_BIN)")
         base = [found]
-    session = os.environ.get("HERMES_KANBAN_HERDR_SESSION") or "default"
+    session = os.environ.get("HERMES_KANBAN_HERDR_SESSION") or "default"  # health: allow HX002 -- dispatcher->worker handoff, same convention as TASK/WORKSPACE/BOARD
     return [*base, "--session", session]
 
 
@@ -366,9 +374,12 @@ def _settle_and_close(name: str, pane_id: Optional[str]) -> tuple[bool, str, boo
     return True, report, not closed
 
 
-def start_agent(name: str, pane_id: str, model: str, effort: str) -> None:
-    """``herdr agent start <name> --kind claude --pane <pane> -- --model <model> --effort
-    <effort>`` — the interactive Claude Code path, never the Anthropic API.
+def start_agent(name: str, pane_id: str, model: str, effort: str, kind: str = _DEFAULT_KIND) -> None:
+    """``herdr agent start <name> --kind <kind> --pane <pane> -- --model <model> --effort
+    <effort>`` — the interactive coding-agent path, never a raw provider API. ``kind`` is whatever
+    the dispatcher resolved from ``kanban.herdr_board_agents`` for this board (``run()``'s own
+    caller); it is a parameter rather than hardcoded so this one function serves every installed
+    ``herdr agent`` kind, not just Claude/Codex.
 
     ``agent_not_ready`` is not treated as fatal on its own: Herdr returns it when it could not
     confirm input-readiness in time, but the agent may still be present and about to become
@@ -380,7 +391,7 @@ def start_agent(name: str, pane_id: str, model: str, effort: str) -> None:
     """
     try:
         _run_herdr([
-            "agent", "start", name, "--kind", "claude", "--pane", pane_id, "--timeout", "60000",
+            "agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", "60000",
             "--", "--model", model, "--effort", effort,
         ], timeout=_AGENT_START_TIMEOUT_S)
     except HerdrCliError as exc:
@@ -409,10 +420,12 @@ def prompt_agent(name: str, text: str) -> None:
     resending (a resend after real delivery would double-prompt the agent).
     """
     try:
-        # Verified live on a busy machine (15+ concurrent real agent panes): a cold-started
-        # interactive Claude Code session can take noticeably longer than 10s just to produce its
+        # Verified live on a busy machine (15+ concurrent real Claude Code agent panes): a
+        # cold-started interactive session can take noticeably longer than 10s just to produce its
         # first observed activity, well short of being stuck. 30s gives real resource contention
-        # room without masking an actually-wedged agent for long.
+        # room without masking an actually-wedged agent for long. Not separately verified for
+        # Codex agents, but the same timeout applies to both -- the risk is the same direction
+        # (too-short masks a slow-but-fine cold start), not a new one.
         _run_herdr(["agent", "prompt", name, text, "--wait", "--timeout", "30000"], timeout=_AGENT_PROMPT_TIMEOUT_S)
     except HerdrCliError as exc:
         if exc.code == "agent_blocked":
@@ -498,7 +511,7 @@ def _annotate_preserved_pane(success: bool, report: str, pane_preserved: bool) -
 
 
 def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
-        herdr_workspace: Optional[str] = None) -> tuple[bool, str]:
+        herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND) -> tuple[bool, str]:
     """Drive one card through the herdr-dispatch skill's workspace -> pane -> link -> agent
     lifecycle.
 
@@ -583,7 +596,7 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
             close_pane(pane_id)
             raise
         try:
-            start_agent(name, pane_id, model, effort)
+            start_agent(name, pane_id, model, effort, kind=kind)
         except BridgeError as exc:
             # Unlike link_pane, start_agent's own failure (including a bare CLI timeout) doesn't
             # prove the agent was never created -- the server may have created and started it
@@ -654,9 +667,7 @@ def main() -> int:
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     board = os.environ.get("HERMES_KANBAN_BOARD")
     workspace_dir = os.environ.get("HERMES_KANBAN_WORKSPACE")
-    model = os.environ.get("HERMES_KANBAN_HERDR_MODEL", _DEFAULT_MODEL)
-    effort = os.environ.get("HERMES_KANBAN_HERDR_EFFORT", _DEFAULT_EFFORT)
-    herdr_workspace = os.environ.get("HERMES_KANBAN_HERDR_WORKSPACE") or None
+    herdr_workspace = os.environ.get("HERMES_KANBAN_HERDR_WORKSPACE") or None  # health: allow HX002 -- dispatcher->worker handoff, same convention as TASK/WORKSPACE/BOARD
     if not task_id or not board or not workspace_dir:
         print(
             "kanban_direct_herdr_worker: missing HERMES_KANBAN_TASK/BOARD/WORKSPACE; "
@@ -664,6 +675,10 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    model = os.environ.get("HERMES_KANBAN_HERDR_MODEL", _DEFAULT_MODEL)  # health: allow HX002 -- dispatcher->worker handoff, same convention as TASK/WORKSPACE/BOARD
+    effort = os.environ.get("HERMES_KANBAN_HERDR_EFFORT", _DEFAULT_EFFORT)  # health: allow HX002 -- same handoff convention
+    kind = os.environ.get("HERMES_KANBAN_HERDR_KIND", _DEFAULT_KIND)  # health: allow HX002 -- same handoff convention, resolved from kanban.herdr_board_agents by the dispatcher
 
     # The dispatcher always sets this (kanban_db_dispatch.py's spawn path), same as the legacy
     # kanban_worker_client.py worker; a missing or malformed value silently turned into None here
@@ -688,7 +703,7 @@ def main() -> int:
         return 1
 
     try:
-        success, report = run(task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace)
+        success, report = run(task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind)
     except Exception as exc:  # health: allow BLE001 -- this is the process's top-level boundary;
         # a worker must exit cleanly with a reported reason, never hang or crash out with a
         # traceback the dispatcher's crash accounting can't read as a business failure.
