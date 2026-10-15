@@ -269,6 +269,14 @@ def link_pane(pane_id: str, task_id: str, board: str) -> None:
         raise BridgeError(f"pane {pane_id} tag did not verify after linking: {tokens!r}")
 
 
+def _pane_tokens(pane_id: str) -> dict:
+    """Read-only lookup of a pane's current tags -- unlike :func:`link_pane`, never writes
+    anything, so it can be used to check a pane's existing ownership before touching it."""
+    result = _run_herdr(["pane", "get", pane_id])
+    pane = result.get("pane") or result if isinstance(result, dict) else {}
+    return pane.get("tokens") or {}
+
+
 def agent_status(name: str) -> str:
     """The agent's live status, or ``""`` if no agent by that name exists.
 
@@ -331,9 +339,17 @@ def _settle_and_close(name: str, pane_id: Optional[str]) -> tuple[bool, str, boo
     # Read the report BEFORE closing: closing a pane tears down the agent living in it (verified
     # live -- a `read` issued after `close_pane` gets `agent_not_found`, not the transcript).
     report = read_agent(name)
+    # `read_agent` is itself a real call that can take time -- recheck once more immediately
+    # before closing so an agent that resumed DURING the read doesn't still get its pane closed
+    # out from under it. The work already succeeded (the report above is good); a resume here only
+    # changes whether it's safe to close, not whether this run counts as a success.
+    final_status = agent_status(name)
+    if final_status not in _SETTLED_STATUSES:
+        return True, report, True
+    closed = True
     if pane_id is not None:
-        close_pane(pane_id)
-    return True, report, False
+        closed = close_pane(pane_id)
+    return True, report, not closed
 
 
 def start_agent(name: str, pane_id: str, model: str, effort: str) -> None:
@@ -400,12 +416,15 @@ def read_agent(name: str) -> str:
     return str(result) if result else ""
 
 
-def close_pane(pane_id: str) -> None:
-    """Best-effort cleanup: a pane that is already gone is not a bridge failure."""
+def close_pane(pane_id: str) -> bool:
+    """Best-effort cleanup: a pane that is already gone is not a bridge failure, but a real close
+    failure is reported to the caller (as ``False``) rather than silently assumed to have
+    succeeded -- callers that care about leaked panes act on the return value."""
     try:
         _run_herdr(["pane", "close", pane_id])
+        return True
     except BridgeError:
-        pass
+        return False
 
 
 def _compose_prompt(task_id: str, board: Optional[str]) -> str:
@@ -450,22 +469,39 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
 
     If an agent named for this card is already live (a dispatcher retry after this bridge's own
     process crashed mid-run), that agent is reused instead of spawning a second one onto the same
-    pane slot. Its tag must still verify -- a pane that matches by name but not by tag isn't
-    safely identifiable as this card's own, and is refused rather than silently adopted. A
-    genuinely mid-flight agent (working/busy/blocked) goes straight to the wait/close path below;
-    anything else (idle, or any other status) gets the task prompt (re-)sent first: an `idle`
-    status here can't be trusted to mean "already handled this" -- the previous attempt may have
-    crashed between starting this agent and ever prompting it, and resending to an agent that
-    already finished the work is a safe no-op (it just re-confirms), while silently waiting on a
-    never-prompted agent would report a false success built from an unrelated transcript.
+    pane slot. Its pane's CURRENT tag is read (read-only, before anything is written) and must
+    already be unset or match this card -- a pane that matches by name but is already tagged for a
+    different card isn't safely identifiable as this card's own, and is refused rather than
+    adopted. This has to happen before :func:`link_pane`, not after: that call's own
+    ``report-metadata`` step unconditionally overwrites the tag, so a write-then-verify would just
+    confirm the write it itself made, never the pane's prior ownership. A genuinely mid-flight
+    agent (working/busy/blocked) goes straight to the wait/close path below; anything else (idle,
+    or any other status) gets the task prompt (re-)sent first: an `idle` status here can't be
+    trusted to mean "already handled this" -- the previous attempt may have crashed between
+    starting this agent and ever prompting it, and resending to an agent that already finished the
+    work is a safe no-op (it just re-confirms), while silently waiting on a never-prompted agent
+    would report a false success built from an unrelated transcript.
     """
     name = pane_name(board, task_id)
     try:
         existing = find_existing_agent(name)
         if existing is not None:
             pane_id = existing.get("pane_id")
-            if pane_id:
-                link_pane(pane_id, task_id, board)
+            if not pane_id:
+                return False, (
+                    f"agent {name} already exists but reported no pane_id; cannot verify "
+                    f"ownership before reuse"
+                )
+            tokens = _pane_tokens(pane_id)
+            owner_task = tokens.get("kanban_task")
+            owner_board = tokens.get("kanban_board")
+            if owner_task not in (None, task_id) or owner_board not in (None, board):
+                return False, (
+                    f"agent {name}'s pane {pane_id} is already tagged for a different card "
+                    f"(kanban_task={owner_task!r}, kanban_board={owner_board!r}); refusing to "
+                    f"adopt it"
+                )
+            link_pane(pane_id, task_id, board)
             status = agent_status(name)
             if status not in ("working", "busy", "blocked", "running"):
                 try:
@@ -490,9 +526,23 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
                 # ensure_board_workspace's docstring for why this can't happen any earlier).
                 close_pane(stale_root_pane_id)
             link_pane(pane_id, task_id, board)
-            start_agent(name, pane_id, model, effort)
         except BridgeError:
-            # No agent has actually started working yet, so a half-created pane is safe to drop.
+            # link_pane only ever touches pane metadata -- no agent exists yet at this point, so a
+            # pane that fails to tag is safe to drop outright.
+            close_pane(pane_id)
+            raise
+        try:
+            start_agent(name, pane_id, model, effort)
+        except BridgeError as exc:
+            # Unlike link_pane, start_agent's own failure (including a bare CLI timeout) doesn't
+            # prove the agent was never created -- the server may have created and started it
+            # despite a lost or slow response. Check before discarding a pane that could already
+            # hold a live executor.
+            if agent_status(name):
+                return False, (
+                    f"agent {name} start failed ambiguously ({exc}) but the agent exists; its "
+                    f"pane is preserved for investigation rather than discarded"
+                )
             close_pane(pane_id)
             raise
         try:

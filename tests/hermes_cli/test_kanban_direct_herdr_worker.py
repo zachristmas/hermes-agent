@@ -360,7 +360,24 @@ def test_run_refuses_to_reuse_an_agent_whose_pane_tag_wont_verify(tmp_path, monk
         "t_cb0795f9", "titan", "C:\\workspace\\t_cb0795f9", "claude-sonnet-5-5", "medium",
     )
     assert success is False
-    assert "tag did not verify" in report.lower(), report
+    assert "already tagged for a different card" in report.lower(), report
+
+
+_REUSE_NO_PANE_ID_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "list"]:
+    print(json.dumps({"result": {"agents": [{"name": "titan-t_cb0795f9", "agent_status": "working"}]}}))
+'''
+
+
+def test_run_refuses_to_reuse_an_agent_with_no_reported_pane_id(tmp_path, monkeypatch):
+    """A bare name match in `agent list` with no pane_id can't be ownership-checked at all -- that
+    must fail closed rather than silently trust the name match alone."""
+    _stub(tmp_path, monkeypatch, _REUSE_NO_PANE_ID_STUB)
+    success, report = bridge.run(
+        "t_cb0795f9", "titan", "C:\\workspace\\t_cb0795f9", "claude-sonnet-5-5", "medium",
+    )
+    assert success is False
+    assert "no pane_id" in report.lower(), report
 
 
 def test_agent_not_ready_is_not_fatal_when_agent_is_present(tmp_path, monkeypatch):
@@ -372,6 +389,41 @@ def test_agent_not_ready_is_fatal_when_agent_is_truly_absent(tmp_path, monkeypat
     _stub(tmp_path, monkeypatch, _AGENT_START_TRULY_MISSING_STUB)
     with pytest.raises(bridge.BridgeError):
         bridge.start_agent("titan-t_x", "w1:p2", "claude-sonnet-5-5", "medium")
+
+
+_START_TIMEOUT_BUT_AGENT_EXISTS_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["workspace", "list"]:
+    print(json.dumps({"result": {"workspaces": [{"label": "titan", "workspace_id": "wTitan"}]}}))
+elif a[:2] == ["tab", "create"]:
+    print(json.dumps({"result": {"tab": {"tab_id": "t2"}, "root_pane": {"pane_id": "w1:p2"}}}))
+elif a[:2] == ["agent", "list"]:
+    print(json.dumps({"result": {"agents": []}}))
+elif a[:2] == ["pane", "report-metadata"]:
+    pass
+elif a[:2] == ["pane", "get"]:
+    print(json.dumps({"result": {"pane": {"tokens": {"kanban_task": "t_cb0795f9", "kanban_board": "titan"}}}}))
+elif a[:2] == ["agent", "start"]:
+    # A bare CLI timeout -- doesn't prove the server never created the agent.
+    sys.stderr.write(json.dumps({"error": {"code": "timeout", "message": "start response lost"}}))
+    sys.exit(1)
+elif a[:2] == ["agent", "get"]:
+    print(json.dumps({"result": {"agent": {"agent_status": "working"}}}))
+elif a[:2] == ["pane", "close"]:
+    sys.stderr.write(json.dumps({"error": {"code": "bug", "message": "must not be called"}}))
+    sys.exit(1)
+'''
+
+
+def test_run_preserves_the_pane_when_start_agent_times_out_but_the_agent_exists(tmp_path, monkeypatch):
+    """A `start` timeout doesn't prove the server never created the agent -- it may have started
+    despite a lost/slow response. Closing the pane in that case would discard a live executor, the
+    exact P1 this whole fix round exists to prevent. Must check before discarding."""
+    _stub(tmp_path, monkeypatch, _START_TIMEOUT_BUT_AGENT_EXISTS_STUB)
+    success, report = bridge.run(
+        "t_cb0795f9", "titan", "C:\\workspace\\t_cb0795f9", "claude-sonnet-5-5", "medium",
+    )
+    assert success is False
+    assert "pane is preserved" in report.lower(), report
 
 
 _AGENT_NOT_FOUND_STUB = _STUB_PRELUDE + r'''
@@ -481,6 +533,59 @@ def test_settle_and_close_preserves_the_pane_on_an_unrecognized_status_not_just_
     assert success is False
     assert pane_preserved is True
     assert "not confirmed settled" in report.lower()
+
+
+_SETTLE_RESUMED_DURING_READ_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "wait"]:
+    print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+elif a[:2] == ["agent", "get"]:
+    # First recheck (right after wait): still idle. Second recheck (right before close, after the
+    # read): resumed to working -- simulating the agent picking work back up during the read call.
+    prior_gets = sum(1 for c in state["calls"][:-1] if c[:2] == ["agent", "get"])
+    status = "idle" if prior_gets == 0 else "working"
+    print(json.dumps({"result": {"agent": {"agent_status": status}}}))
+elif a[:2] == ["agent", "read"]:
+    print(json.dumps({"result": {"text": "finished"}}))
+elif a[:2] == ["pane", "close"]:
+    sys.stderr.write(json.dumps({"error": {"code": "bug", "message": "must not be called"}}))
+    sys.exit(1)
+'''
+
+
+def test_settle_and_close_preserves_the_pane_if_the_agent_resumes_during_the_report_read(
+    tmp_path, monkeypatch,
+):
+    """`read_agent` is itself a real call that can take time -- an agent that resumes work during
+    that read must not still get its pane closed out from under it. The read already succeeded, so
+    this is still a reported success; only the pane's fate changes."""
+    _stub(tmp_path, monkeypatch, _SETTLE_RESUMED_DURING_READ_STUB)
+    success, report, pane_preserved = bridge._settle_and_close("titan-t_x", "w1:p2")
+    assert success is True
+    assert pane_preserved is True
+    assert report == "finished"
+
+
+_SETTLE_CLOSE_FAILS_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "wait"]:
+    print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+elif a[:2] == ["agent", "get"]:
+    print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+elif a[:2] == ["agent", "read"]:
+    print(json.dumps({"result": {"text": "done"}}))
+elif a[:2] == ["pane", "close"]:
+    sys.stderr.write(json.dumps({"error": {"code": "pane_close_failed", "message": "herdr could not close the pane"}}))
+    sys.exit(1)
+'''
+
+
+def test_settle_and_close_reports_pane_preserved_when_close_itself_fails(tmp_path, monkeypatch):
+    """A real close failure (not just "it was already gone") must not be silently treated as
+    cleaned up -- the caller needs to know the pane may still be live."""
+    _stub(tmp_path, monkeypatch, _SETTLE_CLOSE_FAILS_STUB)
+    success, report, pane_preserved = bridge._settle_and_close("titan-t_x", "w1:p2")
+    assert success is True
+    assert pane_preserved is True
+    assert report == "done"
 
 
 def test_compose_prompt_falls_back_to_the_bare_instruction_when_the_board_is_unreachable():
