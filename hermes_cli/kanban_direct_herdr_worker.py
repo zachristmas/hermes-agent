@@ -9,7 +9,9 @@ the ``kanban_herdr_link`` tool and the ``kanban-herdr`` dashboard plugin use), s
 Code coding agent in it through the interactive ``herdr agent start --kind claude`` path (never
 the Anthropic API — this is still billed through the interactive Claude subscription, exactly as
 today), prompt it, wait for it, read its report, and clean up. It then marks the kanban card
-itself (``complete_task`` / ``block_task``) and exits with a real success/failure code.
+itself (``request_review`` on success, never ``complete_task`` — a settled Herdr status is not
+proof of correct work, so a human still reviews it — or ``block_task`` on failure) and exits with
+a real success/failure code.
 
 Nothing about the dispatcher's existing worker lifecycle changes: this process's own PID is
 what ``subprocess.Popen`` in ``_default_spawn`` returns, so ``_worker_alive``,
@@ -96,20 +98,29 @@ class AgentBlockedError(BridgeError):
 def herdr_command() -> list[str]:
     """Resolve the ``herdr`` executable: ``$HERDR_BIN``, then PATH, then the standalone-release
     glob — the same resolution order ``plugins/kanban-herdr/herdr_tool.py`` uses, reimplemented
-    here so this bridge has no import dependency on that separately-versioned plugin repo."""
+    here so this bridge has no import dependency on that separately-versioned plugin repo.
+
+    Pins ``--session`` (default ``default``, override via ``HERMES_KANBAN_HERDR_SESSION``) on
+    every call, per the herdr-dispatch skill's own rule for local work: without it, commands fall
+    back to whatever session context the calling process happened to inherit rather than the
+    recorded local session.
+    """
     env = os.environ.get("HERDR_BIN")
     if env:
-        return shlex.split(env, posix=(os.name != "nt"))
-    found = shutil.which("herdr")
-    if not found:
-        pattern = os.path.join(
-            os.path.expanduser("~"), ".herdr", "packages", "standalone", "releases", "*", "herdr*"
-        )
-        hits = sorted(h for h in glob.glob(pattern) if os.path.basename(h).lower() in ("herdr", "herdr.exe"))
-        found = hits[-1] if hits else None
-    if not found:
-        raise BridgeError("the herdr command isn't installed or isn't on PATH (set HERDR_BIN)")
-    return [found]
+        base = shlex.split(env, posix=(os.name != "nt"))
+    else:
+        found = shutil.which("herdr")
+        if not found:
+            pattern = os.path.join(
+                os.path.expanduser("~"), ".herdr", "packages", "standalone", "releases", "*", "herdr*"
+            )
+            hits = sorted(h for h in glob.glob(pattern) if os.path.basename(h).lower() in ("herdr", "herdr.exe"))
+            found = hits[-1] if hits else None
+        if not found:
+            raise BridgeError("the herdr command isn't installed or isn't on PATH (set HERDR_BIN)")
+        base = [found]
+    session = os.environ.get("HERMES_KANBAN_HERDR_SESSION") or "default"
+    return [*base, "--session", session]
 
 
 def _parse_json(text: Optional[str]) -> Any:
@@ -254,15 +265,73 @@ def link_pane(pane_id: str, task_id: str, board: str) -> None:
     after = _run_herdr(["pane", "get", pane_id])
     pane = after.get("pane") or after if isinstance(after, dict) else {}
     tokens = pane.get("tokens") or {}
-    if tokens.get("kanban_task") != task_id:
+    if tokens.get("kanban_task") != task_id or tokens.get("kanban_board") != board:
         raise BridgeError(f"pane {pane_id} tag did not verify after linking: {tokens!r}")
 
 
 def agent_status(name: str) -> str:
-    result = _run_herdr(["agent", "get", name])
+    """The agent's live status, or ``""`` if no agent by that name exists.
+
+    Verified live (herdr 0.9.3): ``agent get`` on a name with no agent returns the structured
+    error ``agent_not_found``, not an empty/absent result -- callers throughout this file
+    (``start_agent``'s ``agent_not_ready`` fallback among them) rely on a falsy return here for
+    "not present yet", so that specific code is swallowed rather than raised.
+    """
+    try:
+        result = _run_herdr(["agent", "get", name])
+    except HerdrCliError as exc:
+        if exc.code == "agent_not_found":
+            return ""
+        raise
     agent = result.get("agent") or result if isinstance(result, dict) else {}
     # Verified live (herdr 0.9.3): the field is `agent_status`, not `status`.
     return str(agent.get("agent_status") or "").lower()
+
+
+def find_existing_agent(name: str) -> Optional[dict]:
+    """The live ``agent list`` entry named ``name``, or ``None``.
+
+    Goes through ``agent list`` rather than ``agent get <name>`` + :func:`agent_status`: a crashed
+    attempt's existing agent is one entry among however many others are live, and ``agent list``'s
+    entry shape (including ``pane_id`` alongside ``agent_status``) was captured directly from a
+    real run and is already trusted.
+    """
+    result = _run_herdr(["agent", "list"])
+    agents = result.get("agents") if isinstance(result, dict) else None
+    for agent in agents or ():
+        if isinstance(agent, dict) and agent.get("name") == name:
+            return agent
+    return None
+
+
+def _settle_and_close(name: str, pane_id: Optional[str]) -> tuple[bool, str, bool]:
+    """Wait out the agent, then close its pane only if that's actually safe.
+
+    Returns ``(success, report, pane_preserved)``. Re-checks the agent's live status right before
+    closing (not just the status that got the caller here) per the herdr-dispatch skill's cleanup
+    rule: a blocked or still-working agent's pane is never closed, so a human can still reach it.
+    Only a genuinely settled (idle/done) or truly gone agent is closed.
+    """
+    status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000)
+    if status == "blocked":
+        return False, f"agent {name} is blocked on an approval/question dialog: {read_agent(name)}", True
+    if status not in _SETTLED_STATUSES:
+        return False, f"agent {name} did not reach idle/done before the wait timeout (status={status!r})", True
+    # Re-verify immediately before closing: `wait_agent` can itself time out and return a stale
+    # settled-looking read, or the agent can flip back to blocked/working between the wait
+    # returning and this check. Closing must act on the freshest state, not the wait's.
+    live_status = agent_status(name)
+    if live_status in ("blocked", "working", "busy", "running"):
+        return False, (
+            f"agent {name} reported {status!r} on wait but is now {live_status!r}; "
+            f"not closing its pane: {read_agent(name)}"
+        ), True
+    # Read the report BEFORE closing: closing a pane tears down the agent living in it (verified
+    # live -- a `read` issued after `close_pane` gets `agent_not_found`, not the transcript).
+    report = read_agent(name)
+    if pane_id is not None:
+        close_pane(pane_id)
+    return True, report, False
 
 
 def start_agent(name: str, pane_id: str, model: str, effort: str) -> None:
@@ -337,6 +406,35 @@ def close_pane(pane_id: str) -> None:
         pass
 
 
+def _compose_prompt(task_id: str, board: Optional[str]) -> str:
+    """``"work kanban task <id>"`` enriched with the card's own title/description when the DB is
+    reachable, so the agent's first move isn't a blind re-fetch of the card it was already handed.
+    Best-effort: any read failure falls back to the bare instruction rather than blocking dispatch
+    on a problem the agent itself can also just fix by reading the card.
+    """
+    base = f"work kanban task {task_id}"
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+
+        conn = kbc.connect(board=board)
+        try:
+            task = kb.get_task(conn, task_id)
+        finally:
+            conn.close()
+    except Exception:  # health: allow BLE001 -- best-effort enrichment only; any DB/connect
+        # failure here (missing board, locked file, schema drift) must fall back to the bare
+        # instruction, never block dispatch over a problem the agent can fix by reading the card.
+        return base
+    if task is None:
+        return base
+    lines = [base, "", f"Title: {task.title}"]
+    if task.body:
+        lines.append("")
+        lines.append(task.body.strip())
+    return "\n".join(lines)
+
+
 def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
         herdr_workspace: Optional[str] = None) -> tuple[bool, str]:
     """Drive one card through the herdr-dispatch skill's workspace -> pane -> link -> agent
@@ -347,63 +445,89 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
     crashing with a traceback. ``herdr_workspace`` overrides the board-derived workspace
     (``HERMES_KANBAN_HERDR_WORKSPACE`` in ``main()`` — a label or an id, resolved either way);
     otherwise the workspace is the one labelled after the board slug.
+
+    If an agent named for this card is already live (a dispatcher retry after this bridge's own
+    process crashed mid-run), that agent is reused instead of spawning a second one onto the same
+    pane slot: its tag is re-asserted and it goes straight to the wait/close path below, rather
+    than re-prompting work that may already be in flight.
     """
     name = pane_name(board, task_id)
-    pane_id: Optional[str] = None
     try:
+        existing = find_existing_agent(name)
+        if existing is not None:
+            pane_id = existing.get("pane_id")
+            if pane_id:
+                try:
+                    link_pane(pane_id, task_id, board)
+                except BridgeError:
+                    pass  # best-effort re-tag; the agent's own live state is authoritative
+            success, report, _pane_preserved = _settle_and_close(name, pane_id)
+            return success, report
+
         if herdr_workspace:
             workspace_id, stale_root_pane_id = resolve_workspace_id(herdr_workspace), None
         else:
             workspace_id, stale_root_pane_id = ensure_board_workspace(board)
         pane_id = create_pane(name, workspace_dir, herdr_workspace=workspace_id)
-        if stale_root_pane_id:
-            # The real pane now exists, so the just-created workspace's throwaway root pane is
-            # safe to close without deleting the workspace out from under it (see
-            # ensure_board_workspace's docstring for why this can't happen any earlier).
-            close_pane(stale_root_pane_id)
-        link_pane(pane_id, task_id, board)
-        start_agent(name, pane_id, model, effort)
         try:
-            prompt_agent(name, f"work kanban task {task_id}")
+            if stale_root_pane_id:
+                # The real pane now exists, so the just-created workspace's throwaway root pane is
+                # safe to close without deleting the workspace out from under it (see
+                # ensure_board_workspace's docstring for why this can't happen any earlier).
+                close_pane(stale_root_pane_id)
+            link_pane(pane_id, task_id, board)
+            start_agent(name, pane_id, model, effort)
+        except BridgeError:
+            # No agent has actually started working yet, so a half-created pane is safe to drop.
+            close_pane(pane_id)
+            raise
+        try:
+            prompt_agent(name, _compose_prompt(task_id, board))
         except AgentBlockedError as exc:
             return False, (
                 f"agent {name} is blocked on an approval/question dialog and was not "
                 f"auto-answered: {exc}"
             )
-        status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000)
-        if status == "blocked":
-            return False, f"agent {name} is blocked on an approval/question dialog: {read_agent(name)}"
-        if status not in _SETTLED_STATUSES:
-            return False, f"agent {name} did not reach idle/done before the wait timeout (status={status!r})"
-        return True, read_agent(name)
+        success, report, _pane_preserved = _settle_and_close(name, pane_id)
+        return success, report
     except BridgeError as exc:
         return False, str(exc)
-    finally:
-        if pane_id is not None:
-            close_pane(pane_id)
 
 
-def _mark_card(task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str) -> None:
-    """Record the bridge's result on the card itself — the same completion/block path a
-    dispatcher-spawned chat worker's own ``kanban_complete``/``kanban_block`` tool call would
-    take, with the same run-ownership proof (``expected_run_id``)."""
+def _mark_card(
+    task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str,
+) -> tuple[bool, Optional[str]]:
+    """Record the bridge's result on the card itself, with the same run-ownership proof
+    (``expected_run_id``) a dispatcher-spawned chat worker's own ``kanban_complete``/
+    ``kanban_block`` tool call would carry.
+
+    A settled Herdr agent status is a lifecycle signal, not proof the work was actually done
+    correctly (the herdr-dispatch skill is explicit: finish agent work in Review, never Done), so
+    success routes to ``request_review`` for a human to judge, not straight to ``done``.
+
+    Returns ``(ok, reason)``: a card transition can be refused (stale ``expected_run_id``, a
+    status the transition doesn't apply from, ...) without raising, and a caller that only checked
+    for an exception would wrongly treat a no-op as a recorded result.
+    """
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
 
     conn = kbc.connect(board=board)
     try:
         if success:
-            kb.complete_task(
+            ok, reason = kb.request_review(
                 conn, task_id,
-                result=report.strip() or "Direct Herdr dispatch completed with no report text.",
-                expected_run_id=run_id,
+                summary=report.strip() or "Direct Herdr dispatch completed with no report text.",
+                expected_run_id=run_id, with_reason=True,
             )
         else:
-            kb.block_task(
+            ok = kb.block_task(
                 conn, task_id,
                 reason=report.strip() or "Direct Herdr dispatch failed with no further detail.",
                 kind="transient", expected_run_id=run_id,
             )
+            reason = None
+        return ok, reason
     finally:
         conn.close()
 
@@ -415,12 +539,6 @@ def main() -> int:
     model = os.environ.get("HERMES_KANBAN_HERDR_MODEL", _DEFAULT_MODEL)
     effort = os.environ.get("HERMES_KANBAN_HERDR_EFFORT", _DEFAULT_EFFORT)
     herdr_workspace = os.environ.get("HERMES_KANBAN_HERDR_WORKSPACE") or None
-    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
-    try:
-        run_id = int(raw_run_id) if raw_run_id else None
-    except ValueError:
-        run_id = None
-
     if not task_id or not board or not workspace_dir:
         print(
             "kanban_direct_herdr_worker: missing HERMES_KANBAN_TASK/BOARD/WORKSPACE; "
@@ -429,18 +547,50 @@ def main() -> int:
         )
         return 1
 
+    # The dispatcher always sets this (kanban_db_dispatch.py's spawn path), same as the legacy
+    # kanban_worker_client.py worker; a missing or malformed value silently turned into None here
+    # would drop the run-ownership fence that keeps a stale/duplicate run from overwriting a card a
+    # newer run already owns, so it is a hard failure, not a quiet fallback.
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if raw_run_id is None:
+        print(
+            "kanban_direct_herdr_worker: missing HERMES_KANBAN_RUN_ID; refusing to run without a "
+            "verifiable run id.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        run_id = int(raw_run_id)
+    except ValueError:
+        print(
+            f"kanban_direct_herdr_worker: malformed HERMES_KANBAN_RUN_ID={raw_run_id!r}; refusing "
+            "to run without a verifiable run id.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         success, report = run(task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace)
-    except Exception as exc:  # a worker must exit cleanly, never hang or crash out
+    except Exception as exc:  # health: allow BLE001 -- this is the process's top-level boundary;
+        # a worker must exit cleanly with a reported reason, never hang or crash out with a
+        # traceback the dispatcher's crash accounting can't read as a business failure.
         success, report = False, f"direct-herdr bridge crashed: {exc}"
 
     print(report)
     try:
-        _mark_card(task_id, board, run_id, success, report)
-    except Exception as exc:  # the pane/agent work already happened; a failure to
-        # record it must still exit non-zero (so the dispatcher's crash/failure accounting sees
-        # it), not raise past this process's own error handling.
+        card_ok, card_reason = _mark_card(task_id, board, run_id, success, report)
+    except Exception as exc:  # health: allow BLE001 -- the pane/agent work already happened; a
+        # failure to record it must still exit non-zero (so the dispatcher's crash/failure
+        # accounting sees it), not raise past this process's own top-level error handling.
         print(f"kanban_direct_herdr_worker: could not record the card result: {exc}", file=sys.stderr)
+        return 1
+    if not card_ok:
+        suffix = f" ({card_reason})" if card_reason else ""
+        print(
+            f"kanban_direct_herdr_worker: card transition was rejected{suffix}; "
+            f"run_id={run_id!r} may no longer own this card's claim.",
+            file=sys.stderr,
+        )
         return 1
     return 0 if success else 1
 

@@ -38,6 +38,8 @@ def _save(state):
         json.dump(state, f)
 
 a = sys.argv[1:]
+if a[:1] == ["--session"]:
+    a = a[2:]  # herdr_command() pins --session <name> ahead of every real subcommand
 state = _load()
 state["calls"].append(a)
 _save(state)
@@ -77,6 +79,8 @@ elif a[:2] == ["agent", "wait"]:
     print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
 elif a[:2] == ["agent", "get"]:
     print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+elif a[:2] == ["agent", "list"]:
+    print(json.dumps({"result": {"agents": state.get("agents", [])}}))
 elif a[:2] == ["agent", "read"]:
     assert "--source" in a and "recent-unwrapped" in a, "bridge must use recent-unwrapped as the read source"
     print(json.dumps({"result": {"text": "Card done: fixed the thing."}}))
@@ -137,6 +141,17 @@ elif a[:2] == ["agent", "get"]:
     print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
 '''
 
+_WRONG_BOARD_TAG_STUB = _STUB_PRELUDE + r'''
+# Simulates a server that silently ignores the metadata write (or a pane that was tagged for a
+# different board earlier and never actually got re-tagged): `pane get` always reads back a
+# `gsd`-board tag no matter what `report-metadata` was just asked to set.
+if a[:2] == ["pane", "report-metadata"]:
+    pass
+elif a[:2] == ["pane", "get"]:
+    pane_id = a[2]
+    print(json.dumps({"result": {"pane": {"id": pane_id, "tokens": {"kanban_task": "t_cb0795f9", "kanban_board": "gsd"}}}}))
+'''
+
 
 def _stub(tmp_path, monkeypatch, script_text, *, name="stub_herdr.py"):
     script = tmp_path / name
@@ -193,12 +208,18 @@ def test_happy_path_drives_full_lifecycle_and_returns_report(happy_herdr):
     assert ("workspace", "create") in kinds  # no "titan"-labelled workspace existed yet
     assert ("tab", "create") in kinds
     assert ("pane", "report-metadata") in kinds
+    assert ("agent", "list") in kinds  # checked for a surviving agent from a prior crashed attempt
     assert ("agent", "start") in kinds
     assert ("agent", "prompt") in kinds
     assert ("agent", "wait") in kinds
     assert ("agent", "read") in kinds
-    assert ("pane", "close") in kinds  # cleanup always runs, even on the happy path
+    assert ("pane", "close") in kinds  # a genuinely settled agent's pane is closed
     assert kinds.count(("pane", "get")) >= 1  # the link must have been verified by reading it back
+    # Closing a pane tears down the agent living in it (verified live) -- the report must be read
+    # BEFORE the work pane closes, or the read-back gets agent_not_found instead of the
+    # transcript. (The *first* "pane close" here is the unrelated stale-root-pane cleanup that
+    # happens before the agent even starts; the work pane's close is the last one.)
+    assert kinds.index(("agent", "read")) < len(kinds) - 1 - kinds[::-1].index(("pane", "close"))
 
 
 def test_ensure_board_workspace_reuses_an_existing_label_without_creating(happy_herdr):
@@ -249,8 +270,42 @@ def test_link_pane_verifies_the_tag_was_actually_set(happy_herdr):
     assert state["tokens"]["w1:p2"]["kanban_board"] == "titan"
 
 
+def test_link_pane_rejects_a_tag_from_the_wrong_board(tmp_path, monkeypatch):
+    """A pane that reads back with the right task id but a different board's tag (the metadata
+    write didn't actually take, or the pane was tagged for another board earlier) must not verify
+    -- both tokens are checked, not just the task."""
+    _stub(tmp_path, monkeypatch, _WRONG_BOARD_TAG_STUB)
+    with pytest.raises(bridge.BridgeError):
+        bridge.link_pane("w1:p2", "t_cb0795f9", "titan")
+
+
 def test_create_pane_reads_pane_id_from_root_pane(happy_herdr):
     assert bridge.create_pane("titan-t_x", "C:\\ws", herdr_workspace="titan") == "w1:p2"
+
+
+def test_find_existing_agent_returns_none_when_no_agent_matches(happy_herdr):
+    assert bridge.find_existing_agent("titan-t_cb0795f9") is None
+
+
+def test_run_reuses_a_surviving_agent_instead_of_spawning_a_second_one(happy_herdr):
+    """A dispatcher retry after this bridge's own process crashed mid-run must not create a
+    second pane/agent onto the same name -- it re-tags and waits on the one already live."""
+    state = {"tokens": {}, "calls": [], "workspaces": [],
+              "agents": [{"name": "titan-t_cb0795f9", "pane_id": "w1:p9", "agent_status": "working"}]}
+    happy_herdr.write_text(json.dumps(state), encoding="utf-8")
+
+    success, report = bridge.run(
+        "t_cb0795f9", "titan", "C:\\workspace\\t_cb0795f9", "claude-sonnet-5-5", "medium",
+    )
+    assert success is True
+    assert report == "Card done: fixed the thing."
+
+    kinds = [tuple(c[:2]) for c in json.loads(happy_herdr.read_text())["calls"]]
+    assert ("workspace", "create") not in kinds
+    assert ("tab", "create") not in kinds
+    assert ("agent", "start") not in kinds
+    assert ("agent", "prompt") not in kinds
+    assert ("agent", "wait") in kinds
 
 
 def test_agent_not_ready_is_not_fatal_when_agent_is_present(tmp_path, monkeypatch):
@@ -262,6 +317,21 @@ def test_agent_not_ready_is_fatal_when_agent_is_truly_absent(tmp_path, monkeypat
     _stub(tmp_path, monkeypatch, _AGENT_START_TRULY_MISSING_STUB)
     with pytest.raises(bridge.BridgeError):
         bridge.start_agent("titan-t_x", "w1:p2", "claude-sonnet-5-5", "medium")
+
+
+_AGENT_NOT_FOUND_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "get"]:
+    sys.stderr.write(json.dumps({"error": {"code": "agent_not_found", "message": "agent target x not found"}}))
+    sys.exit(1)
+'''
+
+
+def test_agent_status_reports_empty_for_a_truly_missing_agent_rather_than_raising(tmp_path, monkeypatch):
+    """Verified live (herdr 0.9.3): `agent get` on a name with no agent returns the structured
+    error `agent_not_found`, not an empty/absent result. `start_agent`'s own `agent_not_ready`
+    fallback calls `agent_status` expecting a falsy return for "not present yet", not a crash."""
+    _stub(tmp_path, monkeypatch, _AGENT_NOT_FOUND_STUB)
+    assert bridge.agent_status("titan-t_x") == ""
 
 
 def test_agent_blocked_on_prompt_is_surfaced_not_auto_answered(tmp_path, monkeypatch):
@@ -296,6 +366,52 @@ def test_herdr_unreachable_fails_cleanly_without_hanging(unreachable_herdr):
     assert "herdr" in report.lower() or "connection refused" in report.lower()
 
 
+_SETTLE_BLOCKED_ON_RECHECK_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "wait"]:
+    print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+elif a[:2] == ["agent", "get"]:
+    # Flips to blocked between the wait returning and the pre-close recheck.
+    print(json.dumps({"result": {"agent": {"agent_status": "blocked"}}}))
+elif a[:2] == ["agent", "read"]:
+    print(json.dumps({"result": {"text": "needs approval to continue"}}))
+elif a[:2] == ["pane", "close"]:
+    sys.stderr.write(json.dumps({"error": {"code": "bug", "message": "must not be called"}}))
+    sys.exit(1)
+'''
+
+
+def test_settle_and_close_preserves_the_pane_when_still_blocked_on_wait(tmp_path, monkeypatch):
+    _stub(tmp_path, monkeypatch, _SETTLE_BLOCKED_ON_RECHECK_STUB)
+    success, report, pane_preserved = bridge._settle_and_close("titan-t_x", "w1:p2")
+    assert success is False
+    assert pane_preserved is True
+    assert "blocked" in report.lower()
+
+
+def test_settle_and_close_rechecks_status_right_before_closing(tmp_path, monkeypatch):
+    """`wait` can itself time out and return a stale settled-looking read, or the agent can flip
+    back to working between the wait returning and the close -- the pane must not be closed on a
+    stale status read."""
+    _stub(tmp_path, monkeypatch, _SETTLE_BLOCKED_ON_RECHECK_STUB)
+    # The "must not be called" pane-close stub above proves close_pane was never invoked: if it
+    # had been, `_run_herdr` would surface that stub's error as a BridgeError and fail this test.
+    bridge._settle_and_close("titan-t_x", "w1:p2")
+
+
+def test_compose_prompt_falls_back_to_the_bare_instruction_when_the_board_is_unreachable():
+    # No kanban DB fixture is set up here -- kbc.connect() fails, and the fallback must still work.
+    assert bridge._compose_prompt("t_cb0795f9", "no-such-board") == "work kanban task t_cb0795f9"
+
+
+def test_compose_prompt_enriches_with_the_cards_title_and_body(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="Fix the thing", body="Do the specific repro steps.")
+    prompt = bridge._compose_prompt(tid, kb.DEFAULT_BOARD)
+    assert prompt.startswith(f"work kanban task {tid}")
+    assert "Fix the thing" in prompt
+    assert "Do the specific repro steps." in prompt
+
+
 def test_herdr_bin_not_found_raises_bridge_error(monkeypatch, tmp_path):
     monkeypatch.delenv("HERDR_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path))  # a PATH with no herdr on it
@@ -308,39 +424,61 @@ def test_herdr_bin_not_found_raises_bridge_error(monkeypatch, tmp_path):
         bridge.herdr_command()
 
 
-def test_main_happy_path_marks_card_complete_and_exits_zero(happy_herdr, kanban_home, monkeypatch):
+def test_main_happy_path_requests_review_and_exits_zero(happy_herdr, kanban_home, monkeypatch):
+    """Per the herdr-dispatch skill ("finish agent work in Review, never Done"): a settled Herdr
+    status is not proof the work was actually done correctly, so success lands on `review`, not
+    `done`, for a human to judge."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="direct herdr card", assignee="default")
-        run = kb.latest_run(conn, tid)
-        run_id = run.id if run else None
+        claimed = kb.claim_task(conn, tid)
         workspace = kanban_home.parent / "workspace"
         workspace.mkdir()
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
-        if run_id is not None:
-            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
         exit_code = bridge.main()
 
         task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
     assert exit_code == 0
-    assert task.status == "done"
-    assert task.result == "Card done: fixed the thing."
+    assert task.status == "review"
+    summaries = " ".join(str((e.payload or {}).get("summary", "")) for e in events)
+    assert "Card done: fixed the thing." in summaries
+
+
+def test_main_exits_nonzero_when_the_card_transition_is_rejected(happy_herdr, kanban_home, monkeypatch):
+    """A stale/duplicate `HERMES_KANBAN_RUN_ID` (the claim moved on since this run started) must
+    not be swallowed as a successful exit -- `request_review`'s boolean return is checked, not
+    just whether it raised."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="direct herdr card", assignee="default")
+        kb.claim_task(conn, tid)  # a real run exists; HERMES_KANBAN_RUN_ID below deliberately isn't it
+        workspace = kanban_home.parent / "workspace3"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")  # does not match the real current run
+
+        exit_code = bridge.main()
+
+        task = kb.get_task(conn, tid)
+    assert exit_code == 1
+    assert task.status == "running"  # the rejected transition left the card exactly where it was
 
 
 def test_main_failure_path_blocks_card_and_exits_nonzero(unreachable_herdr, kanban_home, monkeypatch):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="direct herdr card (down)", assignee="default")
-        run = kb.latest_run(conn, tid)
-        run_id = run.id if run else None
+        claimed = kb.claim_task(conn, tid)
         workspace = kanban_home.parent / "workspace2"
         workspace.mkdir()
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
-        if run_id is not None:
-            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
         exit_code = bridge.main()
 
@@ -356,4 +494,23 @@ def test_main_exits_nonzero_without_required_env(monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_WORKSPACE", raising=False)
+    assert bridge.main() == 1
+
+
+def test_main_exits_nonzero_without_a_run_id(monkeypatch, tmp_path):
+    # The dispatcher always sets this; a worker started any other way must refuse rather than
+    # silently drop the run-ownership fence that protects a stale/duplicate run from overwriting a
+    # card a newer run already owns.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "titan")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    assert bridge.main() == 1
+
+
+def test_main_exits_nonzero_with_a_malformed_run_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_x")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "titan")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-a-number")
     assert bridge.main() == 1
