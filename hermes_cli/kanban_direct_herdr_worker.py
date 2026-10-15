@@ -310,7 +310,7 @@ def _settle_and_close(name: str, pane_id: Optional[str]) -> tuple[bool, str, boo
     Returns ``(success, report, pane_preserved)``. Re-checks the agent's live status right before
     closing (not just the status that got the caller here) per the herdr-dispatch skill's cleanup
     rule: a blocked or still-working agent's pane is never closed, so a human can still reach it.
-    Only a genuinely settled (idle/done) or truly gone agent is closed.
+    Only an agent confirmed genuinely settled (idle/done/finished) by BOTH checks is closed.
     """
     status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000)
     if status == "blocked":
@@ -318,13 +318,15 @@ def _settle_and_close(name: str, pane_id: Optional[str]) -> tuple[bool, str, boo
     if status not in _SETTLED_STATUSES:
         return False, f"agent {name} did not reach idle/done before the wait timeout (status={status!r})", True
     # Re-verify immediately before closing: `wait_agent` can itself time out and return a stale
-    # settled-looking read, or the agent can flip back to blocked/working between the wait
-    # returning and this check. Closing must act on the freshest state, not the wait's.
+    # settled-looking read, or the agent can flip to blocked/working/some other status between the
+    # wait returning and this check. Require the live status to still be positively settled rather
+    # than excluding a few known-unsafe ones -- an empty, "unknown", or any future status this file
+    # doesn't recognize must not fall through to "safe to close" by default.
     live_status = agent_status(name)
-    if live_status in ("blocked", "working", "busy", "running"):
+    if live_status not in _SETTLED_STATUSES:
         return False, (
-            f"agent {name} reported {status!r} on wait but is now {live_status!r}; "
-            f"not closing its pane: {read_agent(name)}"
+            f"agent {name} reported {status!r} on wait but is now {live_status!r}, not confirmed "
+            f"settled; not closing its pane: {read_agent(name)}"
         ), True
     # Read the report BEFORE closing: closing a pane tears down the agent living in it (verified
     # live -- a `read` issued after `close_pane` gets `agent_not_found`, not the transcript).

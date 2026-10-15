@@ -453,6 +453,36 @@ def test_settle_and_close_rechecks_status_right_before_closing(tmp_path, monkeyp
     bridge._settle_and_close("titan-t_x", "w1:p2")
 
 
+_SETTLE_UNKNOWN_STATUS_ON_RECHECK_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "wait"]:
+    print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+elif a[:2] == ["agent", "get"]:
+    # An unrecognized status (not idle/done/finished, and not one of the obviously-unsafe ones
+    # either) on the pre-close recheck -- a future herdr status this file doesn't know about yet,
+    # or the agent genuinely gone.
+    print(json.dumps({"result": {"agent": {"agent_status": "paused"}}}))
+elif a[:2] == ["agent", "read"]:
+    print(json.dumps({"result": {"text": "unclear"}}))
+elif a[:2] == ["pane", "close"]:
+    sys.stderr.write(json.dumps({"error": {"code": "bug", "message": "must not be called"}}))
+    sys.exit(1)
+'''
+
+
+def test_settle_and_close_preserves_the_pane_on_an_unrecognized_status_not_just_known_unsafe_ones(
+    tmp_path, monkeypatch,
+):
+    """The pre-close recheck must require the live status to be positively confirmed settled
+    (idle/done/finished), not merely absent from a hardcoded list of known-unsafe statuses -- an
+    empty, "unknown", or any future status this file doesn't recognize must fail closed, not fall
+    through to "safe to close" by default."""
+    _stub(tmp_path, monkeypatch, _SETTLE_UNKNOWN_STATUS_ON_RECHECK_STUB)
+    success, report, pane_preserved = bridge._settle_and_close("titan-t_x", "w1:p2")
+    assert success is False
+    assert pane_preserved is True
+    assert "not confirmed settled" in report.lower()
+
+
 def test_compose_prompt_falls_back_to_the_bare_instruction_when_the_board_is_unreachable():
     # No kanban DB fixture is set up here -- kbc.connect() fails, and the fallback must still work.
     assert bridge._compose_prompt("t_cb0795f9", "no-such-board") == "work kanban task t_cb0795f9"
