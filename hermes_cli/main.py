@@ -2445,7 +2445,6 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
-
 def _coalesce_session_name_args(argv: list) -> list:
     """Join unquoted multi-word session names after -c/--continue and -r/--resume.
 
@@ -3376,6 +3375,7 @@ def _build_cli_parser():
     from hermes_cli.subcommands.peer import build_peer_parser
     build_peer_parser(subparsers)
 
+    from hermes_cli.subcommands.herdr_pane import build_herdr_pane_parser; build_herdr_pane_parser(subparsers)
     from hermes_cli.portal_cli import add_parser as _add_portal_parser
     _add_portal_parser(subparsers)
 
