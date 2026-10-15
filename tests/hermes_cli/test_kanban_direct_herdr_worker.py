@@ -76,9 +76,20 @@ elif a[:2] == ["agent", "start"]:
 elif a[:2] == ["agent", "prompt"]:
     print(json.dumps({"result": {}}))
 elif a[:2] == ["agent", "wait"]:
+    # Settling is what "wait" means -- any tracked agent (the reuse-path fixtures) moves to idle
+    # here, so a later `agent get` re-check (the pre-close freshness recheck) sees it consistently,
+    # not whatever stale status it was seeded with.
+    name = a[2]
+    for ag in state.get("agents", []):
+        if ag.get("name") == name:
+            ag["agent_status"] = "idle"
+    _save(state)
     print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
 elif a[:2] == ["agent", "get"]:
-    print(json.dumps({"result": {"agent": {"agent_status": "idle"}}}))
+    name = a[2]
+    known = next((ag for ag in state.get("agents", []) if ag.get("name") == name), None)
+    status = known.get("agent_status", "idle") if known else "idle"
+    print(json.dumps({"result": {"agent": {"agent_status": status}}}))
 elif a[:2] == ["agent", "list"]:
     print(json.dumps({"result": {"agents": state.get("agents", [])}}))
 elif a[:2] == ["agent", "read"]:
@@ -306,6 +317,50 @@ def test_run_reuses_a_surviving_agent_instead_of_spawning_a_second_one(happy_her
     assert ("agent", "start") not in kinds
     assert ("agent", "prompt") not in kinds
     assert ("agent", "wait") in kinds
+
+
+def test_run_reprompts_a_reused_agent_that_is_idle_rather_than_assuming_it_already_ran(happy_herdr):
+    """A crashed prior attempt could have started this agent and never actually prompted it (the
+    crash window is between those two calls) -- an `idle` status on reuse can't be trusted to mean
+    "already handled this", or a never-prompted agent's irrelevant transcript gets reported as a
+    false success. Unlike a genuinely mid-flight agent (working/busy/blocked), idle gets the task
+    (re-)sent before waiting."""
+    state = {"tokens": {}, "calls": [], "workspaces": [],
+              "agents": [{"name": "titan-t_cb0795f9", "pane_id": "w1:p9", "agent_status": "idle"}]}
+    happy_herdr.write_text(json.dumps(state), encoding="utf-8")
+
+    success, report = bridge.run(
+        "t_cb0795f9", "titan", "C:\\workspace\\t_cb0795f9", "claude-sonnet-5-5", "medium",
+    )
+    assert success is True, report
+
+    kinds = [tuple(c[:2]) for c in json.loads(happy_herdr.read_text())["calls"]]
+    assert ("workspace", "create") not in kinds
+    assert ("tab", "create") not in kinds
+    assert ("agent", "start") not in kinds
+    assert ("agent", "prompt") in kinds
+
+
+_REUSE_WRONG_TAG_STUB = _STUB_PRELUDE + r'''
+if a[:2] == ["agent", "list"]:
+    print(json.dumps({"result": {"agents": [{"name": "titan-t_cb0795f9", "pane_id": "w1:p9", "agent_status": "working"}]}}))
+elif a[:2] == ["pane", "report-metadata"]:
+    pass
+elif a[:2] == ["pane", "get"]:
+    print(json.dumps({"result": {"pane": {"id": a[2], "tokens": {"kanban_task": "t_cb0795f9", "kanban_board": "gsd"}}}}))
+'''
+
+
+def test_run_refuses_to_reuse_an_agent_whose_pane_tag_wont_verify(tmp_path, monkeypatch):
+    """A name match alone isn't enough to treat a live agent as this card's own -- if its pane's
+    tag won't verify (wrong board here), that must fail closed, not silently proceed to wait on
+    and report an unverifiable agent's transcript as this card's result."""
+    _stub(tmp_path, monkeypatch, _REUSE_WRONG_TAG_STUB)
+    success, report = bridge.run(
+        "t_cb0795f9", "titan", "C:\\workspace\\t_cb0795f9", "claude-sonnet-5-5", "medium",
+    )
+    assert success is False
+    assert "tag did not verify" in report.lower(), report
 
 
 def test_agent_not_ready_is_not_fatal_when_agent_is_present(tmp_path, monkeypatch):

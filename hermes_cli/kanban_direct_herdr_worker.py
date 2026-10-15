@@ -448,8 +448,14 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
 
     If an agent named for this card is already live (a dispatcher retry after this bridge's own
     process crashed mid-run), that agent is reused instead of spawning a second one onto the same
-    pane slot: its tag is re-asserted and it goes straight to the wait/close path below, rather
-    than re-prompting work that may already be in flight.
+    pane slot. Its tag must still verify -- a pane that matches by name but not by tag isn't
+    safely identifiable as this card's own, and is refused rather than silently adopted. A
+    genuinely mid-flight agent (working/busy/blocked) goes straight to the wait/close path below;
+    anything else (idle, or any other status) gets the task prompt (re-)sent first: an `idle`
+    status here can't be trusted to mean "already handled this" -- the previous attempt may have
+    crashed between starting this agent and ever prompting it, and resending to an agent that
+    already finished the work is a safe no-op (it just re-confirms), while silently waiting on a
+    never-prompted agent would report a false success built from an unrelated transcript.
     """
     name = pane_name(board, task_id)
     try:
@@ -457,10 +463,16 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
         if existing is not None:
             pane_id = existing.get("pane_id")
             if pane_id:
+                link_pane(pane_id, task_id, board)
+            status = agent_status(name)
+            if status not in ("working", "busy", "blocked", "running"):
                 try:
-                    link_pane(pane_id, task_id, board)
-                except BridgeError:
-                    pass  # best-effort re-tag; the agent's own live state is authoritative
+                    prompt_agent(name, _compose_prompt(task_id, board))
+                except AgentBlockedError as exc:
+                    return False, (
+                        f"agent {name} is blocked on an approval/question dialog and was not "
+                        f"auto-answered: {exc}"
+                    )
             success, report, _pane_preserved = _settle_and_close(name, pane_id)
             return success, report
 
