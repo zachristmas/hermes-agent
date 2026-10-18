@@ -456,11 +456,15 @@ export const bulkTasks = (ids: string[], patch: Record<string, unknown>) =>
     })
   )
 
+// The one author identity the desktop posts under; the kernel only lets a comment's
+// original author edit it, so the drawer shows edit controls for exactly this name.
+export const DESKTOP_AUTHOR = 'desktop'
+
 export const addComment = (id: string, body: string) =>
-  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body } })
+  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: DESKTOP_AUTHOR, body } })
 
 export const editComment = (id: string, commentId: number | string, body: string) =>
-  call(withBoard(`/tasks/${id}/comments/${commentId}`), { method: 'PATCH', body: { author: 'desktop', body } })
+  call(withBoard(`/tasks/${id}/comments/${commentId}`), { method: 'PATCH', body: { author: DESKTOP_AUTHOR, body } })
 
 export const reassignTask = (id: string, profile: string) =>
   nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))

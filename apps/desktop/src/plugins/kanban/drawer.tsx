@@ -42,6 +42,7 @@ import {
   addComment,
   boardKeyPrefix,
   deleteTask,
+  DESKTOP_AUTHOR,
   editComment,
   estimateTask,
   fetchLog,
@@ -430,7 +431,7 @@ function CommentComposer({
   )
 }
 
-// Only the original author (the desktop posts as 'desktop') may edit; the
+// Only the original author (the desktop posts as DESKTOP_AUTHOR) may edit; the
 // kernel enforces it, the UI just hides the control on other authors' comments.
 function CommentItem({
   comment,
@@ -455,7 +456,7 @@ function CommentItem({
             {k.commentEdited(comment.edits)}
           </span>
         ) : null}
-        {comment.author === 'desktop' && !editing && (
+        {comment.author === DESKTOP_AUTHOR && !editing && (
           <Button
             aria-label={k.editComment}
             className="ml-auto"
