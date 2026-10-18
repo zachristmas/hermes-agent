@@ -136,6 +136,35 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     return metadata
 
 
+
+class DeferralBackoff:
+    """Per-completion-group retry spacing for admissions the owner refused.
+
+    A refusal (paused or unknown-execution parent session) leaves the durable row pending and the
+    event queued; without spacing the 2s watcher re-attempts it forever. State is in memory only, so a
+    restart retries once immediately and no result is ever dropped or marked delivered here."""
+
+    BASE_SECONDS = 4.0
+    MAX_SECONDS = 300.0
+
+    def __init__(self, clock=None) -> None:
+        import time as _time
+        self._clock = clock or _time.monotonic
+        self._state: dict = {}
+
+    def ready(self, key) -> bool:
+        entry = self._state.get(key)
+        return entry is None or self._clock() >= entry[0]
+
+    def deferred(self, key) -> tuple:
+        attempt = self._state.get(key, (0.0, 0))[1] + 1
+        delay = min(self.MAX_SECONDS, self.BASE_SECONDS * (2 ** (attempt - 1)))
+        self._state[key] = (self._clock() + delay, attempt)
+        return delay, attempt
+
+    def clear(self, key) -> None:
+        self._state.pop(key, None)
+
 class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
@@ -1523,13 +1552,30 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
                     groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
+                backoff = self.__dict__.setdefault("_async_deferral_backoff", DeferralBackoff())
                 for group in groups.values():
+                    key = tuple(sorted(str(evt.get("delegation_id") or id(evt)) for evt in group))
+                    if not backoff.ready(key):
+                        # Refused earlier and still cooling down: keep the durable row and queued event,
+                        # skip the admission attempt and its "injecting" log line.
+                        for evt in group:
+                            _pr.completion_queue.put(evt)
+                        continue
                     try:
                         delivered = await self._deliver_async_delegation_group(group)
                         if delivered is False:
+                            delay, attempt = backoff.deferred(key)
+                            if attempt == 1 or attempt % 5 == 0:
+                                logger.warning(
+                                    "Async delegation completion(s) %s not admitted (attempt %d); "
+                                    "kept pending, next retry in %.0fs",
+                                    ",".join(key)[:120], attempt, delay)
                             for evt in group:
                                 _pr.completion_queue.put(evt)
+                        else:
+                            backoff.clear(key)
                     except Exception as e:
+                        backoff.deferred(key)
                         for evt in group:
                             _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
