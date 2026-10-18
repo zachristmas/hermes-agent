@@ -281,7 +281,7 @@ class GatewayKanbanWatchersMixin:
                 await _to_thread_process_service(maintenance.tick_once)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # health: allow BLE001 -- logged with traceback; one failed tick must not end the loop
                 logger.exception("kanban maintenance: tick failed")
             await self._sleep_between_ticks(settings.interval)
 
