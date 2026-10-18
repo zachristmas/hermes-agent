@@ -959,6 +959,7 @@ hermes kanban assign <id> <profile>                    # or 'none' to unassign
 hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to a profile
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
+hermes kanban edit <id> --summary "..."                # correct an idle card's shown summary (old text kept)
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
 hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
@@ -1442,6 +1443,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `assigned` | `{assignee}` | Assignee changed (including unassignment). |
 | `edited` | `{fields}` | Title or body updated. |
 | `reprioritized` | `{priority}` | Priority changed. |
+| `summary_edited` | `{summary, previous_summary, status, editor, previous_result?}` | `kanban edit --summary` or the drawer's summary edit rewrote the summary an idle card shows (its newest run summary, plus a done card's `result` when it held the same text). The replaced text is kept here; `run_id` is that run. |
 | `status` | `{status}` | Dashboard drag-drop wrote a status directly (e.g. `todo → ready`). Carries the `run_id` of the run that was reclaimed when dragging off `running`; otherwise `run_id` is NULL. |
 
 **Worker telemetry** (about the execution process, not the logical task):

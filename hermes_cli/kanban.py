@@ -1274,14 +1274,14 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        # --summary alone corrects an idle review card's handoff summary; with --result it is
-        # the done-card backfill's summary, as before.
+        # --summary alone corrects an idle card's displayed summary (old text kept in a
+        # summary_edited event); with --result it is the done-card backfill's summary, as before.
         if result is None and summary is not None:
-            ok, why = kbrs.edit_review_summary(conn, args.task_id, summary=summary)
+            ok, why = kbrs.edit_summary(conn, args.task_id, summary=summary, editor=_profile_author())
             if not ok:
                 return _err(f"cannot edit the summary of {args.task_id}: {why}")
             if all(value is None for value in (title, body, priority)):
-                return _ok_or_err(True, "", f"Edited {args.task_id} (review summary)")
+                return _ok_or_err(True, "", f"Edited {args.task_id} (summary)")
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary if result is not None else None, metadata=metadata,

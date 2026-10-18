@@ -90,7 +90,7 @@ _NOTIFY_TARGET = (
     _arg("--thread-id"),
 )
 _STEP_HANDOFF = (
-    _arg("--summary", help="Structured handoff summary. Falls back to --result if omitted."),
+    _arg("--summary", help="Alone: correct the summary an idle card shows (any status; old text kept in a summary_edited event). With --result: the done-card backfill summary."),
     _arg("--metadata", help="JSON dict of structured facts to store on the latest completed run."),
 )
 

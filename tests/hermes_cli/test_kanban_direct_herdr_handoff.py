@@ -15,7 +15,7 @@ from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
-from hermes_cli.kanban_db_review_summary import edit_review_summary
+from hermes_cli.kanban_db_review_summary import edit_summary
 from hermes_cli import kanban_direct_herdr_handoff as handoff
 from hermes_cli import kanban_direct_herdr_worker as bridge
 
@@ -212,10 +212,19 @@ def test_a_board_that_did_not_opt_in_keeps_the_plain_bridge(kanban_home, monkeyp
     code, task, _, atts, events = _run_main(
         kanban_home, monkeypatch, lambda tid, rid: "Card done: fixed the thing.", enable=False,
     )
-    # plain settlement: no verified workspace deliverable means a partial, never Review
-    assert code == 0 and task.status != "review"
+    # plain settlement: a finished turn reaches Review on its summary, with or without a file
+    assert code == 0 and task.status == "review"
     assert _receipt(events)["require_artifacts"] is True
     assert not atts
+
+
+def test_a_handoff_only_report_is_held_back_from_review(kanban_home, monkeypatch):
+    _enable(kanban_home, "titan")  # default board is not listed
+    code, task, _, _, _ = _run_main(
+        kanban_home, monkeypatch,
+        lambda tid, rid: "Wrote a transfer handoff; the implementation is still pending.", enable=False,
+    )
+    assert code == 0 and task.status != "review"
 
 
 def test_stale_run_id_still_cannot_move_a_gated_card(kanban_home, monkeypatch):
@@ -251,14 +260,14 @@ def _edit(tid, **kw):
     return kanban_cli._cmd_edit(argparse.Namespace(**ns))
 
 
-def test_review_summary_edit_preserves_status_assignee_runs_and_old_text(kanban_home):
+def test_summary_edit_preserves_status_assignee_runs_and_old_text(kanban_home):
     with kbc.connect() as conn:
         tid = _review_card(conn)
         before = kb.get_task(conn, tid)
         runs_before = [r.id for r in kb.list_runs(conn, tid)]
         events_before = [e.id for e in kb.list_events(conn, tid)]
 
-        ok, why = edit_review_summary(conn, tid, summary=COMMAND + "\n\nclean prose")
+        ok, why = edit_summary(conn, tid, summary=COMMAND + "\n\nclean prose", editor="desktop")
         after = kb.get_task(conn, tid)
         events_after = kb.list_events(conn, tid)
 
@@ -268,43 +277,53 @@ def test_review_summary_edit_preserves_status_assignee_runs_and_old_text(kanban_
     assert [r.id for r in kb.list_runs(kbc.connect(), tid)] == runs_before  # no new run
     assert [e.id for e in events_after][: len(events_before)] == events_before  # history intact
     new = events_after[-1]
-    assert new.kind == "review_summary_edited"
+    assert new.kind == "summary_edited"
     assert new.payload["previous_summary"].startswith("▐▛███▛█")
+    assert new.payload["editor"] == "desktop"
     with kbc.connect() as conn:
         assert kb.latest_run(conn, tid).summary.startswith(COMMAND)
 
 
-def test_review_summary_edit_is_refused_for_a_live_claim_and_for_non_review_cards(kanban_home):
+def test_summary_edit_is_refused_for_a_live_claim_or_a_card_without_a_summary(kanban_home):
     with kbc.connect() as conn:
         running = kb.create_task(conn, title="running", assignee="default")
         kb.claim_task(conn, running)
         ready = kb.create_task(conn, title="ready", assignee="default")
-        done = kb.create_task(conn, title="done", assignee="default")
-        claimed = kb.claim_task(conn, done)
-        kb.complete_task(conn, done, result="x", expected_run_id=claimed.current_run_id)
         reviewing = _review_card(conn)
         # a reviewer has claimed the review card: it is no longer idle
         conn.execute("UPDATE tasks SET claim_lock = 'reviewer:1' WHERE id = ?", (reviewing,))
         conn.commit()
 
-        for tid in (running, ready, done, reviewing):
-            ok, why = edit_review_summary(conn, tid, summary=COMMAND)
+        for tid in (running, ready, reviewing):
+            ok, why = edit_summary(conn, tid, summary=COMMAND)
             assert not ok and why, tid
         assert kb.get_task(conn, running).status == "running"
-        assert kb.get_task(conn, ready).status == "ready"
-        assert kb.get_task(conn, done).status == "done"
         assert kb.get_task(conn, reviewing).status == "review"
-        assert not edit_review_summary(conn, "t_missing", summary=COMMAND)[0]
-        assert not edit_review_summary(conn, ready, summary="  ")[0]
+        assert not edit_summary(conn, "t_missing", summary=COMMAND)[0]
 
 
-def test_cli_edit_summary_alone_corrects_a_review_card_and_rejects_other_cards(kanban_home, capsys):
+def test_summary_edit_corrects_a_done_card_and_its_matching_result(kanban_home):
+    with kbc.connect() as conn:
+        done = kb.create_task(conn, title="done", assignee="default")
+        claimed = kb.claim_task(conn, done)
+        kb.complete_task(conn, done, result="raw", summary="raw", expected_run_id=claimed.current_run_id)
+        ok, why = edit_summary(conn, done, summary="clean")
+        assert (ok, why) == (True, None)
+        assert not edit_summary(conn, done, summary="  ")[0]
+        task = kb.get_task(conn, done)
+        assert (task.status, task.result, kb.latest_summary(conn, done)) == ("done", "clean", "clean")
+        event = kb.list_events(conn, done)[-1]
+        assert (event.kind, event.payload["previous_summary"], event.payload["previous_result"]) == (
+            "summary_edited", "raw", "raw")
+
+
+def test_cli_edit_summary_alone_corrects_a_review_card_and_rejects_a_card_without_a_summary(kanban_home, capsys):
     with kbc.connect() as conn:
         tid = _review_card(conn)
         other = kb.create_task(conn, title="ready", assignee="default")
     assert _edit(tid, summary=COMMAND) == 0
     assert _edit(other, summary=COMMAND) == 1
-    assert "not review" in capsys.readouterr().err
+    assert "no run summary" in capsys.readouterr().err
     assert _edit(tid, metadata="{}") == 2  # metadata still needs --result
     with kbc.connect() as conn:
         assert kb.get_task(conn, tid).status == "review"

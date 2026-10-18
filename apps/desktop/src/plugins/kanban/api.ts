@@ -468,6 +468,10 @@ export const addComment = (id: string, body: string) =>
 export const editComment = (id: string, commentId: number | string, body: string) =>
   call(withBoard(`/tasks/${id}/comments/${commentId}`), { method: 'PATCH', body: { author: DESKTOP_AUTHOR, body } })
 
+// Corrects the summary an idle card shows; the backend keeps the replaced text in a summary_edited event.
+export const editSummary = (id: string, summary: string) =>
+  call(withBoard(`/tasks/${id}/summary`), { method: 'PATCH', body: { editor: 'desktop', summary } })
+
 export const reassignTask = (id: string, profile: string) =>
   nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
 
