@@ -668,9 +668,9 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_paused
+    from hermes_cli.kanban_settlement import owner_hold_or_continue
     for row in rows:
-        if owner_reclaim_paused(conn, row["id"]):
+        if owner_hold_or_continue(conn, row["id"]):
             continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
@@ -779,9 +779,9 @@ def detect_stale_running(
         "WHERE t.status = 'running'"
     ).fetchall()
 
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_paused
+    from hermes_cli.kanban_settlement import owner_hold_or_continue
     for row in rows:
-        if owner_reclaim_paused(conn, row["id"]):
+        if owner_hold_or_continue(conn, row["id"]):
             continue
         if row["active_started_at"] is None:
             continue
@@ -866,9 +866,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_paused
+    from hermes_cli.kanban_settlement import owner_hold_or_continue
     for row in rows:
-        if owner_reclaim_paused(conn, row["id"]):
+        if owner_hold_or_continue(conn, row["id"]):
             continue
         tid = row["id"]
         pid = row["worker_pid"]
@@ -1376,6 +1376,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1398,10 +1399,16 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
+    failure_run_id = expected_run_id
     with _kb.write_txn(conn):
+        where = "WHERE id = ?"
+        params: tuple[Any, ...] = (task_id,)
+        if expected_run_id is not None:
+            where += " AND status = 'running' AND current_run_id = ?"
+            params = (task_id, int(expected_run_id))
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "FROM tasks " + where, params,
         ).fetchone()
         if row is None:
             return False
@@ -1421,14 +1428,18 @@ def _record_task_failure(
 
         if infrastructure or not (force_trip or failures >= effective_limit):
             if release_claim:
-                # Spawn path: restore the claimed source phase + clear claim.
-                conn.execute(
+                # Restore the claimed source phase + clear only this fenced run's claim.
+                claim_guard = " AND current_run_id = ?" if expected_run_id is not None else ""
+                claim_params = (retry_status, failures, error, task_id, int(expected_run_id)) if expected_run_id is not None else (retry_status, failures, error, task_id)
+                claim_cursor = conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error, task_id),
+                    "WHERE id = ? AND status = 'running'" + claim_guard,
+                    claim_params,
                 )
+                if expected_run_id is not None and claim_cursor.rowcount != 1:
+                    return False
             else:
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
@@ -1437,25 +1448,33 @@ def _record_task_failure(
                 )
             # Timeout/crash path's caller already emitted its own event.
             if end_run:
+                open_run = _kb._current_run_id(conn, task_id)
+                if expected_run_id is not None and open_run != int(expected_run_id):
+                    return False
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
                     detail["infrastructure"] = True
-                run_id = _kb._end_run(
+                failure_run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
-                _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
+                _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=failure_run_id)
             return False
 
         # Spawn path (release_claim) is still running and also clears claim
         # state; the timeout/crash path already did.
-        conn.execute(
+        failure_run_id = None
+        claim_guard = " AND current_run_id = ?" if expected_run_id is not None else ""
+        claim_params = (failures, error, task_id, int(expected_run_id)) if expected_run_id is not None else (failures, error, task_id)
+        updated = conn.execute(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
                if release_claim else "")
             + "consecutive_failures = ?, last_failure_error = ? "
-            "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
+            "WHERE id = ? AND status IN ('running', 'ready', 'review')" + claim_guard,
+            claim_params,
         )
+        if expected_run_id is not None and updated.rowcount != 1:
+            return False  # fenced settle lost the run (claim moved on): write nothing
         payload = {
             "failures": failures,
             "effective_limit": effective_limit,
@@ -1464,10 +1483,9 @@ def _record_task_failure(
             "trigger_outcome": outcome,
             "retry_status": retry_status,
         }
-        run_id = None
         if end_run:
             # Only the spawn path has an open run to close.
-            run_id = _kb._end_run(
+            failure_run_id = _kb._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
                 metadata={
                     "failures": failures,
@@ -1483,7 +1501,7 @@ def _record_task_failure(
             payload["sticky"] = True
         if event_payload_extra:
             payload.update(event_payload_extra)
-        _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+        _kb._append_event(conn, task_id, "gave_up", payload, run_id=failure_run_id)
         return True
 
 
@@ -2221,6 +2239,15 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    # Settle finished attempts from their durable result receipts BEFORE stale-claim
+    # reclaim can book them as failures, and retry pauses waiting for owner stop evidence.
+    # Runs on every tick, including maintenance-only ticks while spawning is paused.
+    from hermes_cli import kanban_settlement as _settlement
+    try:
+        _settlement.reconcile_settlements(conn)
+        _settlement.reconcile_pending_pauses(conn)
+    except Exception:  # health: allow BLE001 -- logged with traceback; the rest of the sweep must still run
+        _kb._log.exception("kanban settlement reconcile failed; continuing sweep")
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)

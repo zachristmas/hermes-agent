@@ -1894,6 +1894,8 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
+        # dispatch_in_gateway false still runs settlement/hold maintenance ticks (max_spawn=0, no spawns).
+        "maintenance_when_paused": True,
         # Per-board opt-in (list/comma-string): boards listed auto-claim review-column tasks and
         # spawn the assignee; empty/None/unreadable all mean "off" (human-only review, the default).
         "review_dispatch_boards": None,

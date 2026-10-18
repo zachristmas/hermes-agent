@@ -10,6 +10,7 @@ in ``kanban_watchers_common``.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import time
 from pathlib import Path
@@ -254,6 +255,36 @@ class GatewayKanbanWatchersMixin:
                            "on config control alone.", _lock_path)
         return _load_config, _kb, kanban_cfg
 
+    async def _kanban_maintenance_watcher(self) -> None:
+        """Maintenance-only ticks while spawning is disabled (``dispatch_in_gateway: false``).
+
+        Same sweep as the dispatcher (stale claims, recovery holds, result-receipt settlement,
+        pending operator pauses) with ``max_spawn=0``, so nothing is admitted or spawned.
+        Gated by ``kanban.maintenance_when_paused`` (default True). The per-board tick lock
+        already serialises it against any other dispatcher on the same DB.
+        """
+        try:
+            from hermes_cli.config import load_config as _load_config
+            from hermes_cli import kanban_db as _kb
+            kanban_cfg = (await asyncio.to_thread(_load_config) or {}).get("kanban", {}) or {}
+        except Exception as exc:  # health: allow BLE001 -- unreadable config means maintenance stays off
+            logger.warning("kanban maintenance: cannot load config (%s); not running", exc)
+            return
+        if kanban_cfg.get("dispatch_in_gateway", True) or not kanban_cfg.get("maintenance_when_paused", True):
+            return
+        settings = dataclasses.replace(_resolve_dispatcher_settings(kanban_cfg, _kb), max_spawn=0)
+        maintenance = _KanbanDispatcher(_kb, settings)
+        await asyncio.sleep(5)
+        logger.info("kanban maintenance: running with spawning disabled (interval=%.1fs)", settings.interval)
+        while self._running:
+            try:
+                await _to_thread_process_service(maintenance.tick_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("kanban maintenance: tick failed")
+            await self._sleep_between_ticks(settings.interval)
+
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
@@ -265,6 +296,8 @@ class GatewayKanbanWatchersMixin:
         """
         boot = self._kanban_dispatcher_boot()
         if boot is None:
+            # Spawning is disabled by config; settlement/hold maintenance must still run.
+            await self._kanban_maintenance_watcher()
             return
         _load_config, _kb, kanban_cfg = boot
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
@@ -280,6 +313,7 @@ class GatewayKanbanWatchersMixin:
         last_warn_at = 0
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
+        maintenance = _KanbanDispatcher(_kb, dataclasses.replace(settings, max_spawn=0))
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
@@ -298,6 +332,8 @@ class GatewayKanbanWatchersMixin:
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
+                    # Admission stays paused; settlement and recovery-hold maintenance does not.
+                    await _to_thread_process_service(maintenance.tick_once)
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.

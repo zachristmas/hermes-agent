@@ -94,7 +94,8 @@ elif a[:2] == ["agent", "list"]:
     print(json.dumps({"result": {"agents": state.get("agents", [])}}))
 elif a[:2] == ["agent", "read"]:
     assert "--source" in a and "recent-unwrapped" in a, "bridge must use recent-unwrapped as the read source"
-    print(json.dumps({"result": {"text": "Card done: fixed the thing."}}))
+    report = state.get("report", "Card done: fixed the thing.")
+    print(json.dumps({"result": {"text": report}}))
 elif a[:2] == ["pane", "close"]:
     print(json.dumps({"result": {}}))
 else:
@@ -174,6 +175,14 @@ def _stub(tmp_path, monkeypatch, script_text, *, name="stub_herdr.py"):
     monkeypatch.setenv("STUB_STATE", str(state))
     monkeypatch.setenv("HERDR_BIN", f"{sys.executable} {script}")
     return state
+
+
+def _set_stub_report(state_path, text):
+    """The stub creates its state file on first call; seed it so a test can pre-set the report."""
+    path = Path(state_path)
+    state = json.loads(path.read_text()) if path.exists() else {"tokens": {}, "calls": [], "workspaces": []}
+    state["report"] = text
+    path.write_text(json.dumps(state))
 
 
 @pytest.fixture
@@ -725,28 +734,105 @@ def test_herdr_bin_not_found_raises_bridge_error(monkeypatch, tmp_path):
         bridge.herdr_command()
 
 
-def test_main_happy_path_requests_review_and_exits_zero(happy_herdr, kanban_home, monkeypatch):
-    """Per the herdr-dispatch skill ("finish agent work in Review, never Done"): a settled Herdr
-    status is not proof the work was actually done correctly, so success lands on `review`, not
-    `done`, for a human to judge."""
+def test_main_happy_path_records_receipt_and_the_dispatcher_sweep_enters_review(happy_herdr, kanban_home, monkeypatch):
+    """Per the herdr-dispatch skill ("finish agent work in Review, never Done"): the bridge only
+    records a durable run-scoped receipt for the exact settled native agent; the dispatcher
+    settlement sweep (not the bridge) moves the card, and success lands on `review`, never `done`."""
+    from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="direct herdr card", assignee="default")
         claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
         workspace = kanban_home.parent / "workspace"
         workspace.mkdir()
+        (workspace / "DELIVERABLE.md").write_text("reviewable artifact")
+        _set_stub_report(happy_herdr, f"Final deliverable: {workspace / 'DELIVERABLE.md'}")
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
         exit_code = bridge.main()
+        assert exit_code == 0
+        assert kb.get_task(conn, tid).status == "running"  # the bridge itself never transitions the card
+        receipts = [e for e in kb.list_events(conn, tid) if e.kind == "worker_result_receipt"]
+        assert receipts and receipts[0].payload["artifacts"], receipts and receipts[0].payload
 
+        kbd.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)  # admission disabled
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
-    assert exit_code == 0
     assert task.status == "review"
+    # Attachment copying (kernel _stage_completion_artifacts) applies to scratch-workspace artifacts
+    # only; this test's workspace is external, so assert the durable Review reference instead.
+    reviewed = [e for e in events if e.kind == "review_requested"]
+    assert reviewed and any("DELIVERABLE.md" in p for p in reviewed[0].payload["artifacts"])
     summaries = " ".join(str((e.payload or {}).get("summary", "")) for e in events)
-    assert "Card done: fixed the thing." in summaries
+    assert "DELIVERABLE.md" in summaries
+
+
+def test_success_receipt_requires_the_exact_settled_native_agent(happy_herdr, kanban_home, tmp_path):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fence", assignee="default")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
+    ws = tmp_path / "ws-fence"
+    ws.mkdir()
+    (ws / "D.md").write_text("artifact")
+    report = f"done {ws / 'D.md'}"
+    # No native agent named: refused, nothing recorded.
+    with pytest.raises(bridge.BridgeError):
+        bridge._mark_card(tid, None, run_id, True, report, workspace_dir=str(ws), settlement_owner=True)
+    # Not owned by the dispatcher settlement: refused.
+    with pytest.raises(bridge.BridgeError):
+        bridge._mark_card(tid, None, run_id, True, report, workspace_dir=str(ws), agent_name="x")
+    with kbc.connect() as conn:
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "worker_result_receipt"]
+
+
+def test_success_receipt_refused_while_the_native_agent_is_not_terminal(kanban_home, tmp_path, monkeypatch):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="fence2", assignee="default")
+        run_id = kb.claim_task(conn, tid).current_run_id
+    ws = tmp_path / "ws-fence2"
+    ws.mkdir()
+    (ws / "D.md").write_text("artifact")
+    monkeypatch.setattr(bridge, "agent_status", lambda name, machine_id=None: "working")
+    with pytest.raises(bridge.BridgeError):
+        bridge._mark_card(tid, None, run_id, True, f"done {ws / 'D.md'}", workspace_dir=str(ws),
+                          settlement_owner=True, agent_name="a1")
+    with kbc.connect() as conn:
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "worker_result_receipt"]
+
+
+def test_main_withholds_review_without_a_real_artifact(happy_herdr, kanban_home, monkeypatch):
+    from hermes_cli import kanban_db_dispatch as kbd
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="handoff only", assignee="default")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        workspace = kanban_home.parent / "workspace-handoff-only"
+        workspace.mkdir()
+        _set_stub_report(happy_herdr, "Handoff written; ready for Review.")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+        exit_code = bridge.main()
+        assert exit_code == 0  # receipt recorded; the DISPATCHER decides the card outcome
+        assert kb.get_task(conn, tid).status == "running"
+        kbd.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        runs = kb.list_runs(conn, tid)
+    assert task is not None
+    # no verified deliverable: settled as a truthful partial (owner kept), never Review
+    assert task.status == "ready"
+    assert task.block_kind is None
+    assert runs[-1].outcome == "partial_result"
+    assert any(e.kind == "partial_result_detail" for e in events)
+    assert not any(e.kind == "review_requested" for e in events)
+    assert not kb.list_attachments(conn, tid)
 
 
 def test_main_exits_nonzero_when_the_card_transition_is_rejected(happy_herdr, kanban_home, monkeypatch):
@@ -770,7 +856,11 @@ def test_main_exits_nonzero_when_the_card_transition_is_rejected(happy_herdr, ka
     assert task.status == "running"  # the rejected transition left the card exactly where it was
 
 
-def test_main_failure_path_blocks_card_and_exits_nonzero(unreachable_herdr, kanban_home, monkeypatch):
+def test_main_failure_without_a_native_agent_writes_no_receipt_and_leaves_the_card_fenced(unreachable_herdr, kanban_home, monkeypatch):
+    """Herdr unreachable: no exact native agent exists, so the bridge refuses to write ANY receipt
+    (it never fabricates a result). The card is untouched and stays Running under its lease; the
+    lease/owner-fence sweep (not the bridge) later closes it or holds it visibly."""
+    from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="direct herdr card (down)", assignee="default")
         claimed = kb.claim_task(conn, tid)
@@ -782,13 +872,12 @@ def test_main_failure_path_blocks_card_and_exits_nonzero(unreachable_herdr, kanb
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
         exit_code = bridge.main()
-
+        assert exit_code == 1
+        kbd.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
-    assert exit_code == 1
-    assert task.status == "blocked"
-    reasons = " ".join(str((e.payload or {}).get("reason", "")) for e in events).lower()
-    assert "herdr" in reasons or "connection refused" in reasons
+    assert task.status == "running"  # fresh lease: nothing transitions it, nothing reaches Done/Review
+    assert not any(e.kind in {"worker_result_receipt", "completed", "review_requested"} for e in events)
 
 
 def test_main_exits_nonzero_without_required_env(monkeypatch):
@@ -815,3 +904,124 @@ def test_main_exits_nonzero_with_a_malformed_run_id(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-a-number")
     assert bridge.main() == 1
+
+
+# --- fresh pane is not a usable shell yet (CS board agent_pane_busy blocks) -----------------
+
+_FRESH_PANE_STUB = _HAPPY_STUB.replace(
+    '''elif a[:2] == ["pane", "get"]:
+    pane_id = a[2]
+    print(json.dumps({"result": {"pane": {"id": pane_id, "tokens": state["tokens"].get(pane_id, {})}}}))''',
+    '''elif a[:2] == ["pane", "get"]:
+    pane_id = a[2]
+    n = state.get("pane_gets", 0) + 1
+    state["pane_gets"] = n
+    _save(state)
+    pane = {"id": pane_id, "tokens": state["tokens"].get(pane_id, {}), "revision": 1 if n > 3 else 0}
+    print(json.dumps({"result": {"pane": pane}}))''',
+).replace(
+    '''elif a[:2] == ["agent", "start"]:
+    print(json.dumps({"result": {"agent": {"name": a[2]}}}))''',
+    '''elif a[:2] == ["agent", "start"]:
+    starts = state.get("starts", 0) + 1
+    state["starts"] = starts
+    state["start_args"] = a
+    _save(state)
+    if starts <= int(os.environ.get("STUB_BUSY_STARTS", "0")):
+        sys.stderr.write(json.dumps({"error": {"code": "agent_pane_busy",
+                         "message": "agent target pane " + a[a.index("--pane") + 1] + " is not an available shell"}}))
+        sys.exit(1)
+    print(json.dumps({"result": {"agent": {"name": a[2]}}}))''',
+)
+
+
+def test_herdr_agent_profile_uses_dispatch_profile_home_for_board_defaults(monkeypatch, tmp_path):
+    config = tmp_path / "profiles" / "cs-orchestrator" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("kanban:\n  herdr_board_agents:\n    cs:\n      kind: codex\n      model: gpt-6.1-sol\n      effort: low\n")
+    monkeypatch.setenv("HERMES_PROFILE", "cs-orchestrator")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # custom root: profiles live under <root>/profiles
+    assert bridge._herdr_agent_profile_for_worker(
+        "cs", "claude", "claude-sonnet-5-5", "medium",
+    ) == ("codex", "gpt-6.1-sol", "low")
+
+
+def test_herdr_agent_profile_respects_per_task_overrides(monkeypatch, tmp_path):
+    config = tmp_path / "profiles" / "cs-orchestrator" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("kanban:\n  herdr_board_agents:\n    cs:\n      kind: codex\n      model: gpt-6.1-sol\n      effort: low\n")
+    monkeypatch.setenv("HERMES_PROFILE", "cs-orchestrator")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # custom root: profiles live under <root>/profiles
+    assert bridge._herdr_agent_profile_for_worker(
+        "cs", "claude", "task-model", "high", has_model_override=True, has_effort_override=True,
+    ) == ("codex", "task-model", "high")
+
+
+def test_herdr_agent_args_use_harness_specific_permission_bypass():
+    assert bridge._herdr_agent_args("codex", "gpt-6.1-sol", "low") == [
+        "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "--yolo",
+    ]
+    assert bridge._herdr_agent_args("claude", "claude-sonnet-5-5", "medium") == [
+        "--model", "claude-sonnet-5-5", "--effort", "medium", "--dangerously-skip-permissions",
+    ]
+
+
+def test_start_agent_uses_codex_yolo_without_unsupported_effort_flag(tmp_path, monkeypatch):
+    state = _stub(tmp_path, monkeypatch, _HAPPY_STUB)
+    bridge.start_agent("cs-t_x", "w1:p2", "gpt-6.1-sol", "low", kind="codex")
+    args = json.loads(state.read_text())["calls"]
+    start = next(call for call in args if call[:2] == ["agent", "start"])
+    assert start[start.index("--") + 1:] == [
+        "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "--yolo",
+    ]
+
+
+def test_start_agent_uses_claude_skip_permissions(tmp_path, monkeypatch):
+    state = _stub(tmp_path, monkeypatch, _HAPPY_STUB)
+    bridge.start_agent("cs-t_x", "w1:p2", "claude-sonnet-5-5", "medium", kind="claude")
+    args = json.loads(state.read_text())["calls"]
+    start = next(call for call in args if call[:2] == ["agent", "start"])
+    assert start[start.index("--") + 1:] == [
+        "--model", "claude-sonnet-5-5", "--effort", "medium", "--dangerously-skip-permissions",
+    ]
+
+
+def test_wait_pane_shell_ready_polls_until_the_shell_has_drawn(tmp_path, monkeypatch):
+    state = _stub(tmp_path, monkeypatch, _FRESH_PANE_STUB)
+    monkeypatch.setattr(bridge, "_PANE_SHELL_POLL_S", 0)
+    assert bridge.wait_pane_shell_ready("w1:p2", timeout_s=5) is True
+    assert json.loads(state.read_text())["pane_gets"] == 4
+
+
+def test_wait_pane_shell_ready_times_out_without_raising(tmp_path, monkeypatch):
+    _stub(tmp_path, monkeypatch, _FRESH_PANE_STUB)
+    monkeypatch.setattr(bridge, "_PANE_SHELL_POLL_S", 0)
+    assert bridge.wait_pane_shell_ready("w1:p2", timeout_s=0) is False
+
+
+def test_start_agent_retries_agent_pane_busy_then_succeeds(tmp_path, monkeypatch):
+    state = _stub(tmp_path, monkeypatch, _FRESH_PANE_STUB)
+    monkeypatch.setenv("STUB_BUSY_STARTS", "2")
+    monkeypatch.setattr(bridge, "_START_BUSY_BACKOFF_S", 0)
+    bridge.start_agent("cs-t_x", "w1:p2", "claude-sonnet-5-5", "medium")
+    assert json.loads(state.read_text())["starts"] == 3
+
+
+def test_start_agent_gives_up_after_bounded_agent_pane_busy_retries(tmp_path, monkeypatch):
+    state = _stub(tmp_path, monkeypatch, _FRESH_PANE_STUB)
+    monkeypatch.setenv("STUB_BUSY_STARTS", "99")
+    monkeypatch.setattr(bridge, "_START_BUSY_BACKOFF_S", 0)
+    with pytest.raises(bridge.HerdrCliError) as exc:
+        bridge.start_agent("cs-t_x", "w1:p2", "claude-sonnet-5-5", "medium")
+    assert exc.value.code == "agent_pane_busy"
+    assert json.loads(state.read_text())["starts"] == bridge._START_BUSY_RETRIES + 1
+
+
+def test_run_waits_for_the_new_pane_shell_before_starting_the_agent(tmp_path, monkeypatch):
+    state = _stub(tmp_path, monkeypatch, _FRESH_PANE_STUB)
+    monkeypatch.setattr(bridge, "_PANE_SHELL_POLL_S", 0)
+    success, _report = bridge.run("t_x", "cs", "/ws/t_x", "claude-sonnet-5-5", "medium")
+    assert success is True
+    calls = json.loads(state.read_text())["calls"]
+    start_idx = next(i for i, c in enumerate(calls) if tuple(c[:2]) == ("agent", "start"))
+    assert sum(1 for c in calls[:start_idx] if tuple(c[:2]) == ("pane", "get")) >= 4

@@ -111,7 +111,9 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# ``operator_pause`` is an explicit, sticky operator hold: it never counts toward
+# block-loop recurrence or the failure breaker (see kanban_settlement.operator_pause).
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "operator_pause"}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -2421,10 +2423,10 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_paused
+    from hermes_cli.kanban_settlement import owner_hold_or_continue
     for row in stale:
-        if owner_reclaim_paused(conn, row["id"]):
-            continue
+        if owner_hold_or_continue(conn, row["id"]):
+            continue  # unknown owner: durable recovery_hold recorded, run stays fenced
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = _to_epoch(row["last_heartbeat_at"])
         # Backstop: a heartbeat older than the max-stale threshold means no
@@ -2705,9 +2707,14 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True, force: bool = False,
+    fire_lifecycle_hook: bool = True, force: bool = False, human_acceptance: Any = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
+
+    On a board whose policy requires trusted-human acceptance
+    (``kanban.human_acceptance.boards``), Done is only reachable from ``review``
+    with a verified ``human_acceptance`` (see ``kanban_settlement.gate_done``), for
+    every caller and with ``force`` included.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
     approval. A ``running`` task under a live claim is only completed with
@@ -2729,12 +2736,21 @@ def complete_task(
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
+    from hermes_cli import kanban_settlement as _settlement
+    if _settlement.gate_done(conn, task_id, board=_settlement.board_of_connection(conn), acceptance=human_acceptance) is not None:
+        return False
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    _status_now = _task_status(conn, task_id)
+    if _status_now != "review":  # approving out of review stays exempt, as for the empty-evidence gate
+        _unmet = _settlement.check_artifact_contract(conn, task_id, _cleaned_artifact_paths(metadata))
+        if _unmet:
+            _settlement.refuse_unmet_contract(conn, task_id, _unmet, boundary="done")
+            return False
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -3300,6 +3316,9 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+    if kind == "operator_pause":
+        # Explicit operator intent, not a failure: outside loop accounting, sticky until resume.
+        return "blocked", "blocked", "block_kind    = ?,\n                       block_recurrences = 0", (kind,), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
@@ -3322,6 +3341,69 @@ def redact_review_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_review_value(item) for item in value)
     return value
+
+
+class _ReviewRefused(Exception):
+    """request_review refused after its transaction opened; raising rolls everything back."""
+
+
+def _task_workspace_for_review(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The task's workspace path from the real schema (``tasks.workspace_kind/workspace_path``; runs carry
+    no path). A persisted path wins; an unset scratch task resolves to ``<board workspaces root>/<id>``
+    for the CONNECTION's board. Read-only: never creates a directory or worktree. None when unknown."""
+    row = conn.execute("SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    if row["workspace_path"]:
+        return str(row["workspace_path"])
+    if (row["workspace_kind"] or "scratch") == "scratch":
+        from hermes_cli import kanban_settlement as _settlement
+        slug = _settlement.board_of_connection(conn)
+        if slug:
+            return str(workspaces_root(board=slug) / task_id)
+    return None
+
+
+_REVIEW_ARTIFACT_EXCLUDED = ("handoff", "transfer", "session", "transcript", "instructions")
+
+
+def _verified_declared_review_artifacts(
+    declared: list[str], workspace: Optional[str], receipted: list[str],
+) -> list[str]:
+    """Declared deliverables that really exist: non-empty files that are not handoff/session
+    material and either sit inside the task workspace or are listed in the bridge's receipt."""
+    root = None
+    if workspace:
+        try:
+            root = Path(workspace).expanduser().resolve()
+        except OSError:
+            root = None
+    trusted = set()
+    for item in receipted:
+        try:
+            trusted.add(Path(item).expanduser().resolve(strict=True))
+        except OSError:
+            continue
+    out: list[str] = []
+    for item in declared:
+        try:
+            path = Path(item).expanduser().resolve(strict=True)
+        except OSError:
+            continue
+        if not path.is_file() or path.stat().st_size <= 0:
+            continue
+        if any(token in path.name.lower() for token in _REVIEW_ARTIFACT_EXCLUDED):
+            continue
+        inside = False
+        if root is not None:
+            try:
+                path.relative_to(root)
+                inside = True
+            except ValueError:
+                inside = False
+        if inside or path in trusted:
+            out.append(str(path) if path in trusted and not inside else item)
+    return out
 
 
 def request_review(
@@ -3356,6 +3438,11 @@ def request_review(
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
     metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
+    # Declared deliverables must be delivered before Review; shared by every caller.
+    from hermes_cli import kanban_settlement as _settlement
+    _unmet = _settlement.check_artifact_contract(conn, task_id, _cleaned_artifact_paths(metadata))
+    if _unmet:
+        return _ret(False, _settlement.refuse_unmet_contract(conn, task_id, _unmet, boundary="review"))
     now = int(time.time())
     # Staged copies live outside the txn: a rollback after staging must not
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
@@ -3428,15 +3515,65 @@ def request_review(
                 return _ret(
                     False, "task is not in running/ready (or expected_run_id did not match the current run)",
                 )
+            artifacts = _cleaned_artifact_paths(metadata)
+            # Persist a readable run summary, not the worker's complete terminal transcript.
+            from hermes_cli.kanban_settlement import _review_summary, _verified_review_artifacts
+            workspace = None
+            if expected_run_id is not None:
+                workspace = _task_workspace_for_review(conn, task_id)
+            if artifacts:
+                summary_text = (summary or "").strip()
+                short_summary = _review_summary(summary_text)
+                if short_summary.startswith("Worker handoff only"):
+                    raise _ReviewRefused("Review refused: worker handoff has no completed deliverable")
+                # Verify BEFORE staging so the durable staged copies (not the scratch paths the
+                # reviewer's completion deletes) are what ride the payload. A declared file counts
+                # when it is a substantive non-handoff file inside the task workspace, or was
+                # already verified by the native bridge and recorded in this run's receipt.
+                _receipt = _settlement._run_event(conn, task_id, "worker_result_receipt", expected_run_id)
+                _receipted = []
+                if _receipt is not None:
+                    _receipted = [str(a) for a in (json.loads(_receipt["payload"] or "{}").get("artifacts") or [])]
+                verified = _verified_declared_review_artifacts(
+                    artifacts, workspace, _receipted,
+                ) or ([] if not workspace else _verified_review_artifacts(summary_text, workspace))
+                if not verified:
+                    raise _ReviewRefused("Review refused: no verified workspace deliverable")
+                artifacts = verified
+                metadata = {**(metadata if isinstance(metadata, dict) else {}), "artifacts": artifacts}
             if isinstance(metadata, dict):
                 staged_copies = _stage_completion_artifacts(
                     conn, task_id, metadata, now, uploaded_by="kanban_request_review",
                 )
+            if artifacts:
+                if not re.search(r"(?i)(PR #?\d+|pull/\d+|https?://|deliverable|document|report)", short_summary[:400]):
+                    short_summary = "Deliverable ready for review: " + ", ".join(Path(str(a)).name for a in artifacts[:3]) + ". " + short_summary
+                summary = short_summary[:1200]
+            if summary is not None and len(summary) > 1200:
+                summary = summary[:1197].rstrip() + "..."
             run_id = _end_or_synthesize_run(
                 conn, task_id, outcome="review_requested", status="review",
                 summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
                 profile=implementer,
             )
+            from hermes_cli import kanban_settlement as _settlement
+            receipt = _settlement._run_event(conn, task_id, "worker_result_receipt", expected_run_id)
+            if receipt is not None:
+                receipt_payload = json.loads(receipt["payload"] or "{}")
+                receipt_metadata = {"artifacts": receipt_payload.get("artifacts") or []}
+                receipt_summary = receipt_payload.get("report") or summary
+                if receipt_summary and receipt_summary != summary:
+                    if run_id is not None:
+                        conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (receipt_summary, run_id))
+                    summary = receipt_summary
+                metadata = {**(metadata or {}), **receipt_metadata}
+            if summary is not None and len(summary) > 1200:
+                summary = summary[:1197].rstrip() + "..."
+            if metadata and metadata.get("artifacts"):
+                summary_text = summary or ""
+                if not re.search(r"(?i)(PR #?\d+|pull/\d+|https?://|deliverable|document|report)", summary_text[:400]):
+                    summary_text = "Deliverable ready for review: " + ", ".join(str(a) for a in metadata["artifacts"][:3]) + ". " + summary_text
+                summary = summary_text[:1200]
             payload: dict = {
                 "summary": _first_line(summary, 400) or None,
                 "implementer": implementer,
@@ -3446,6 +3583,11 @@ def request_review(
             if staged:
                 payload["artifacts"] = staged
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+    except _ReviewRefused as refusal:
+        # Raised inside the transaction so the status flip and staging roll back with it.
+        if staged_copies:
+            _discard_staged_copies(staged_copies, staged_copies[0].parent)
+        return _ret(False, str(refusal))
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)

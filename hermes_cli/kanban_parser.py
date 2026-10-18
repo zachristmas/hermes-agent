@@ -146,6 +146,28 @@ _BOARD_SPECS = [
     )),
 ]
 
+_ACCEPTANCE_SPECS = [
+    _cmd("show", [], help="Show the shared human-acceptance policy"),
+    _cmd("protect", [_arg("boards", nargs="+", metavar="BOARD")], help="Require trusted-human Done on these boards ('*' = all)"),
+    _cmd("unprotect", [_arg("boards", nargs="+", metavar="BOARD")], help="Stop requiring trusted-human Done on these boards"),
+    _cmd("set-verifier", [], help="Set the acceptance passphrase (prompted, never echoed or passed in argv)"),
+]
+
+
+_CONTRACT_SPECS = [
+    _cmd("declare", [
+        _TASK_ID,
+        _arg("--require", dest="require", action="append", required=True, metavar="NAME[:MIN_BYTES]",
+             help="Deliverable file basename the card must produce (repeatable); optional minimum size in bytes"),
+        _arg("--contains", dest="contains", action="append", default=[], metavar="NAME=TEXT",
+             help="Text the named deliverable must contain (repeatable)"),
+        _arg("--json-keys", dest="json_keys", action="append", default=[], metavar="NAME=key1,key2",
+             help="Top-level JSON keys the named deliverable must have (repeatable)"),
+    ], help="Declare required deliverables a card must evidence at Review/Done (operator-only)"),
+    _cmd("show", [_TASK_ID, _json_flag()], help="Show a task's declared deliverable contract"),
+]
+
+
 _REF_SPECS = [
     _cmd("add", [
         _TASK_ID,
@@ -298,6 +320,10 @@ _SPECS = [
     _cmd("ref", children=("ref_action", _REF_SPECS),
          help="Attach/list/remove/find typed references (branch, ADO work item, Connect ticket, "
               "PR URL, ...) a task corresponds to -- a task can have any number, across repos"),
+    _cmd("acceptance", children=("acceptance_action", _ACCEPTANCE_SPECS),
+         help="Operator: shared human-acceptance policy (which boards need trusted-human Done)"),
+    _cmd("contract", children=("contract_action", _CONTRACT_SPECS),
+         help="Declare/show the deliverable evidence a card must carry to enter Review or Done"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
@@ -344,6 +370,9 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),
+        _arg("--accept", action="store_true",
+             help="Human acceptance for review-required boards: prompts for the acceptance "
+                  "passphrase on the terminal (kanban.human_acceptance.verifier)."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,

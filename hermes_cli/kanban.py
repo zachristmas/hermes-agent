@@ -406,13 +406,16 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         return _err(f"kanban swarm: {exc}", 2)
     if not workers:
         return _err("kanban swarm: at least one --worker is required", 2)
-    with kbc.connect_closing() as conn:
-        created = ks.create_swarm(
-            conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
-            synthesizer_assignee=args.synthesizer, tenant=args.tenant,
-            created_by=args.created_by or _profile_author(), priority=args.priority,
-            idempotency_key=getattr(args, "idempotency_key", None),
-        )
+    try:
+        with kbc.connect_closing() as conn:
+            created = ks.create_swarm(
+                conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
+                synthesizer_assignee=args.synthesizer, tenant=args.tenant,
+                created_by=args.created_by or _profile_author(), priority=args.priority,
+                idempotency_key=getattr(args, "idempotency_key", None),
+            )
+    except ks.SwarmRefusedError as exc:
+        return _err(f"kanban swarm: {exc}", 2)
     if getattr(args, "json", False):
         _print_json(created.as_dict())
     else:
@@ -684,7 +687,122 @@ def _dispatch_ref(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def _dispatch_acceptance(args: argparse.Namespace) -> int:
+    """``hermes kanban acceptance show|protect|unprotect|set-verifier``: the ONE operator surface for the
+    shared human-acceptance policy (``<kanban_home>/kanban/human_acceptance.json``)."""
+    from hermes_cli import kanban_settlement as ks
+    sub = getattr(args, "acceptance_action", None) or "show"
+    if sub != "show" and (_in_worker_context() or os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")):
+        return _err("kanban acceptance: policy changes are operator-only", 2)
+    try:
+        policy = ks.read_policy()
+    except ks.PolicyError as exc:
+        if sub == "show":
+            return _err(f"kanban acceptance: {exc} (all Done writes are refused until it is fixed)")
+        policy = {}
+    boards, verifier = list(policy.get("boards", [])), policy.get("verifier", "")
+    if sub == "show":
+        print(f"policy file: {ks.policy_path()}")
+        print(f"protected boards: {', '.join(boards) or '(none)'}")
+        print(f"verifier set: {'yes' if verifier else 'no'}")
+        return 0
+    if sub in ("protect", "unprotect"):
+        for b in args.boards:
+            if b != "*" and not kb.board_exists(b):
+                return _err(f"kanban acceptance: no such board: {b}", 2)
+        boards = sorted(set(boards) | set(args.boards)) if sub == "protect" else [b for b in boards if b not in args.boards]
+    elif sub == "set-verifier":
+        import getpass
+        first = getpass.getpass("New acceptance passphrase: ")
+        if not first or first != getpass.getpass("Repeat: "):
+            return _err("kanban acceptance: empty or mismatched passphrase", 2)
+        verifier = ks.make_verifier(first)
+    else:
+        return _err(f"kanban acceptance: unknown action {sub!r}", 2)
+    ks.write_policy(boards, verifier)
+    print(f"Saved. Protected boards: {', '.join(boards) or '(none)'}; verifier set: {'yes' if verifier else 'no'}")
+    return 0
+
+
+def _in_worker_context() -> bool:
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
+def _parse_contract_items(args: argparse.Namespace) -> list[dict]:
+    """Validate ``--require/--contains/--json-keys`` into contract items; ValueError on bad input."""
+    items: dict[str, dict] = {}
+    for spec in args.require:
+        name, _, size = spec.partition(":")
+        if not name or name != os.path.basename(name) or name in (".", ".."):
+            raise ValueError(f"--require needs a bare file name, got {spec!r}")
+        try:
+            min_bytes = int(size) if size else 1
+        except ValueError:
+            raise ValueError(f"--require size must be an integer, got {spec!r}") from None
+        if min_bytes < 1:
+            raise ValueError(f"--require size must be >= 1, got {spec!r}")
+        items[name] = {"name": name, "min_bytes": min_bytes, "must_contain": [], "json_keys": []}
+    for field, key, sep in ((args.contains, "must_contain", None), (args.json_keys, "json_keys", ",")):
+        for spec in field:
+            name, eq, value = spec.partition("=")
+            if not eq or name not in items or not value:
+                raise ValueError(f"expected NAME=VALUE for a --require'd name, got {spec!r}")
+            items[name][key].extend([v for v in value.split(sep) if v] if sep else [value])
+    return list(items.values())
+
+
+def _dispatch_contract(args: argparse.Namespace) -> int:
+    sub = getattr(args, "contract_action", None) or "show"
+    handler = _CONTRACT_HANDLERS.get(sub)
+    if handler is None:
+        return _err(f"kanban contract: unknown action {sub!r}", 2)
+    return handler(args)
+
+
+def _cmd_contract_declare(args: argparse.Namespace) -> int:
+    if _in_worker_context():
+        return _err("kanban contract declare: refused inside a dispatched worker (operator-only)", 2)
+    try:
+        items = _parse_contract_items(args)
+    except ValueError as exc:
+        return _err(f"kanban contract declare: {exc}", 2)
+    from hermes_cli import kanban_settlement as ks
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            return _err(f"no such task: {args.task_id}")
+        if ks.load_artifact_contract(conn, args.task_id):
+            return _err(f"kanban contract declare: {args.task_id} already has a contract "
+                        "(remove it with `kanban ref rm` as an operator first)", 2)
+        ks.declare_artifact_contract(conn, args.task_id, items)
+    print(f"Declared {len(items)} required deliverable(s) on {args.task_id}: "
+          + ", ".join(i["name"] for i in items))
+    return 0
+
+
+def _cmd_contract_show(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_settlement as ks
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            return _err(f"no such task: {args.task_id}")
+        items = ks.load_artifact_contract(conn, args.task_id)
+    if _json_out(args, items):
+        return 0
+    if not items:
+        print(f"{args.task_id}: no deliverable contract declared")
+        return 0
+    for i in items:
+        extra = "".join([f" contains={i['must_contain']}" if i["must_contain"] else "",
+                         f" json_keys={i['json_keys']}" if i["json_keys"] else ""])
+        print(f"{i['name']}  min_bytes={i['min_bytes']}{extra}")
+    return 0
+
+
+_CONTRACT_HANDLERS = {"declare": _cmd_contract_declare, "show": _cmd_contract_show}
+
+
 def _cmd_ref_add(args: argparse.Namespace) -> int:
+    if _in_worker_context() and args.ref_type == "review_artifact_contract":
+        return _err("kanban ref add: the deliverable contract is operator-only", 2)
     try:
         with kbc.connect_closing() as conn:
             ref_id = kb.add_task_ref(
@@ -720,6 +838,10 @@ def _cmd_ref_list(args: argparse.Namespace) -> int:
 
 def _cmd_ref_rm(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
+        if _in_worker_context():
+            row = conn.execute("SELECT ref_type FROM task_refs WHERE id = ?", (args.ref_id,)).fetchone()
+            if row is not None and row["ref_type"] == "review_artifact_contract":
+                return _err("kanban ref rm: the deliverable contract is operator-only", 2)
         removed = kb.remove_task_ref(conn, args.ref_id)
     if removed is None:
         return _err(f"no such ref: {args.ref_id}")
@@ -986,6 +1108,23 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_human_acceptance(args):
+    """Passphrase-authenticated human acceptance for ``complete --accept``; None otherwise.
+
+    Prompts on the controlling terminal (getpass), so a process without a human at the
+    keyboard cannot supply it. Never read from argv, env or stdin pipes.
+    """
+    if not getattr(args, "accept", False):
+        return None
+    import getpass
+    from hermes_cli import kanban_settlement as settlement
+    try:
+        verifier = (settlement._acceptance_config().get("verifier") or "")
+        return settlement.authenticate_passphrase(getpass.getpass("Acceptance passphrase: "), verifier)
+    except (EOFError, KeyboardInterrupt, OSError, settlement.PolicyError):
+        return None
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     if env_tid and env_tid != task_id:
@@ -1095,7 +1234,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", False)),
+                                        human_acceptance=_cli_human_acceptance(args))
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
@@ -1495,7 +1635,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model, "set-remote": _cmd_set_remote,
-    "set-kind": _cmd_set_kind, "set-effort": _cmd_set_effort, "ref": _dispatch_ref,
+    "set-kind": _cmd_set_kind, "set-effort": _cmd_set_effort, "ref": _dispatch_ref, "contract": _dispatch_contract, "acceptance": _dispatch_acceptance,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

@@ -27,6 +27,27 @@ def _local_hostname() -> str:
         return ""
 
 
+def _handoff_profile_config_path():
+    """``config.yaml`` of the profile a dispatcher handed this process (``HERMES_PROFILE``, set
+    only on kanban worker children), so a bridge worker reads its board policy from the
+    dispatching profile; None means the ambient, profile-aware home."""
+    import os
+
+    # health: allow HX002 -- dispatcher->worker handoff, same convention as TASK/WORKSPACE/BOARD
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    if not profile:
+        return None
+    from hermes_cli.profiles import get_profile_dir
+    return get_profile_dir(profile) / "config.yaml"
+
+
+def _load_dispatch_config():
+    """Load effective settings from the dispatching profile, not the default profile."""
+    from hermes_cli.config_effective import load_user_config_effective
+
+    return load_user_config_effective(config_path=_handoff_profile_config_path(), fail_closed=True)
+
+
 def _direct_herdr_dispatch_boards() -> frozenset:
     """Boards opted into the direct-Herdr bridge worker (``kanban.direct_herdr_dispatch_boards``,
     card t_cb0795f9).
@@ -39,8 +60,7 @@ def _direct_herdr_dispatch_boards() -> frozenset:
     """
     from hermes_cli import kanban_db as _kb
     try:
-        from hermes_cli.config_effective import load_user_config_effective
-        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+        kanban = (_load_dispatch_config() or {}).get("kanban", {})
     except Exception as exc:  # health: allow BLE001 -- config read boundary; an unreadable
         # config must stay "off", not propagate and crash a dispatcher tick other boards need.
         _kb._log.warning(
@@ -93,8 +113,7 @@ def _herdr_agent_profile_for_board(board: Optional[str]) -> dict:
     from hermes_cli import kanban_db as _kb
     slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
     try:
-        from hermes_cli.config_effective import load_user_config_effective
-        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+        kanban = (_load_dispatch_config() or {}).get("kanban", {})
     except Exception as exc:  # health: allow BLE001 -- same config-read boundary as
         # _direct_herdr_dispatch_boards; the safe fallback below is the point of the catch.
         _kb._log.warning(
@@ -131,8 +150,7 @@ def _review_dispatch_boards() -> frozenset:
     """
     from hermes_cli import kanban_db as _kb
     try:
-        from hermes_cli.config_effective import load_user_config_effective
-        kanban = (load_user_config_effective(fail_closed=True) or {}).get("kanban", {})
+        kanban = (_load_dispatch_config() or {}).get("kanban", {})
     except Exception as exc:  # health: allow BLE001 -- config read boundary; an unreadable
         # config must stay "off", matching _direct_herdr_dispatch_boards's own fail-closed rule.
         _kb._log.warning(

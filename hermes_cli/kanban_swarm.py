@@ -67,6 +67,10 @@ def _swarm_context(root_id: str, goal: str) -> str:
     )
 
 
+class SwarmRefusedError(RuntimeError):
+    """Swarm creation refused by board policy (no writes were made)."""
+
+
 def _activate_root_inline(
     conn: sqlite3.Connection,
     root_id: str,
@@ -81,6 +85,14 @@ def _activate_root_inline(
     would run while the outer txn can still roll back). The caller runs
     ``recompute_ready`` after the outer commit.
     """
+    # System-only path (sole caller: create_swarm, on a root created in the same transaction). Defensive
+    # scope: refuse any task that has ever had an attempt, and refuse outright on a human-acceptance
+    # board (connection-bound policy), so this can never become a back door to Done.
+    from hermes_cli import kanban_settlement as _ks
+    if _ks.acceptance_required(_ks.board_of_connection(conn)):
+        return False
+    if conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (root_id,)).fetchone():
+        return False
     cur = conn.execute(
         """
         UPDATE tasks
@@ -121,6 +133,12 @@ def create_swarm(
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
+    from hermes_cli import kanban_settlement as _ks
+    if _ks.acceptance_required(_ks.board_of_connection(conn)):
+        # Checked before any write: nothing is created, so no graph, root or run is left behind.
+        raise SwarmRefusedError(
+            "swarm creation is not supported on a human-acceptance board: its root would be "
+            "auto-completed without trusted human acceptance")
     activation_summary = "Swarm topology planned; root remains the shared blackboard."
     activated = False
     with kb.write_txn(conn):
