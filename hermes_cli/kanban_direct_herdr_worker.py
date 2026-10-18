@@ -93,6 +93,8 @@ _START_BUSY_RETRIES = 4
 _START_BUSY_BACKOFF_S = 2.0
 
 _SETTLED_STATUSES = ("idle", "done", "finished")
+_RESUMED_STATUSES = ("working", "busy", "running")
+_SETTLE_REWAITS = 3
 _LAST_SETTLED_AGENT: Optional[str] = None
 # The native transcript this process read from the agent it settled, immediately before closing that
 # agent's pane. Once closed, the agent no longer exists, so ``_mark_card`` cannot re-read it.
@@ -468,21 +470,27 @@ def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional
     """
     global _LAST_SETTLED_AGENT, _CLOSED_AGENT_REPORT
     _LAST_SETTLED_AGENT = name
-    status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000, machine_id=machine_id)
-    if status == "blocked":
-        return False, f"agent {name} is blocked on an approval/question dialog: {read_agent(name, machine_id=machine_id)}", True
-    if status not in _SETTLED_STATUSES:
-        return False, f"agent {name} did not reach idle/done before the wait timeout (status={status!r})", True
-    # Re-verify immediately before closing: `wait_agent` can itself time out and return a stale
-    # settled-looking read, or the agent can flip to blocked/working/some other status between the
-    # wait returning and this check. Require the live status to still be positively settled rather
-    # than excluding a few known-unsafe ones -- an empty, "unknown", or any future status this file
-    # doesn't recognize must not fall through to "safe to close" by default.
-    live_status = agent_status(name, machine_id=machine_id)
+    # An agent that settles and then resumes on its own (a background subagent finishing, say) is
+    # still doing this card's work: wait it out again, a bounded number of times, instead of
+    # failing the run while it keeps working.
+    for _ in range(_SETTLE_REWAITS + 1):
+        status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000, machine_id=machine_id)
+        if status == "blocked":
+            return False, f"agent {name} is blocked on an approval/question dialog: {_read_agent_for_report(name, machine_id=machine_id)}", True
+        if status not in _SETTLED_STATUSES:
+            return False, f"agent {name} did not reach idle/done before the wait timeout (status={status!r})", True
+        # Re-verify immediately before closing: `wait_agent` can itself time out and return a stale
+        # settled-looking read, or the agent can flip to blocked/working/some other status between
+        # the wait returning and this check. Require the live status to still be positively settled
+        # rather than excluding a few known-unsafe ones -- an empty, "unknown", or any future status
+        # this file doesn't recognize must not fall through to "safe to close" by default.
+        live_status = agent_status(name, machine_id=machine_id)
+        if live_status in _SETTLED_STATUSES or live_status not in _RESUMED_STATUSES:
+            break
     if live_status not in _SETTLED_STATUSES:
         return False, (
             f"agent {name} reported {status!r} on wait but is now {live_status!r}, not confirmed "
-            f"settled; not closing its pane: {read_agent(name, machine_id=machine_id)}"
+            f"settled; not closing its pane: {_read_agent_for_report(name, machine_id=machine_id)}"
         ), True
     # Read the report BEFORE closing: closing a pane tears down the agent living in it (verified
     # live -- a `read` issued after `close_pane` gets `agent_not_found`, not the transcript).
@@ -634,6 +642,21 @@ def read_agent(name: str, *, machine_id: Optional[str] = None) -> str:
     result = _run_herdr(
         ["agent", "read", name, "--source", "recent-unwrapped", "--lines", "120"], machine_id=machine_id,
     )
+    if isinstance(result, dict):
+        return result.get("text") or result.get("output") or result.get("_raw") or ""
+    return str(result) if result else ""
+
+
+def _read_agent_for_report(name: str, *, machine_id: Optional[str] = None) -> str:
+    """:func:`read_agent` for a failure report. Herdr refuses a scrollback read while the agent is
+    working (``agent_not_idle``); fall back to the visible screen so the failure is still reported
+    with evidence instead of escaping and losing the run's agent identity."""
+    try:
+        return read_agent(name, machine_id=machine_id)
+    except HerdrCliError as exc:
+        if exc.code != "agent_not_idle":
+            raise
+    result = _run_herdr(["agent", "read", name, "--source", "visible"], machine_id=machine_id)
     if isinstance(result, dict):
         return result.get("text") or result.get("output") or result.get("_raw") or ""
     return str(result) if result else ""
