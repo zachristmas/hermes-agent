@@ -592,14 +592,129 @@ function AttachmentDownload({
   )
 }
 
+// Inline preview is text and Markdown only, picked by filename extension; every
+// other type keeps the download button alone. Bytes come from the host's
+// captured preview reader (same pinned owner as the download), never a guessed
+// path, and are capped for display so a large log can't stall the sidebar.
+const MARKDOWN_EXT = /\.(?:md|markdown)$/i
+const TEXT_EXT = /\.(?:txt|log|json|csv|tsv|ya?ml|toml|ini)$/i
+const PREVIEW_MAX_SIZE = 2 * 1024 * 1024
+const PREVIEW_MAX_CHARS = 100_000
+
+export const attachmentPreviewKind = (filename: string): 'markdown' | 'text' | null =>
+  MARKDOWN_EXT.test(filename) ? 'markdown' : TEXT_EXT.test(filename) ? 'text' : null
+
+export function decodeTextDataUrl(dataUrl: string): string {
+  const comma = dataUrl.indexOf(',')
+
+  if (!/^data:/i.test(dataUrl) || comma < 0) {
+    throw new Error('Not a data URL')
+  }
+
+  const payload = dataUrl.slice(comma + 1)
+
+  if (!/;base64$/i.test(dataUrl.slice(0, comma))) {
+    return decodeURIComponent(payload)
+  }
+
+  const bin = atob(payload)
+
+  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)))
+}
+
+function AttachmentPreview({
+  attachment,
+  kind,
+  onPreview
+}: {
+  attachment: KanbanAttachment
+  kind: 'markdown' | 'text'
+  onPreview: (path: string) => Promise<string>
+}) {
+  const k = useKanban()
+  const path = attachment.stored_path?.trim() ?? ''
+
+  const { data, isError, isPending } = useQuery({
+    queryFn: async () => decodeTextDataUrl(await onPreview(path)),
+    queryKey: ['kanban', 'attachment-preview', attachment.id, path],
+    retry: false,
+    staleTime: 60_000
+  })
+
+  if (isPending) {
+    return <Loader />
+  }
+
+  if (isError) {
+    return <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.previewFailed}</p>
+  }
+
+  const truncated = data.length > PREVIEW_MAX_CHARS
+  const text = truncated ? data.slice(0, PREVIEW_MAX_CHARS) : data
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1" data-testid="kanban-attachment-preview">
+      <div className="max-h-72 overflow-auto rounded-md border border-(--ui-border) p-2 text-[0.75rem]">
+        {kind === 'markdown' ? (
+          <MessageTextContent media={false} text={text} />
+        ) : (
+          <pre className="whitespace-pre-wrap break-words font-mono">{text}</pre>
+        )}
+      </div>
+      {truncated && <p className="text-[0.7rem] text-(--ui-text-quaternary)">{k.previewTruncated}</p>}
+    </div>
+  )
+}
+
+function AttachmentRow({
+  attachment,
+  onDownload,
+  onPreview
+}: {
+  attachment: KanbanAttachment
+  onDownload: (path: string, suggestedName: string) => Promise<void>
+  onPreview?: (path: string) => Promise<string>
+}) {
+  const k = useKanban()
+  const [open, setOpen] = useState(false)
+  const kind = attachmentPreviewKind(attachment.filename)
+  const path = attachment.stored_path?.trim()
+  const tooBig = typeof attachment.size === 'number' && attachment.size > PREVIEW_MAX_SIZE
+  const previewable = Boolean(kind && path && onPreview && !tooBig)
+
+  return (
+    <li className="flex min-w-0 flex-col gap-1 text-[0.75rem] text-(--ui-text-tertiary)">
+      <div className="flex items-center gap-1.5">
+        <AttachmentDownload attachment={attachment} onDownload={onDownload} />
+        {previewable && (
+          <Button
+            aria-expanded={open}
+            aria-label={open ? k.hidePreviewAttachment(attachment.filename) : k.previewAttachment(attachment.filename)}
+            onClick={() => setOpen(value => !value)}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name={open ? 'eye-closed' : 'eye'} size="0.8rem" />
+          </Button>
+        )}
+      </div>
+      {previewable && open && kind && onPreview && (
+        <AttachmentPreview attachment={attachment} kind={kind} onPreview={onPreview} />
+      )}
+    </li>
+  )
+}
+
 function AttachmentsSection({
   attachments,
   onDownload,
+  onPreview,
   onUpload,
   pending
 }: {
   attachments: KanbanAttachment[]
   onDownload: (path: string, suggestedName: string) => Promise<void>
+  onPreview?: (path: string) => Promise<string>
   onUpload: (file: File) => void
   pending: boolean
 }) {
@@ -640,9 +755,7 @@ function AttachmentsSection({
       {attachments.length > 0 ? (
         <ul className="flex flex-col gap-1">
           {attachments.map(attachment => (
-            <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
-              <AttachmentDownload attachment={attachment} onDownload={onDownload} />
-            </li>
+            <AttachmentRow attachment={attachment} key={attachment.id} onDownload={onDownload} onPreview={onPreview} />
           ))}
         </ul>
       ) : (
@@ -1248,6 +1361,7 @@ export function TaskDrawer({
                   <AttachmentsSection
                     attachments={detail.attachments}
                     onDownload={detail.downloadAttachment}
+                    onPreview={detail.previewAttachment}
                     onUpload={file => uploadMut.mutate(file)}
                     pending={uploadMut.isPending}
                   />

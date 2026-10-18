@@ -1879,6 +1879,9 @@ export { formatModifierToken } from '@/lib/keybinds/combo'
 export { LruCache } from '@/lib/lru-cache'
 /** Capture a gateway file download alongside a REST read (see the SDK guide). */
 export { captureGatewayFileDownload } from '@/lib/media'
+/** Same capture rule, for an inline preview: resolves a gateway file path to a
+ *  `data:` URL through the owner pinned at read time. */
+export { captureGatewayFilePreview } from '@/lib/media'
 /** True when a saved provider id names this `model.options` row: its slug,
  *  display name, or a custom-provider alias (`custom:<key>` vs the bare key). */
 export { catalogProviderMatches } from '@/lib/model-options'

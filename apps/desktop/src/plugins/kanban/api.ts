@@ -18,6 +18,7 @@
 import {
   atom,
   captureGatewayFileDownload,
+  captureGatewayFilePreview,
   host,
   type PluginOs,
   type PluginRestOptions,
@@ -390,9 +391,10 @@ export const fetchBoard = (archived: boolean) =>
 
 export const fetchTask = async (id: string) => {
   const downloadAttachment = captureGatewayFileDownload()
+  const previewAttachment = captureGatewayFilePreview()
   const detail = await call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
 
-  return { ...detail, downloadAttachment }
+  return { ...detail, downloadAttachment, previewAttachment }
 }
 
 /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */

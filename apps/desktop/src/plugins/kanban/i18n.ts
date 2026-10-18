@@ -162,6 +162,10 @@ type KanbanMessages = {
   workerLogTail: string
   attachments: (n: number) => string
   noAttachments: string
+  previewAttachment: (name: string) => string
+  hidePreviewAttachment: (name: string) => string
+  previewFailed: string
+  previewTruncated: string
   uploadAttachment: string
   taskActions: string
   copyTaskId: string
@@ -399,6 +403,10 @@ export const en: KanbanMessages = {
   workerLogTail: 'Worker log · tail',
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
+  previewAttachment: n => `Preview ${n}`,
+  hidePreviewAttachment: n => `Hide preview of ${n}`,
+  previewFailed: 'Preview unavailable',
+  previewTruncated: 'Preview truncated — download for the full file.',
   uploadAttachment: 'Upload attachment',
   taskActions: 'Task actions',
   copyTaskId: 'Copy task id',
@@ -628,6 +636,10 @@ const ja: KanbanMessages = {
   workerLogTail: 'ワーカーログ・末尾',
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
+  previewAttachment: n => `${n} をプレビュー`,
+  hidePreviewAttachment: n => `${n} のプレビューを閉じる`,
+  previewFailed: 'プレビューできません',
+  previewTruncated: 'プレビューは一部のみ表示しています。全文はダウンロードしてください。',
   uploadAttachment: '添付をアップロード',
   taskActions: 'タスクの操作',
   copyTaskId: 'タスク ID をコピー',
@@ -855,6 +867,10 @@ const zh: KanbanMessages = {
   workerLogTail: '工作单元日志・末尾',
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
+  previewAttachment: n => `预览 ${n}`,
+  hidePreviewAttachment: n => `收起 ${n} 的预览`,
+  previewFailed: '无法预览',
+  previewTruncated: '预览已截断，请下载完整文件。',
   uploadAttachment: '上传附件',
   taskActions: '任务操作',
   copyTaskId: '复制任务 ID',
@@ -1081,6 +1097,10 @@ const zhHant: KanbanMessages = {
   workerLogTail: '工作單元日誌・末尾',
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
+  previewAttachment: n => `預覽 ${n}`,
+  hidePreviewAttachment: n => `收合 ${n} 的預覽`,
+  previewFailed: '無法預覽',
+  previewTruncated: '預覽已截斷，請下載完整檔案。',
   uploadAttachment: '上傳附件',
   taskActions: '任務操作',
   copyTaskId: '複製任務 ID',
