@@ -922,6 +922,18 @@ CREATE TABLE IF NOT EXISTS task_comments (
     created_at INTEGER NOT NULL
 );
 
+-- Append-only: one row per edit, holding the body the edit replaced.
+CREATE TABLE IF NOT EXISTS task_comment_revisions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    comment_id INTEGER NOT NULL,
+    task_id    TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    editor     TEXT NOT NULL,
+    edited_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_comment_revisions ON task_comment_revisions(comment_id, id);
+
 CREATE TABLE IF NOT EXISTS task_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1714,6 +1726,43 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
+
+
+class CommentEditForbidden(PermissionError):
+    """Editor is not the comment's original author."""
+
+
+def edit_comment(conn: sqlite3.Connection, task_id: str, comment_id: int, editor: str, body: str) -> None:
+    """Replace a comment's body; only its original author may. The replaced body
+    is kept in ``task_comment_revisions`` (append-only) in the same txn."""
+    if not body or not body.strip():
+        raise ValueError("comment body is required")
+    if not editor or not editor.strip():
+        raise ValueError("comment editor is required")
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT author, body FROM task_comments WHERE id = ? AND task_id = ?", (comment_id, task_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"comment {comment_id} not found on task {task_id}")
+        if row["author"] != editor.strip():
+            raise CommentEditForbidden("only the original author may edit a comment")
+        conn.execute(
+            "INSERT INTO task_comment_revisions (comment_id, task_id, body, editor, edited_at) "
+            "VALUES (?, ?, ?, ?, ?)", (comment_id, task_id, row["body"], editor.strip(), now),
+        )
+        conn.execute("UPDATE task_comments SET body = ? WHERE id = ?", (body.strip(), comment_id))
+        _append_event(conn, task_id, "comment_edited", {"comment_id": comment_id, "editor": editor.strip()})
+
+
+def comment_edit_info(conn: sqlite3.Connection, task_id: str) -> dict[int, dict]:
+    """``{comment_id: {"edited_at": last edit, "edits": count}}`` for edited comments only."""
+    rows = conn.execute(
+        "SELECT comment_id, MAX(edited_at) AS edited_at, COUNT(*) AS edits "
+        "FROM task_comment_revisions WHERE task_id = ? GROUP BY comment_id", (task_id,),
+    ).fetchall()
+    return {r["comment_id"]: {"edited_at": r["edited_at"], "edits": r["edits"]} for r in rows}
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -3855,7 +3904,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in ("task_comments", "task_comment_revisions", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 

@@ -398,7 +398,10 @@ def get_task(
         _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
         return {
             "task": task_d,
-            "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
+            "comments": [
+                {**asdict(c), **edit_info.get(c.id, {})}
+                for edit_info in [kanban_db.comment_edit_info(conn, task_id)]
+                for c in kanban_db.list_comments(conn, task_id)],
             "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
@@ -806,6 +809,21 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
         kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body)
+        return {"ok": True}
+
+
+@router.patch("/tasks/{task_id}/comments/{comment_id}")
+def edit_comment(task_id: str, comment_id: int, payload: CommentBody, board: Optional[str] = Query(None)):
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        try:
+            kanban_db.edit_comment(conn, task_id, comment_id, payload.author or "dashboard", payload.body)
+        except kanban_db.CommentEditForbidden as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0]))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         return {"ok": True}
 
 

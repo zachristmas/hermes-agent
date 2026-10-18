@@ -42,6 +42,7 @@ import {
   addComment,
   boardKeyPrefix,
   deleteTask,
+  editComment,
   estimateTask,
   fetchLog,
   fetchProfiles,
@@ -61,6 +62,7 @@ import {
   type Diagnostic,
   type DiagnosticAction,
   type KanbanAttachment,
+  type KanbanComment,
   type KanbanEvent,
   type KanbanTaskDetail,
   SEVERITY_TONE,
@@ -428,6 +430,78 @@ function CommentComposer({
   )
 }
 
+// Only the original author (the desktop posts as 'desktop') may edit; the
+// kernel enforces it, the UI just hides the control on other authors' comments.
+function CommentItem({
+  comment,
+  onEdit,
+  pending
+}: {
+  comment: KanbanComment
+  onEdit: (id: number | string, body: string) => void
+  pending: boolean
+}) {
+  const k = useKanban()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  return (
+    <li className="flex flex-col gap-0.5">
+      <div className="flex items-baseline gap-2 text-[0.75rem]">
+        <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
+        <span className="text-[0.625rem] text-(--ui-text-quaternary)">{ago(comment.created_at)}</span>
+        {comment.edits ? (
+          <span className="text-[0.625rem] text-(--ui-text-quaternary)" title={ago(comment.edited_at ?? comment.created_at) ?? undefined}>
+            {k.commentEdited(comment.edits)}
+          </span>
+        ) : null}
+        {comment.author === 'desktop' && !editing && (
+          <Button
+            aria-label={k.editComment}
+            className="ml-auto"
+            onClick={() => {
+              setDraft(comment.body)
+              setEditing(true)
+            }}
+            size="icon-xs"
+            type="button"
+            variant="ghost"
+          >
+            <Codicon name="edit" size="0.75rem" />
+          </Button>
+        )}
+      </div>
+      {editing ? (
+        <div className="flex flex-col gap-1.5">
+          <Textarea
+            className="field-sizing-content max-h-40 resize-none text-[0.8125rem]"
+            onChange={event => setDraft(event.target.value)}
+            value={draft}
+          />
+          <div className="flex justify-end gap-1.5">
+            <Button onClick={() => setEditing(false)} size="xs" type="button" variant="ghost">
+              {k.cancel}
+            </Button>
+            <Button
+              disabled={!draft.trim() || pending}
+              onClick={() => {
+                onEdit(comment.id, draft.trim())
+                setEditing(false)
+              }}
+              size="xs"
+              type="button"
+            >
+              {k.save}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <TaskMarkdown text={comment.body} />
+      )}
+    </li>
+  )
+}
+
 function DescriptionSection({ body, onSave }: { body: null | string | undefined; onSave: (body: string) => void }) {
   const k = useKanban()
   const [editing, setEditing] = useState(false)
@@ -689,6 +763,7 @@ function FeedTabs({
   detail,
   log,
   onComment,
+  onEditComment,
   onRequeue,
   running
 }: {
@@ -696,6 +771,7 @@ function FeedTabs({
   detail: KanbanTaskDetail
   log: null | WorkerLog
   onComment: (body: string) => void
+  onEditComment: (id: number | string, body: string) => void
   onRequeue: (body: string) => void
   running: boolean
 }) {
@@ -731,13 +807,7 @@ function FeedTabs({
           {detail.comments.length > 0 && (
             <ul className="flex flex-col gap-3">
               {detail.comments.map(comment => (
-                <li className="flex flex-col gap-0.5" key={comment.id}>
-                  <div className="flex items-baseline gap-2 text-[0.75rem]">
-                    <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
-                    <span className="text-[0.625rem] text-(--ui-text-quaternary)">{ago(comment.created_at)}</span>
-                  </div>
-                  <TaskMarkdown text={comment.body} />
-                </li>
+                <CommentItem comment={comment} key={comment.id} onEdit={onEditComment} pending={commentPending} />
               ))}
             </ul>
           )}
@@ -905,6 +975,12 @@ export function TaskDrawer({
 
   const commentMut = useMutation({
     mutationFn: (body: string) => addComment(id!, body),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: invalidate
+  })
+
+  const editCommentMut = useMutation({
+    mutationFn: ({ body, cid }: { body: string; cid: number | string }) => editComment(id!, cid, body),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
@@ -1093,6 +1169,7 @@ export function TaskDrawer({
                     detail={detail}
                     log={log ?? null}
                     onComment={body => commentMut.mutate(body)}
+                    onEditComment={(cid, body) => editCommentMut.mutate({ body, cid })}
                     onRequeue={body => requeueMut.mutate(body)}
                     running={running}
                   />

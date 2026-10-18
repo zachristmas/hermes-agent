@@ -151,6 +151,8 @@ type KanbanMessages = {
   comment: string
   messageWorker: string
   addComment: string
+  editComment: string
+  commentEdited: (edits: number) => string
   deliveredLive: string
   requeueWithNote: string
   notePosted: string
@@ -386,6 +388,8 @@ export const en: KanbanMessages = {
   comment: 'Comment',
   messageWorker: 'Message the running worker…',
   addComment: 'Add a comment…',
+  editComment: 'Edit comment',
+  commentEdited: n => `Edited · ${n}`,
   deliveredLive: 'Delivered to the running worker within a few seconds.',
   requeueWithNote: 'Requeue with note',
   notePosted: 'Note posted — worker requeued',
@@ -613,6 +617,8 @@ const ja: KanbanMessages = {
   comment: 'コメント',
   messageWorker: '実行中のワーカーにメッセージ…',
   addComment: 'コメントを追加…',
+  editComment: 'コメントを編集',
+  commentEdited: n => `編集済み・${n}`,
   deliveredLive: '数秒以内に実行中のワーカーへ届きます。',
   requeueWithNote: 'メモを付けて再キュー',
   notePosted: 'メモを投稿しました — ワーカーを再キューしました',
@@ -838,6 +844,8 @@ const zh: KanbanMessages = {
   comment: '评论',
   messageWorker: '给运行中的工作单元发消息…',
   addComment: '添加评论…',
+  editComment: '编辑评论',
+  commentEdited: n => `已编辑・${n}`,
   deliveredLive: '几秒内送达运行中的工作单元。',
   requeueWithNote: '附带备注重新入队',
   notePosted: '备注已发布 — 工作单元已重新入队',
@@ -1062,6 +1070,8 @@ const zhHant: KanbanMessages = {
   comment: '留言',
   messageWorker: '傳訊給執行中的工作單元…',
   addComment: '新增留言…',
+  editComment: '編輯留言',
+  commentEdited: n => `已編輯・${n}`,
   deliveredLive: '幾秒內送達執行中的工作單元。',
   requeueWithNote: '附上備註重新排入佇列',
   notePosted: '備註已發布 — 工作單元已重新排入佇列',
