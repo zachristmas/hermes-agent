@@ -32,6 +32,8 @@ OWNER_HOLD_ESCALATE_SECONDS = 3600
 # becomes a durable visible outcome instead of a silent retry loop.
 SETTLE_ERROR_BUDGET = 3
 ARTIFACT_CONTRACT_REF = "review_artifact_contract"
+# What _review_summary returns for a report that only hands the work off.
+HANDOFF_ONLY_SUMMARY = "Worker handoff only. Requested deliverable remains incomplete."
 ACCEPTANCE_MAX_AGE_SECONDS = 600
 
 
@@ -267,8 +269,8 @@ def record_result_receipt(
 ) -> bool:
     """Persist a finished attempt's result BEFORE any card transition.
 
-    ``require_artifacts``: the producer (e.g. the Herdr bridge) treats a success with no verified
-    deliverable as a partial result, not a Review candidate; settlement enforces that.
+    ``require_artifacts``: the producer (e.g. the Herdr bridge) asks settlement to hold back a
+    success whose report is a handoff only (no files attached) as a partial result.
 
     Idempotent per run. If the coordinator dies after this commit, the next
     sweep settles the card from the receipt (see :func:`reconcile_settlements`).
@@ -323,14 +325,14 @@ def settle_from_receipt(conn, task_id: str) -> Optional[str]:
     data = _json(receipt["payload"])
     report = str(data.get("report") or "")
     if data.get("success"):
-        if data.get("require_artifacts") and not data.get("artifacts"):
-            concise = (report or "").strip()
-            if len(concise) > 1200:
-                concise = concise[:1197].rstrip() + "..."
+        # A finished turn needs no file to reach Review: the summary can be the deliverable (board
+        # edits, a merged PR). Only a handoff-only report is held back; a declared contract or a
+        # claimed file is enforced by request_review below.
+        if data.get("require_artifacts") and not data.get("artifacts") and \
+                report.strip().startswith(HANDOFF_ONLY_SUMMARY):
             return settle_partial(
-                conn, task_id, run_id,
-                summary=concise or "Worker finished without a verified review deliverable.",
-                unmet=["review deliverable: missing or not referenced by the worker"])
+                conn, task_id, run_id, summary=report.strip()[:1200],
+                unmet=["worker reported a handoff only; the requested work is not done"])
         concise = (report or "").strip()
         if len(concise) > 1200:
             concise = concise[:1197].rstrip() + "..."
@@ -741,7 +743,7 @@ def _review_summary(report: str) -> str:
         return "Worker finished, but no concise review summary was available."
     if re.search(r"(?i)(handoff|transfer|pending|not implemented|not started|still pending)", summary) and not re.search(
             r"(?i)(PR #?\d+|pull/\d+|implemented|completed|deliverable ready)", summary):
-        return "Worker handoff only. Requested deliverable remains incomplete."
+        return HANDOFF_ONLY_SUMMARY
     return summary[:1200]
 
 

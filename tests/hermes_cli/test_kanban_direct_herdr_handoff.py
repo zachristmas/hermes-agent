@@ -212,10 +212,19 @@ def test_a_board_that_did_not_opt_in_keeps_the_plain_bridge(kanban_home, monkeyp
     code, task, _, atts, events = _run_main(
         kanban_home, monkeypatch, lambda tid, rid: "Card done: fixed the thing.", enable=False,
     )
-    # plain settlement: no verified workspace deliverable means a partial, never Review
-    assert code == 0 and task.status != "review"
+    # plain settlement: a finished turn reaches Review on its summary, with or without a file
+    assert code == 0 and task.status == "review"
     assert _receipt(events)["require_artifacts"] is True
     assert not atts
+
+
+def test_a_handoff_only_report_is_held_back_from_review(kanban_home, monkeypatch):
+    _enable(kanban_home, "titan")  # default board is not listed
+    code, task, _, _, _ = _run_main(
+        kanban_home, monkeypatch,
+        lambda tid, rid: "Wrote a transfer handoff; the implementation is still pending.", enable=False,
+    )
+    assert code == 0 and task.status != "review"
 
 
 def test_stale_run_id_still_cannot_move_a_gated_card(kanban_home, monkeypatch):

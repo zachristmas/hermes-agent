@@ -1036,9 +1036,9 @@ def _mark_card(
         return saved, why
     review_summary = settlement._review_summary(report)
     artifacts = settlement._verified_review_artifacts(report, workspace_dir or "") if success else ()
-    # A success report with no verified deliverable stays a success receipt that carries no artifacts:
-    # settlement (require_artifacts=True) turns it into a truthful partial that keeps the owner, instead
-    # of a transient block that would drop the card out of the queue.
+    # A success with no files still reaches Review on its summary. Settlement (require_artifacts=True)
+    # holds back only a handoff-only report, as a truthful partial that keeps the owner instead of a
+    # transient block that would drop the card out of the queue.
     if success and artifacts:
         artifact_names = ", ".join(artifacts[:4])
         review_summary = f"Deliverable ready for review: {artifact_names}. {review_summary}".strip()
