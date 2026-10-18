@@ -35,6 +35,7 @@ from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_review_summary as kbrs
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
@@ -854,6 +855,25 @@ def edit_comment(task_id: str, comment_id: int, payload: CommentBody, board: Opt
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"ok": True}
+
+
+class SummaryBody(BaseModel):
+    summary: str
+    editor: Optional[str] = "dashboard"
+
+
+@router.patch("/tasks/{task_id}/summary")
+def edit_summary(task_id: str, payload: SummaryBody, board: Optional[str] = Query(None)):
+    """Correct the summary an idle card shows; the replaced text is kept in a summary_edited event."""
+    if not payload.summary.strip():
+        raise HTTPException(status_code=400, detail="summary is required")
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        ok, why = kbrs.edit_summary(conn, task_id, summary=payload.summary,
+                                    editor=payload.editor or "dashboard", board=board)
+        if not ok:
+            raise HTTPException(status_code=409, detail=why)
+        return {"ok": True, "latest_summary": kanban_db.latest_summary(conn, task_id)}
 
 
 class LinkBody(BaseModel):

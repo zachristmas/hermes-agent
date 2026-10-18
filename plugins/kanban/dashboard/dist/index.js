@@ -3671,6 +3671,17 @@
       }
     };
 
+    // Resolves true on success; a refusal (e.g. 409 while a worker holds the card) shows by the actions.
+    function doEditSummary(summary) {
+      setPatchErr(null);
+      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/summary`, boardSlug), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ summary: summary, editor: "dashboard" }),
+      }).then(function () { load(); props.onRefresh(); return true; })
+        .catch(function (e) { setPatchErr(parseApiErrorMessage(e)); return false; });
+    }
+
     // Local completion-summary prompt used only by doPatch above.
     // Documented carve-out — see the doPatch comment.
     function withCompletionSummary(patch) {
@@ -3822,6 +3833,7 @@
           assignees: props.assignees || [],
           boardSlug: boardSlug,
           onPatch: doPatch,
+          onEditSummary: doEditSummary,
           onSpecify: doSpecify,
           onDecompose: doDecompose,
           onAddParent: addLink,
@@ -4079,10 +4091,14 @@
           var label = t.result
             ? tx(i18n, "result", "Result")
             : tx(i18n, "finalResult", "Final Result (run summary)");
-          return h("div", { className: "hermes-kanban-section" },
-            h("div", { className: "hermes-kanban-section-head" }, label),
-            h(MarkdownBlock, { source: finalResult, enabled: props.renderMarkdown }),
-          );
+          // The summary edit rewrites the run summary (and a done result holding the same text),
+          // so offer it only when that is what this section shows and no worker holds the card.
+          var editable = !!t.latest_summary && t.status !== "running" && !t.claim_lock && !t.worker_pid &&
+            (!t.result || t.result.trim() === t.latest_summary.trim());
+          return h(SummaryEditor, {
+            label: label, source: finalResult, editable: editable,
+            renderMarkdown: props.renderMarkdown, onSave: props.onEditSummary,
+          });
         }
         if (isDone && isParent) {
           return h("div", { className: "hermes-kanban-section" },
@@ -4594,6 +4610,47 @@
               );
             }),
           ),
+    );
+  }
+
+  function SummaryEditor(props) {
+    const { t } = useI18n();
+    const [editing, setEditing] = useState(false);
+    const [v, setV] = useState(props.source || "");
+    const [busy, setBusy] = useState(false);
+    useEffect(function () { setV(props.source || ""); }, [props.source]);
+    const save = function () {
+      if (!v.trim()) return;
+      setBusy(true);
+      props.onSave(v.trim())
+        .then(function (ok) { if (ok) setEditing(false); })
+        .finally(function () { setBusy(false); });
+    };
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head-row" },
+        h("span", { className: "hermes-kanban-section-head" }, props.label),
+        !props.editable ? null : editing
+          ? h("div", { className: "flex gap-1" },
+              h(Button, { onClick: save, disabled: busy || !v.trim(), size: "sm" }, tx(t, "save", "Save")),
+              h(Button, { onClick: function () { setEditing(false); setV(props.source || ""); },
+                size: "sm",
+              }, tx(t, "cancel", "Cancel")),
+            )
+          : h("button", {
+              type: "button",
+              onClick: function () { setEditing(true); },
+              className: "hermes-kanban-edit-link",
+              title: "Edit summary (the old text is kept in the task events)",
+            }, tx(t, "edit", "edit")),
+      ),
+      editing
+        ? h("textarea", {
+            className: "hermes-kanban-textarea",
+            value: v,
+            rows: 8,
+            onChange: function (e) { setV(e.target.value); },
+          })
+        : h(MarkdownBlock, { source: props.source, enabled: props.renderMarkdown }),
     );
   }
 

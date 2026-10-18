@@ -137,6 +137,7 @@ type KanbanMessages = {
   commandCopied: string
   description: string
   editDescription: string
+  editSummary: string
   cancelEdit: string
   noDescription: string
   result: string
@@ -376,6 +377,7 @@ export const en: KanbanMessages = {
   commandCopied: 'Command copied',
   description: 'Description',
   editDescription: 'Edit description',
+  editSummary: 'Edit summary',
   cancelEdit: 'Cancel edit',
   noDescription: 'No description yet.',
   result: 'Result',
@@ -609,6 +611,7 @@ const ja: KanbanMessages = {
   commandCopied: 'コマンドをコピーしました',
   description: '説明',
   editDescription: '説明を編集',
+  editSummary: '概要を編集',
   cancelEdit: '編集をキャンセル',
   noDescription: 'まだ説明はありません。',
   result: '結果',
@@ -841,6 +844,7 @@ const zh: KanbanMessages = {
   commandCopied: '命令已复制',
   description: '描述',
   editDescription: '编辑描述',
+  editSummary: '编辑摘要',
   cancelEdit: '取消编辑',
   noDescription: '暂无描述。',
   result: '结果',
@@ -1071,6 +1075,7 @@ const zhHant: KanbanMessages = {
   commandCopied: '指令已複製',
   description: '描述',
   editDescription: '編輯描述',
+  editSummary: '編輯摘要',
   cancelEdit: '取消編輯',
   noDescription: '尚無描述。',
   result: '結果',

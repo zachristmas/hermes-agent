@@ -44,6 +44,7 @@ import {
   deleteTask,
   DESKTOP_AUTHOR,
   editComment,
+  editSummary,
   estimateTask,
   fetchLog,
   fetchProfiles,
@@ -65,6 +66,7 @@ import {
   type KanbanAttachment,
   type KanbanComment,
   type KanbanEvent,
+  type KanbanTask,
   type KanbanTaskDetail,
   SEVERITY_TONE,
   type TaskEstimate,
@@ -548,6 +550,68 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
         <TaskMarkdown text={body} />
       ) : (
         <p className="text-[0.8125rem] text-(--ui-text-quaternary)">{k.noDescription}</p>
+      )}
+    </Section>
+  )
+}
+
+// No worker or reviewer holds the card, so its summary may be corrected; the kernel enforces that too.
+const isIdle = (task: KanbanTask) => task.status !== 'running' && !task.claim_lock && !task.worker_pid
+
+function SummarySection({
+  editable,
+  onSave,
+  summary
+}: {
+  editable: boolean
+  onSave: (summary: string) => void
+  summary: string
+}) {
+  const k = useKanban()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  return (
+    <Section
+      action={
+        editable ? (
+          <Button
+            aria-label={editing ? k.cancelEdit : k.editSummary}
+            onClick={() => {
+              setDraft(summary)
+              setEditing(!editing)
+            }}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name={editing ? 'close' : 'edit'} size="0.75rem" />
+          </Button>
+        ) : undefined
+      }
+      label={k.latestSummary}
+    >
+      {editing ? (
+        <div className="flex flex-col gap-1.5">
+          <Textarea
+            className="min-h-24 text-[0.75rem]"
+            onChange={event => setDraft(event.target.value)}
+            value={draft}
+          />
+          <Button
+            className="self-end"
+            disabled={!draft.trim()}
+            onClick={() => {
+              onSave(draft.trim())
+              setEditing(false)
+            }}
+            size="xs"
+            variant="secondary"
+          >
+            {k.save}
+          </Button>
+        </div>
+      ) : (
+        <TaskMarkdown text={summary} />
       )}
     </Section>
   )
@@ -1273,9 +1337,11 @@ export function TaskDrawer({
                   )}
 
                   {task.latest_summary && !isAdminSummary(task.latest_summary) && (
-                    <Section label={k.latestSummary}>
-                      <TaskMarkdown text={task.latest_summary} />
-                    </Section>
+                    <SummarySection
+                      editable={isIdle(task)}
+                      onSave={summary => void mutate(() => editSummary(task.id, summary))()}
+                      summary={task.latest_summary}
+                    />
                   )}
 
                   <FeedTabs
