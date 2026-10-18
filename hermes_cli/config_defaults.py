@@ -1964,6 +1964,9 @@ DEFAULT_CONFIG = {
         # ``{p5: {kind: codex, model: gpt-6.1-sol, effort: medium}}``. Unlisted/unreadable falls
         # back to claude/claude-sonnet-5-5/medium. A task's own override still wins.
         "herdr_board_agents": None,
+        # Per-board opt-in: the bridge moves a card to Review only with a deliberate handoff that
+        # opens with a real ``/open-pr`` command. List/comma-string; unset = plain bridge.
+        "direct_herdr_open_pr_handoff_boards": None,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.

@@ -381,7 +381,8 @@ _SPECS = [
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
-    ], help="Edit task fields or recovery fields on an already-completed task"),
+    ], help="Edit task fields, recovery fields on an already-completed task, "
+         "or an idle review task's handoff summary (--summary without --result)"),
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),

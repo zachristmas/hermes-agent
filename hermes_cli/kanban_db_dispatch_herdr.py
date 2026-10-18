@@ -180,6 +180,42 @@ def _board_uses_review_dispatch(board: Optional[str]) -> bool:
     return slug in _review_dispatch_boards()
 
 
+def _open_pr_handoff_boards() -> frozenset:
+    """Direct-Herdr boards whose Review handoff must be a human ``/open-pr`` command
+    (``kanban.direct_herdr_open_pr_handoff_boards``, e.g. ``[titan]``).
+
+    Opt-in per board, never a default for every board: a board with no PR step keeps the bridge's
+    plain behaviour. Absent, empty, or unreadable all resolve to the empty set.
+    """
+    from hermes_cli import kanban_db as _kb
+    try:
+        kanban = (_load_dispatch_config() or {}).get("kanban", {})
+    except Exception as exc:  # health: allow BLE001 -- config read boundary; an unreadable
+        # config keeps the bridge's plain behaviour rather than crashing a worker mid-run.
+        _kb._log.warning(
+            "kanban: could not read kanban.direct_herdr_open_pr_handoff_boards (%s: %s) — "
+            "no board enforces the /open-pr handoff contract until the config is readable",
+            type(exc).__name__, exc,
+        )
+        return frozenset()
+    if not isinstance(kanban, Mapping):
+        return frozenset()
+    raw = kanban.get("direct_herdr_open_pr_handoff_boards")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return frozenset()
+    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    return frozenset(
+        slug for slug in (_kb._normalize_board_slug(n) or n.strip() or None for n in names) if slug
+    )
+
+
+def _board_requires_open_pr_handoff(board: Optional[str]) -> bool:
+    """True when ``board`` (or the current board, if None) enforces the /open-pr handoff contract."""
+    from hermes_cli import kanban_db as _kb
+    slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    return slug in _open_pr_handoff_boards()
+
+
 def _direct_herdr_worker_argv() -> list[str]:
     """Build the direct-Herdr bridge worker command (per-board opt-in, card t_cb0795f9).
 

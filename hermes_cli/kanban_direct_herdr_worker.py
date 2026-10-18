@@ -65,8 +65,11 @@ import sys
 import time
 from typing import Any, Optional
 
+from hermes_cli import kanban_direct_herdr_handoff as handoff
+
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _DEFAULT_MODEL = "claude-sonnet-5-5"
+_HANDOFF_REJECTED = "handoff contract rejected"
 _DEFAULT_EFFORT = "medium"
 # Used only when the dispatcher didn't set HERMES_KANBAN_HERDR_KIND at all (e.g. a direct manual
 # invocation of this module outside kanban_db_dispatch.py). The dispatcher itself always resolves
@@ -499,12 +502,23 @@ def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional
 
 
 def _herdr_agent_args(kind: str, model: str, effort: str) -> list[str]:
-    """Return harness-specific supported flags and the requested permission bypass."""
+    """Return harness-specific supported flags and the requested permission bypass.
+
+    Claude model/effort defaults never leak into another harness: Codex keeps its own model config
+    when handed a Claude default, and Windows Codex stays in the owned terminal (``--no-daemon``)
+    rather than attaching to the shared daemon.
+    """
     if kind == "codex":
-        return ["--model", model, "-c", f'model_reasoning_effort="{effort}"', "--yolo"]
+        args = ["--model", model] if model and not model.lower().startswith("claude") else []
+        if effort:
+            args += ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
+        args.append("--yolo")
+        if os.name == "nt":
+            args.append("--no-daemon")
+        return args
     if kind == "claude":
         return ["--model", model, "--effort", effort, "--dangerously-skip-permissions"]
-    return ["--model", model, "--effort", effort]
+    return []
 
 
 def _herdr_agent_profile_for_worker(
@@ -541,7 +555,7 @@ def start_agent(name: str, pane_id: str, model: str, effort: str, kind: str = _D
             try:
                 _run_herdr([
                     "agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", "60000",
-                    "--", *agent_args,
+                    *(["--", *agent_args] if agent_args else []),
                 ], timeout=_AGENT_START_TIMEOUT_S)
                 return
             except HerdrCliError as exc:
@@ -631,11 +645,14 @@ def close_pane(pane_id: str) -> bool:
         return False
 
 
-def _compose_prompt(task_id: str, board: Optional[str]) -> str:
+def _compose_prompt(task_id: str, board: Optional[str], run_id: Optional[int] = None) -> str:
     """``"work kanban task <id>"`` enriched with the card's own title/description when the DB is
     reachable, so the agent's first move isn't a blind re-fetch of the card it was already handed.
     Best-effort: any read failure falls back to the bare instruction rather than blocking dispatch
     on a problem the agent itself can also just fix by reading the card.
+
+    On a board that enforces the ``/open-pr`` handoff contract, the instructions for it are
+    appended (``run_id`` names the run the handoff block must be tied to).
     """
     base = f"work kanban task {task_id}"
     try:
@@ -650,14 +667,22 @@ def _compose_prompt(task_id: str, board: Optional[str]) -> str:
     except Exception:  # health: allow BLE001 -- best-effort enrichment only; any DB/connect
         # failure here (missing board, locked file, schema drift) must fall back to the bare
         # instruction, never block dispatch over a problem the agent can fix by reading the card.
-        return base
-    if task is None:
-        return base
-    lines = [base, "", f"Title: {task.title}"]
-    if task.body:
-        lines.append("")
-        lines.append(task.body.strip())
-    return "\n".join(lines)
+        task = None
+    lines = [base]
+    if task is not None:
+        lines += ["", f"Title: {task.title}"]
+        if task.body:
+            lines += ["", task.body.strip()]
+    prompt = "\n".join(lines)
+    if run_id is not None and _requires_open_pr_handoff(board):
+        prompt += "\n" + handoff.contract_instructions(task_id, run_id)
+    return prompt
+
+
+def _requires_open_pr_handoff(board: Optional[str]) -> bool:
+    from hermes_cli.kanban_db_dispatch_herdr import _board_requires_open_pr_handoff
+
+    return _board_requires_open_pr_handoff(board)
 
 
 def _annotate_preserved_pane(success: bool, report: str, pane_preserved: bool) -> str:
@@ -675,7 +700,8 @@ def _annotate_preserved_pane(success: bool, report: str, pane_preserved: bool) -
 
 
 def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
-        herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND) -> tuple[bool, str]:
+        herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND,
+        run_id: Optional[int] = None) -> tuple[bool, str]:
     """Drive one card through the herdr-dispatch skill's workspace -> pane -> link -> agent
     lifecycle.
 
@@ -735,7 +761,7 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
             status = agent_status(name)
             if status not in ("working", "busy", "blocked", "running"):
                 try:
-                    prompt_agent(name, _compose_prompt(task_id, board))
+                    prompt_agent(name, _compose_prompt(task_id, board, run_id))
                 except AgentBlockedError as exc:
                     return False, (
                         f"agent {name} is blocked on an approval/question dialog and was not "
@@ -780,7 +806,7 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
             close_pane(pane_id)
             raise
         try:
-            prompt_agent(name, _compose_prompt(task_id, board))
+            prompt_agent(name, _compose_prompt(task_id, board, run_id))
         except AgentBlockedError as exc:
             return False, (
                 f"agent {name} is blocked on an approval/question dialog and was not "
@@ -846,7 +872,7 @@ def _continue_remote_matches(matches: list[dict], task_id: str, board: Optional[
 
 def dispatch(
     task_id: str, board: str, workspace_dir: str, model: str, effort: str,
-    herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND,
+    herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND, run_id: Optional[int] = None,
 ) -> tuple[bool, str, str, Optional[str], Optional[str]]:
     """Entry point for :func:`main`: checks for this card's existing Herdr state on OTHER
     machines first, then falls through to :func:`run` (which already covers the local case).
@@ -869,7 +895,10 @@ def dispatch(
     if matches:
         success, report = _continue_remote_matches(matches, task_id, board)
         return success, report, "transient", str(matches[0].get("name") or "") or None, matches[0].get("_machine_id") if success else None
-    success, report = run(task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind)
+    success, report = run(
+        task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind,
+        run_id=run_id,
+    )
     # Appended, not prepended: request_review's event payload keeps only the summary's FIRST
     # LINE as its headline (`_first_line`), so this housekeeping note must never push the actual
     # work's own report out of that line.
@@ -881,6 +910,71 @@ def dispatch(
     return success, report + suffix, "transient", _LAST_SETTLED_AGENT, None
 
 
+def _archive_transcript(task_id: str, board: Optional[str], run_id: int, transcript: str) -> Optional[str]:
+    """Keep the raw terminal capture as a task attachment (audit only, never the Review summary).
+    Returns the stored filename, or ``None`` when there was nothing to keep or it could not be
+    stored: the card transition must not depend on its own audit copy."""
+    if not transcript.strip():
+        return None
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    try:
+        conn = kbc.connect(board=board)
+        try:
+            att_id = kb.store_attachment_bytes(
+                conn, task_id, f"herdr-transcript-run{run_id}.txt", transcript.encode("utf-8"),
+                content_type="text/plain", uploaded_by="direct-herdr-bridge", board=board,
+            )
+            att = kb.get_attachment(conn, att_id)
+        finally:
+            conn.close()
+    except Exception as exc:  # health: allow BLE001 -- audit copy is best-effort by design
+        print(f"kanban_direct_herdr_worker: could not archive the raw transcript: {exc}", file=sys.stderr)
+        return None
+    return att.filename if att else None
+
+
+def _last_comment_body(task_id: str, board: Optional[str]) -> Optional[str]:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect(board=board)
+    try:
+        comments = kb.list_comments(conn, task_id)
+    finally:
+        conn.close()
+    return max(comments, key=lambda c: (c.created_at or 0, c.id)).body if comments else None
+
+
+def _apply_handoff_contract(
+    task_id: str, board: str, run_id: int, success: bool, report: str, block_kind: str,
+) -> tuple[bool, str, str]:
+    """On a board enforcing the ``/open-pr`` handoff contract, turn the settled agent's own report
+    into a Review receipt only when it carries a deliberate handoff (see
+    ``kanban_direct_herdr_handoff``); the raw terminal capture is archived as an attachment, never
+    used as the summary. A rejected handoff becomes a ``needs_input`` failure receipt (sticky, not
+    auto-retried) with the transcript tail as evidence. Other boards and bridge failures pass
+    through unchanged.
+    """
+    if not success or not _requires_open_pr_handoff(board):
+        return success, report, block_kind
+    result = handoff.resolve_handoff(
+        report, _compose_prompt(task_id, board, run_id), task_id, run_id,
+        _last_comment_body(task_id, board),
+    )
+    archived = _archive_transcript(task_id, board, run_id, report)
+    audit = f"\n\nRaw terminal capture kept as attachment {archived}." if archived else ""
+    if not result.ok:
+        return False, result.reason + audit, "needs_input"
+    summary = result.summary
+    if "could not be confirmed closed" in report:
+        summary += "\n\nThe Herdr pane could not be confirmed closed; check it."
+    if result.source == "card_comment":
+        summary += "\n\nHandoff taken from the card's last comment."
+    return True, summary + audit, block_kind
+
+
 def _mark_card(
     task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str,
     block_kind: str = "transient", workspace_dir: Optional[str] = None,
@@ -888,7 +982,6 @@ def _mark_card(
     machine_id: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Verify the exact settled Herdr executor and persist its run-scoped receipt."""
-    from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_settlement as settlement
 
     if not settlement_owner:
@@ -899,6 +992,13 @@ def _mark_card(
     if status not in _SETTLED_STATUSES:
         raise BridgeError(f"native Herdr agent is not settled: {status!r}")
     report = read_agent(agent_name, machine_id=machine_id).strip()
+    if success and _requires_open_pr_handoff(board):
+        # On an /open-pr board the verified handoff is the deliverable, not a workspace file.
+        success, summary, block_kind = _apply_handoff_contract(task_id, board, run_id, success, report, block_kind)
+        saved, why = _record_receipt(task_id, board, run_id, success, summary, (), block_kind, False)
+        if saved and not success:
+            return True, f"{_HANDOFF_REJECTED}; durable needs_input receipt recorded"
+        return saved, why
     review_summary = settlement._review_summary(report)
     artifacts = settlement._verified_review_artifacts(report, workspace_dir or "") if success else ()
     # A success report with no verified deliverable stays a success receipt that carries no artifacts:
@@ -907,11 +1007,21 @@ def _mark_card(
     if success and artifacts:
         artifact_names = ", ".join(artifacts[:4])
         review_summary = f"Deliverable ready for review: {artifact_names}. {review_summary}".strip()
+    return _record_receipt(task_id, board, run_id, success, review_summary, artifacts, block_kind, True)
+
+
+def _record_receipt(
+    task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str,
+    artifacts, block_kind: str, require_artifacts: bool,
+) -> tuple[bool, Optional[str]]:
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_settlement as settlement
+
     conn = kbc.connect(board=board)
     try:
         saved = settlement.record_result_receipt(
-            conn, task_id, run_id, success=success, report=review_summary,
-            artifacts=artifacts, block_kind=block_kind, require_artifacts=True,
+            conn, task_id, run_id, success=success, report=report,
+            artifacts=artifacts, block_kind=block_kind, require_artifacts=require_artifacts,
         )
         if not saved:
             return False, "result receipt was already present or the run fence no longer matched"
@@ -956,11 +1066,12 @@ def main() -> int:
     try:
         success, report, block_kind, agent_name, machine_id = dispatch(
             task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind,
+            run_id=run_id,
         )
     except Exception as exc:  # health: allow BLE001 -- this is the process's top-level boundary;
         # a worker must exit cleanly with a reported reason, never crash out with a traceback.
         report = f"direct-herdr bridge failed: {type(exc).__name__}: {exc}"
-    print(report)
+    print(report)  # the raw capture always reaches the worker log, whatever the card summary becomes
     try:
         card_ok, reason = _mark_card(
             task_id, board, run_id, success, report, block_kind, workspace_dir=workspace_dir,
@@ -972,6 +1083,8 @@ def main() -> int:
         return 1
     if not card_ok:
         print(f"kanban_direct_herdr_worker: result receipt rejected: {reason}", file=sys.stderr)
+        return 1
+    if reason and reason.startswith(_HANDOFF_REJECTED):
         return 1
     return 0 if success else 1
 
