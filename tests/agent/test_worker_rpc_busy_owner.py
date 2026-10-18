@@ -4,8 +4,8 @@ Regression: an owner whose event loop stalled past the 5s discovery bound answer
 ``control_timeout``, the worker raised ``owner_unavailable`` on its first persistence call, and
 that sticky failure ended the whole managed run.
 """
-from contextlib import contextmanager
 import json
+import queue
 from types import SimpleNamespace
 
 import pytest
@@ -22,10 +22,13 @@ def rpc_env(tmp_path, monkeypatch):
     monkeypatch.setattr('hermes_cli.gateway_runtime.control_home_for', lambda home, endpoint: home)
     monkeypatch.setattr('hermes_cli.gateway_client._session_ticket', lambda *a, **k: 'ticket')
 
-    @contextmanager
     def connect(url, **kwargs):
-        yield SimpleNamespace(send=lambda value: None,
-                              recv=lambda **k: json.dumps({'id': 1, 'result': {'ok': True}}))
+        sent = queue.SimpleQueue()
+
+        def recv():
+            return json.dumps({'id': json.loads(sent.get())['id'], 'result': {'ok': True}})
+
+        return SimpleNamespace(send=sent.put, recv=recv, close=lambda: None)
 
     monkeypatch.setattr('websockets.sync.client.connect', connect)
     monkeypatch.setattr('hermes_cli.gateway_runtime_discovery.query_identify', lambda *a, **k: {'pid': -1})

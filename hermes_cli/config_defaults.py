@@ -17,17 +17,7 @@ DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
 LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
 
 
-def _aux(timeout, *, reasoning_effort=True, **extra):
-    """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
-
-    reasoning_effort=False omits that key (MoA blocks configure depth per slot);
-    ``extra`` keys are appended after the standard ones.
-    """
-    d = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout, "extra_body": {}}
-    if reasoning_effort:
-        d["reasoning_effort"] = ""
-    d.update(extra)
-    return d
+from hermes_cli.config_defaults_aux import _aux
 
 
 DEFAULT_CONFIG = {
@@ -320,12 +310,11 @@ DEFAULT_CONFIG = {
         # immediately kills the delivery (e.g. Bot Mode handoff replies via message_agent /
         # bot_relay). Plain background processes without notify_on_complete are never waited on. 0
         # disables.
-        # Bounded linger (seconds) for one-shot CLI runs (-q/-Q/-z) that exit while background processes
-        # spawned with notify_on_complete=true are still running. See #90879.
         "oneshot_completion_wait_seconds": 600.0,
-        # Env vars passed into sandboxed terminal/execute_code (skill-declared
-        # required_environment_variables pass through automatically).
+        "process_wait_auto_notify": True,  # 2 unchanged wait/poll -> notify_on_complete + stop; False = old polling
+        # Env vars passed into sandboxed terminal/execute_code (plus skill-declared required_environment_variables).
         "env_passthrough": [],
+        "client_env_passthrough": [],  # Extra non-secret toolchain names a CLI/TUI client sends for its tools
         # Remote-backend sync-back refuses to extract a downloaded state archive larger than this
         # (bytes); raise it for a ~/.hermes tree that legitimately exceeds 2 GiB.
         "sync_back_max_bytes": 2 * 1024 * 1024 * 1024,
@@ -449,20 +438,20 @@ DEFAULT_CONFIG = {
         # prefs copied and re-synced per fresh session) driven by Hermes' packaged Chromium. The
         # snapshot dir sidesteps Chrome 136+'s default-profile debugging block and never contends
         # with the running browser. Turning off deletes ~/.hermes/browser-profile/ so credentials
-        # don't outlive consent. Chromium-family only (Chrome, Edge, Brave, Brave Origin, Chromium);
-        # Firefox etc. fails closed. Also gates the browser_exec `local` argument (real-profile
-        # local session even under a cloud backend). Desktop Settings -> Browser.
+        # don't outlive consent. Chromium-family only; a profile that can't be copied (Firefox default,
+        # Windows browser holding its cookies) gives a fresh, signed-out browser plus a note saying why.
+        # Also gates the browser_exec `local` arg (real-profile session under a cloud backend). Desktop Settings -> Browser.
         "use_real_profile": False,
         # Windows only: a running Chrome/Edge/Brave locks its cookie DB, so the profile can't be
-        # copied. When on, a locked profile still blocks and the agent ASKS first; on approval it
+        # copied (the session runs on a fresh browser). When on, the agent ASKS first; on approval it
         # runs `hermes browser close-profile` (kills that profile's browser tree, unsaved tabs lost)
-        # and retries once; still locked -> stays blocked, no auto-kill. No effect on macOS/Linux,
-        # where a running browser instead makes the Login Data / Web Data SQLite backups miss
-        # their deadline; quit the browser by hand there.
+        # so a new session can copy it; no auto-kill. No effect on macOS/Linux, where a running
+        # browser only locks the password/autofill DBs, which are skipped (cookies still copy).
         "real_profile_autoclose": False,
         # Pin WHICH source profile directory is snapshotted for real-profile browsing (e.g. "Profile
         # 2"). Empty = browser's last-used profile, which on multi-profile machines can hand the
-        # agent the wrong identity. A pin naming a missing directory FAILS CLOSED.
+        # agent the wrong identity. A pin naming a missing directory never falls back to another
+        # profile: the session gets a fresh browser without the user's logins.
         "real_profile_pin": "",
         # restrict_evaluate: opt-in denylist blocking sensitive JS primitives (cookies/storage/
         # clipboard/network/form values) in browser_console(expression=...); allow_unsafe_evaluate
@@ -492,6 +481,22 @@ DEFAULT_CONFIG = {
         # registration also requires the API server bearer key. developer_mode gates the privileged
         # browser_cdp / browser_evaluate capabilities.
         "extension_control": {"enabled": False, "developer_mode": False},
+    },
+    # Stale git worktree lifecycle (`hermes -w`, `/worktree new`, subagent isolation, Desktop). The
+    # sweep runs at `hermes -w` startup and every 6h from the cron ticker over every repo Hermes made
+    # a worktree in. Trees idle past their tier (hermes-*/subagent-* 24h, named 72h) that are clean
+    # and merged are removed; dirty or unpushed ones are archived to refs/hermes/archive/<tree>
+    # first (`hermes worktree restore <name>`). Live trees and Kanban t_<hex> trees are never touched.
+    "worktrees": {
+        # false = never remove a dirty/unpushed tree (the pre-archive behaviour, exactly).
+        "archive_dirty": True,
+        # Untracked files larger than this (MB) are not archived, so a tree holding one is kept.
+        "archive_max_file_mb": 50,
+        # The sweep deletes archive refs older than this many days. 0 keeps them forever.
+        "archive_retention_days": 30,
+        # Optional size budget (GB) for idle trees: past it the oldest idle trees are archived and
+        # removed first. Live, young and Kanban trees are never counted or touched. 0 = off.
+        "max_total_gb": 0,
     },
     # Filesystem checkpoints: snapshot the working directory once per turn (on the first
     # write_file/patch call); restore with /rollback. Opt-in via `hermes chat --checkpoints` or
@@ -1246,8 +1251,7 @@ DEFAULT_CONFIG = {
         # instead of going to the agent. [] disables.
         "stop_phrases": ["stop"],
     },
-    # Native vision embeds (vision_analyze / browser screenshots on vision-capable main models) ride
-    # conversation history and are re-sent on every later API call.
+    # Native images (vision_analyze, browser screenshots, replayed user images) are re-sent on every later call.
     "vision": {
         # Byte budget for one embedded image (clamped 64 KiB..4 MiB). Raise it for dense phone
         # screenshots of tables the model calls "unreadable" at 256 KB.
@@ -1256,6 +1260,7 @@ DEFAULT_CONFIG = {
         # null = 3 inside delegated subagents (they run unattended), unlimited for the main agent;
         # an explicit number applies everywhere; 0 = unlimited.
         "max_calls_per_image": None,
+        "replay_recent_images": 3,  # newest user images re-sent on turns rebuilt from state.db; 0 = off
     },
     # "Hey Hermes" hands-free wake word: always-on, on-device hotword detection that starts a fresh
     # voice session. Off by default; toggle with /wake.
@@ -1951,21 +1956,17 @@ DEFAULT_CONFIG = {
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.
         "reconcile_orphans": True,
-        # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
-        # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
-        # activity for this many days so stale rows aren't scanned forever. 0 = off.
+        # Notify subscriptions survive `done` and are removed on archive; on boards that never archive,
+        # the notifier GC purges subs of tasks done with no activity for this many days. 0 = off.
         "done_sub_retention_days": 30,
-        # Per-board opt-in (card t_cb0795f9): boards listed here get the "direct Herdr bridge"
-        # worker (``hermes_cli.kanban_direct_herdr_worker``) instead of the usual worker argv, via
-        # ``herdr agent start`` (never a raw provider API). List/comma-string; empty/None/unreadable
-        # all resolve to "off". Requires ``herdr`` on PATH (or ``HERDR_BIN``).
+        # Per-board opt-in (card t_cb0795f9): listed boards spawn the direct-Herdr bridge worker
+        # (``hermes_cli.kanban_direct_herdr_worker``, via ``herdr agent start`` from PATH or ``HERDR_BIN``,
+        # never a raw provider API) instead of the usual worker argv. List/comma; empty/None/unreadable = off.
         "direct_herdr_dispatch_boards": None,
-        # Per-board ``herdr agent start --kind``/model/effort for the boards above, e.g.
-        # ``{p5: {kind: codex, model: gpt-6.1-sol, effort: medium}}``. Unlisted/unreadable falls
-        # back to claude/claude-sonnet-5-5/medium. A task's own override still wins.
+        # Per-board ``herdr agent start --kind``/model/effort for the boards above (a task's own override
+        # wins); unlisted/unreadable = claude/claude-sonnet-5-5/medium.
         "herdr_board_agents": None,
-        # Per-board opt-in: the bridge moves a card to Review only with a deliberate handoff that
-        # opens with a real ``/open-pr`` command. List/comma-string; unset = plain bridge.
+        # Per-board opt-in: Review only with a deliberate handoff opening with a real ``/open-pr``.
         "direct_herdr_open_pr_handoff_boards": None,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
@@ -2277,18 +2278,14 @@ DEFAULT_CONFIG = {
     # inserts, /resume listing, and insights queries.
     "sessions": {
         # Prune ENDED sessions inactive for retention_days (activity = freshest of live activity /
-        # latest message / creation) about once per min_interval_hours at startup. Open, pinned, or mid-turn sessions
-        # are never deleted; stale automation sessions whose process died are *closed*, then get a
-        # full retention window before removal.
-        "auto_prune": True,
+        # latest message / creation) about once per min_interval_hours at CLI/gateway/cron startup.
+        # Open, pinned, or mid-turn sessions are never deleted; stale automation sessions whose
+        # process died are *closed*, then get a full retention window before removal.
+        # Off by default (deleting history is opt-in). While the user's config.yaml has no
+        # auto_prune key, every surface asks once the disk holding state.db runs low
+        # (hermes_cli/prune_advisor.py); either answer writes the key and ends the question.
+        "auto_prune": False,
         # Inactive days of ended-session history to keep (= `hermes sessions prune`).
-        # When true, prune ENDED sessions inactive for retention_days once per (roughly) min_interval_hours
-        # at CLI/gateway/cron startup. Activity is the freshest of live activity (last_activity_at) / latest
-        # message timestamp / creation time. Sessions that are still open, pinned, or mid-turn are never deleted — the
-        # only open rows the sweep touches are stale automation sessions (cron/kanban/subagent/one-shot CLI)
-        # whose process died without closing them; those are *closed*, not deleted, and get a further full
-        # retention window before removal. Default true since #54189: without it state.db grows without
-        # bound (multi-GB installs reported within weeks).
         "retention_days": 90,
         # Auto-archive (soft-hide, never delete) sessions with no activity for auto_archive_days,
         # once per min_interval_hours. Pinned sessions are exempt.

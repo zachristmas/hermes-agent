@@ -1,5 +1,4 @@
-"""OPTIONAL_ENV_VARS entry factories, split out of ``config_defaults.py`` to keep that data
-module under its line cap. Pure helpers: no imports from ``hermes_cli.config``."""
+"""Entry factories for ``config_defaults.OPTIONAL_ENV_VARS`` (pure-data leaf, no imports)."""
 
 
 def _env(description, prompt, **keys):
