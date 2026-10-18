@@ -122,7 +122,26 @@ def bot_chat_tip(authority, session_id):
     tip = db.get_compression_tip(row['id'])
     if not tip or db.get_compression_tip(session_id) != tip:
         return None
-    return db.get_session(tip)
+    tip_row = db.get_session(tip)
+    if tip_row is None or not _is_local_bound(db, tip_row):
+        # A legacy Bot Chat (an api_server-era row never adopted by a native owner) is not a LOCAL session:
+        # adopting it needs a native create-capable transport, which an API peer deliberately is not, so
+        # admission answered ``not_found`` for every peer turn. Its history stays an API conversation
+        # until a native owner adopts it; the caller then runs the turn through the API lane.
+        return None
+    return tip_row
+
+
+def _is_local_bound(db, row) -> bool:
+    """True when *row* is a LOCAL session (policy-bound or imported) the authority FIFO can admit to;
+    the same test ``resolve_local_target`` applies before it would try to adopt a legacy row."""
+    from hermes_state_local import POLICY_PREFIX
+    from hermes_state_local_migration import LEGACY_PREFIX
+    chat_id = row.get('chat_id') or row['id']
+    with db._read_ctx() as conn:
+        bound = conn.execute('SELECT 1 FROM state_meta WHERE key IN (?,?)',
+                             (POLICY_PREFIX + chat_id, LEGACY_PREFIX + chat_id)).fetchone()
+    return bool(bound) or str(row.get('chat_id') or '').startswith('local-')
 
 
 async def admit_peer_turn(runner, session_id, message, author):

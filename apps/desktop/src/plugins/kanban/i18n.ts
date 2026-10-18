@@ -151,6 +151,8 @@ type KanbanMessages = {
   comment: string
   messageWorker: string
   addComment: string
+  editComment: string
+  commentEdited: (edits: number) => string
   deliveredLive: string
   requeueWithNote: string
   notePosted: string
@@ -160,6 +162,10 @@ type KanbanMessages = {
   workerLogTail: string
   attachments: (n: number) => string
   noAttachments: string
+  previewAttachment: (name: string) => string
+  hidePreviewAttachment: (name: string) => string
+  previewFailed: string
+  previewTruncated: string
   uploadAttachment: string
   taskActions: string
   copyTaskId: string
@@ -386,6 +392,8 @@ export const en: KanbanMessages = {
   comment: 'Comment',
   messageWorker: 'Message the running worker…',
   addComment: 'Add a comment…',
+  editComment: 'Edit comment',
+  commentEdited: n => `Edited · ${n}`,
   deliveredLive: 'Delivered to the running worker within a few seconds.',
   requeueWithNote: 'Requeue with note',
   notePosted: 'Note posted — worker requeued',
@@ -395,6 +403,10 @@ export const en: KanbanMessages = {
   workerLogTail: 'Worker log · tail',
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
+  previewAttachment: n => `Preview ${n}`,
+  hidePreviewAttachment: n => `Hide preview of ${n}`,
+  previewFailed: 'Preview unavailable',
+  previewTruncated: 'Preview truncated — download for the full file.',
   uploadAttachment: 'Upload attachment',
   taskActions: 'Task actions',
   copyTaskId: 'Copy task id',
@@ -613,6 +625,8 @@ const ja: KanbanMessages = {
   comment: 'コメント',
   messageWorker: '実行中のワーカーにメッセージ…',
   addComment: 'コメントを追加…',
+  editComment: 'コメントを編集',
+  commentEdited: n => `編集済み・${n}`,
   deliveredLive: '数秒以内に実行中のワーカーへ届きます。',
   requeueWithNote: 'メモを付けて再キュー',
   notePosted: 'メモを投稿しました — ワーカーを再キューしました',
@@ -622,6 +636,10 @@ const ja: KanbanMessages = {
   workerLogTail: 'ワーカーログ・末尾',
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
+  previewAttachment: n => `${n} をプレビュー`,
+  hidePreviewAttachment: n => `${n} のプレビューを閉じる`,
+  previewFailed: 'プレビューできません',
+  previewTruncated: 'プレビューは一部のみ表示しています。全文はダウンロードしてください。',
   uploadAttachment: '添付をアップロード',
   taskActions: 'タスクの操作',
   copyTaskId: 'タスク ID をコピー',
@@ -838,6 +856,8 @@ const zh: KanbanMessages = {
   comment: '评论',
   messageWorker: '给运行中的工作单元发消息…',
   addComment: '添加评论…',
+  editComment: '编辑评论',
+  commentEdited: n => `已编辑・${n}`,
   deliveredLive: '几秒内送达运行中的工作单元。',
   requeueWithNote: '附带备注重新入队',
   notePosted: '备注已发布 — 工作单元已重新入队',
@@ -847,6 +867,10 @@ const zh: KanbanMessages = {
   workerLogTail: '工作单元日志・末尾',
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
+  previewAttachment: n => `预览 ${n}`,
+  hidePreviewAttachment: n => `收起 ${n} 的预览`,
+  previewFailed: '无法预览',
+  previewTruncated: '预览已截断，请下载完整文件。',
   uploadAttachment: '上传附件',
   taskActions: '任务操作',
   copyTaskId: '复制任务 ID',
@@ -1062,6 +1086,8 @@ const zhHant: KanbanMessages = {
   comment: '留言',
   messageWorker: '傳訊給執行中的工作單元…',
   addComment: '新增留言…',
+  editComment: '編輯留言',
+  commentEdited: n => `已編輯・${n}`,
   deliveredLive: '幾秒內送達執行中的工作單元。',
   requeueWithNote: '附上備註重新排入佇列',
   notePosted: '備註已發布 — 工作單元已重新排入佇列',
@@ -1071,6 +1097,10 @@ const zhHant: KanbanMessages = {
   workerLogTail: '工作單元日誌・末尾',
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
+  previewAttachment: n => `預覽 ${n}`,
+  hidePreviewAttachment: n => `收合 ${n} 的預覽`,
+  previewFailed: '無法預覽',
+  previewTruncated: '預覽已截斷，請下載完整檔案。',
   uploadAttachment: '上傳附件',
   taskActions: '任務操作',
   copyTaskId: '複製任務 ID',

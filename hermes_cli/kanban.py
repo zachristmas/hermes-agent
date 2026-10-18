@@ -21,6 +21,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_db_review_summary as kbrs
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
@@ -219,11 +220,18 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "set-default-workdir", "import",
 })
 
+# Mirrors attach/attach-rm above: writing or removing a ref is fenced the same as an attachment;
+# list/find are reads and stay open to delegated children.
+_DELEGATED_CHILD_DENIED_REF_ACTIONS: frozenset[str] = frozenset({"add", "rm"})
+
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     action = getattr(args, "kanban_action", None)
     if action == "boards":
         if (getattr(args, "boards_action", None) or "list") not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
+            return False
+    elif action == "ref":
+        if (getattr(args, "ref_action", None) or "list") not in _DELEGATED_CHILD_DENIED_REF_ACTIONS:
             return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
@@ -399,13 +407,16 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
         return _err(f"kanban swarm: {exc}", 2)
     if not workers:
         return _err("kanban swarm: at least one --worker is required", 2)
-    with kbc.connect_closing() as conn:
-        created = ks.create_swarm(
-            conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
-            synthesizer_assignee=args.synthesizer, tenant=args.tenant,
-            created_by=args.created_by or _profile_author(), priority=args.priority,
-            idempotency_key=getattr(args, "idempotency_key", None),
-        )
+    try:
+        with kbc.connect_closing() as conn:
+            created = ks.create_swarm(
+                conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
+                synthesizer_assignee=args.synthesizer, tenant=args.tenant,
+                created_by=args.created_by or _profile_author(), priority=args.priority,
+                idempotency_key=getattr(args, "idempotency_key", None),
+            )
+    except ks.SwarmRefusedError as exc:
+        return _err(f"kanban swarm: {exc}", 2)
     if getattr(args, "json", False):
         _print_json(created.as_dict())
     else:
@@ -471,6 +482,29 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _print_task_overrides(task, field) -> None:
+    """``show``'s per-task override lines: model/provider pin, host pin, effective retry
+    threshold. Split out of ``_cmd_show`` to keep it under the function complexity cap."""
+    if task.model_override:
+        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
+        field("model", f"{task.model_override}{_prov}")
+    if task.agent_kind_override:
+        field("agent-kind", task.agent_kind_override)
+    if task.reasoning_effort:
+        field("effort", task.reasoning_effort)
+    if task.remote_host:
+        field("remote-host", task.remote_host)
+    # Effective retry threshold (task > config > default) explains auto-blocks.
+    if task.max_retries is not None:
+        print(f"  max-retries: {task.max_retries} (task)")
+    else:
+        cfg_val = _kanban_config().get("failure_limit")
+        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
+            print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
+        else:
+            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -486,6 +520,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        refs = kb.list_task_refs(conn, args.task_id)
         # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
         latest_summary = kb.latest_summary(conn, args.task_id)
         if not want_json:
@@ -497,6 +532,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
+            "refs": refs,
         })
         return 0
 
@@ -513,18 +549,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("branch", task.branch_name)
     if task.skills:
         field("skills", ", ".join(task.skills))
-    if task.model_override:
-        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
-        field("model", f"{task.model_override}{_prov}")
-    # Effective retry threshold (task > config > default) explains auto-blocks.
-    if task.max_retries is not None:
-        print(f"  max-retries: {task.max_retries} (task)")
-    else:
-        cfg_val = _kanban_config().get("failure_limit")
-        if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
-            print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
-        else:
-            print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+    _print_task_overrides(task, field)
+    for r in refs:
+        line = f"  ref:       [{r['id']}] {r['ref_type']}"
+        for label, key in (("repo", "repo"), ("ref", "ref"), ("host", "host"), ("note", "note")):
+            if r[key]:
+                line += f"  {label}={r[key]}"
+        print(line)
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
@@ -596,6 +627,272 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared model override on {args.task_id} (worker uses its profile default)")
     return 0
+
+
+def _cmd_set_kind(args: argparse.Namespace) -> int:
+    kind = args.kind
+    if kind is not None and kind.lower() in {"none", "-", "null", ""}:
+        kind = None
+    with kbc.connect_closing() as conn:
+        ok = kb.set_agent_kind_override(conn, args.task_id, kind)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    if kind:
+        print(f"Pinned {args.task_id} to agent kind {kind} (applies on next dispatch)")
+    else:
+        print(f"Cleared the agent kind override on {args.task_id} (uses the board's default)")
+    return 0
+
+
+def _cmd_set_effort(args: argparse.Namespace) -> int:
+    effort = args.effort
+    if effort is not None and effort.lower() in {"none", "-", "null", ""}:
+        effort = None
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.set_reasoning_effort(conn, args.task_id, effort)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    if effort:
+        print(f"Set reasoning effort override on {args.task_id}: {effort} (applies on next dispatch)")
+    else:
+        print(f"Cleared reasoning effort override on {args.task_id}")
+    return 0
+
+
+def _cmd_set_remote(args: argparse.Namespace) -> int:
+    host = args.host
+    if host is not None and host.lower() in {"none", "-", "null", ""}:
+        host = None
+    with kbc.connect_closing() as conn:
+        ok = kb.set_remote_host(conn, args.task_id, host)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    if host:
+        print(f"Pinned {args.task_id} to host {host} (a direct-Herdr bridge board skips its "
+              f"fast path for this task until the pin is cleared or matches this machine)")
+    else:
+        print(f"Cleared the host pin on {args.task_id}")
+    return 0
+
+
+def _dispatch_ref(args: argparse.Namespace) -> int:
+    """``hermes kanban ref <action>`` -- same shape as ``_dispatch_boards``, a nested subparser
+    group instead of a flat handler, since a task can carry any number of refs."""
+    sub = getattr(args, "ref_action", None) or "list"
+    handler = _REF_HANDLERS.get(sub)
+    if handler is None:
+        return _err(f"kanban ref: unknown action {sub!r}", 2)
+    return handler(args)
+
+
+def _dispatch_acceptance(args: argparse.Namespace) -> int:
+    """``hermes kanban acceptance show|protect|unprotect|set-verifier``: the ONE operator surface for the
+    shared human-acceptance policy (``<kanban_home>/kanban/human_acceptance.json``)."""
+    from hermes_cli import kanban_settlement as ks
+    sub = getattr(args, "acceptance_action", None) or "show"
+    if sub != "show" and (_in_worker_context() or os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")):
+        return _err("kanban acceptance: policy changes are operator-only", 2)
+    try:
+        policy = ks.read_policy()
+    except ks.PolicyError as exc:
+        if sub == "show":
+            return _err(f"kanban acceptance: {exc} (all Done writes are refused until it is fixed)")
+        policy = {}
+    boards, verifier = list(policy.get("boards", [])), policy.get("verifier", "")
+    if sub == "show":
+        print(f"policy file: {ks.policy_path()}")
+        print(f"protected boards: {', '.join(boards) or '(none)'}")
+        print(f"verifier set: {'yes' if verifier else 'no'}")
+        return 0
+    if sub in ("protect", "unprotect"):
+        for b in args.boards:
+            if b != "*" and not kb.board_exists(b):
+                return _err(f"kanban acceptance: no such board: {b}", 2)
+        boards = sorted(set(boards) | set(args.boards)) if sub == "protect" else [b for b in boards if b not in args.boards]
+    elif sub == "set-verifier":
+        import getpass
+        first = getpass.getpass("New acceptance passphrase: ")
+        if not first or first != getpass.getpass("Repeat: "):
+            return _err("kanban acceptance: empty or mismatched passphrase", 2)
+        verifier = ks.make_verifier(first)
+    else:
+        return _err(f"kanban acceptance: unknown action {sub!r}", 2)
+    ks.write_policy(boards, verifier)
+    print(f"Saved. Protected boards: {', '.join(boards) or '(none)'}; verifier set: {'yes' if verifier else 'no'}")
+    return 0
+
+
+def _in_worker_context() -> bool:
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
+def _parse_contract_items(args: argparse.Namespace) -> list[dict]:
+    """Validate ``--require/--contains/--json-keys`` into contract items; ValueError on bad input."""
+    items: dict[str, dict] = {}
+    for spec in args.require:
+        name, _, size = spec.partition(":")
+        if not name or name != os.path.basename(name) or name in (".", ".."):
+            raise ValueError(f"--require needs a bare file name, got {spec!r}")
+        try:
+            min_bytes = int(size) if size else 1
+        except ValueError:
+            raise ValueError(f"--require size must be an integer, got {spec!r}") from None
+        if min_bytes < 1:
+            raise ValueError(f"--require size must be >= 1, got {spec!r}")
+        items[name] = {"name": name, "min_bytes": min_bytes, "must_contain": [], "json_keys": []}
+    for field, key, sep in ((args.contains, "must_contain", None), (args.json_keys, "json_keys", ",")):
+        for spec in field:
+            name, eq, value = spec.partition("=")
+            if not eq or name not in items or not value:
+                raise ValueError(f"expected NAME=VALUE for a --require'd name, got {spec!r}")
+            items[name][key].extend([v for v in value.split(sep) if v] if sep else [value])
+    return list(items.values())
+
+
+def _dispatch_contract(args: argparse.Namespace) -> int:
+    sub = getattr(args, "contract_action", None) or "show"
+    handler = _CONTRACT_HANDLERS.get(sub)
+    if handler is None:
+        return _err(f"kanban contract: unknown action {sub!r}", 2)
+    return handler(args)
+
+
+def _cmd_contract_declare(args: argparse.Namespace) -> int:
+    if _in_worker_context():
+        return _err("kanban contract declare: refused inside a dispatched worker (operator-only)", 2)
+    try:
+        items = _parse_contract_items(args)
+    except ValueError as exc:
+        return _err(f"kanban contract declare: {exc}", 2)
+    from hermes_cli import kanban_settlement as ks
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            return _err(f"no such task: {args.task_id}")
+        if ks.load_artifact_contract(conn, args.task_id):
+            return _err(f"kanban contract declare: {args.task_id} already has a contract "
+                        "(remove it with `kanban ref rm` as an operator first)", 2)
+        ks.declare_artifact_contract(conn, args.task_id, items)
+    print(f"Declared {len(items)} required deliverable(s) on {args.task_id}: "
+          + ", ".join(i["name"] for i in items))
+    return 0
+
+
+def _cmd_contract_show(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_settlement as ks
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            return _err(f"no such task: {args.task_id}")
+        items = ks.load_artifact_contract(conn, args.task_id)
+    if _json_out(args, items):
+        return 0
+    if not items:
+        print(f"{args.task_id}: no deliverable contract declared")
+        return 0
+    for i in items:
+        extra = "".join([f" contains={i['must_contain']}" if i["must_contain"] else "",
+                         f" json_keys={i['json_keys']}" if i["json_keys"] else ""])
+        print(f"{i['name']}  min_bytes={i['min_bytes']}{extra}")
+    return 0
+
+
+_CONTRACT_HANDLERS = {"declare": _cmd_contract_declare, "show": _cmd_contract_show}
+
+
+def _cmd_ref_add(args: argparse.Namespace) -> int:
+    if _in_worker_context() and args.ref_type == "review_artifact_contract":
+        return _err("kanban ref add: the deliverable contract is operator-only", 2)
+    try:
+        with kbc.connect_closing() as conn:
+            ref_id = kb.add_task_ref(
+                conn, args.task_id, args.ref_type, repo=getattr(args, "repo", None),
+                ref=getattr(args, "ref_value", None), host=getattr(args, "host", None),
+                note=getattr(args, "note", None),
+            )
+    except ValueError as exc:
+        return _err(f"kanban ref add: {exc}", 2)
+    print(f"Added ref {ref_id} ({args.ref_type}) to {args.task_id}")
+    return 0
+
+
+def _cmd_ref_list(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            return _err(f"no such task: {args.task_id}")
+        refs = kb.list_task_refs(conn, args.task_id)
+    if _json_out(args, refs):
+        return 0
+    if not refs:
+        print(f"No refs on {args.task_id}")
+        return 0
+    print(f"Refs on {args.task_id}:")
+    for r in refs:
+        line = f"  [{r['id']}] {r['ref_type']}"
+        for label, key in (("repo", "repo"), ("ref", "ref"), ("host", "host"), ("note", "note")):
+            if r[key]:
+                line += f"  {label}={r[key]}"
+        print(line)
+    return 0
+
+
+def _cmd_ref_rm(args: argparse.Namespace) -> int:
+    with kbc.connect_closing() as conn:
+        if _in_worker_context():
+            row = conn.execute("SELECT ref_type FROM task_refs WHERE id = ?", (args.ref_id,)).fetchone()
+            if row is not None and row["ref_type"] == "review_artifact_contract":
+                return _err("kanban ref rm: the deliverable contract is operator-only", 2)
+        removed = kb.remove_task_ref(conn, args.ref_id)
+    if removed is None:
+        return _err(f"no such ref: {args.ref_id}")
+    print(f"Removed ref {args.ref_id} ({removed['ref_type']}) from {removed['task_id']}")
+    return 0
+
+
+def _cmd_ref_find(args: argparse.Namespace) -> int:
+    """Reverse lookup: which task(s) a repo/ref value belongs to. Scoped to the current board
+    when ``--board`` was given (same resolution every other action gets); otherwise scans every
+    non-archived board, since the whole point is not already knowing where to look."""
+    repo = getattr(args, "repo", None)
+    ref_value = getattr(args, "ref_value", None)
+    if not (repo or "").strip() and not (ref_value or "").strip():
+        return _err("kanban ref find: pass --repo and/or --ref", 2)
+    matches = []
+    if getattr(args, "board", None):
+        with kbc.connect_closing() as conn:
+            found = kb.find_task_refs(conn, repo=repo, ref=ref_value)
+        matches.extend(dict(m, board=kb.get_current_board()) for m in found)
+    else:
+        for b in kb.list_boards(include_archived=False):
+            slug = b["slug"]
+            try:
+                with kbc.connect_closing(board=slug) as conn:
+                    found = kb.find_task_refs(conn, repo=repo, ref=ref_value)
+            except Exception as exc:  # health: allow BLE001 -- cross-board scan boundary; one
+                # unreadable/corrupt board must not abort matches already found on the others.
+                kb._log.warning("kanban ref find: skipping board %r (%s: %s)", slug, type(exc).__name__, exc)
+                continue
+            matches.extend(dict(m, board=slug) for m in found)
+    if _json_out(args, matches):
+        return 0
+    if not matches:
+        print("(no matching refs)")
+        return 0
+    for m in matches:
+        line = f"{m['task_id']}  board={m['board']}  status={m['task_status']}  {m['ref_type']}"
+        if m["repo"]:
+            line += f"  repo={m['repo']}"
+        if m["ref"]:
+            line += f"  ref={m['ref']}"
+        line += f"  {m['task_title']}"
+        print(line)
+    return 0
+
+
+_REF_HANDLERS = {
+    "add": _cmd_ref_add, "list": _cmd_ref_list, "rm": _cmd_ref_rm, "find": _cmd_ref_find,
+}
 
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
@@ -812,6 +1109,23 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_human_acceptance(args):
+    """Passphrase-authenticated human acceptance for ``complete --accept``; None otherwise.
+
+    Prompts on the controlling terminal (getpass), so a process without a human at the
+    keyboard cannot supply it. Never read from argv, env or stdin pipes.
+    """
+    if not getattr(args, "accept", False):
+        return None
+    import getpass
+    from hermes_cli import kanban_settlement as settlement
+    try:
+        verifier = (settlement._acceptance_config().get("verifier") or "")
+        return settlement.authenticate_passphrase(getpass.getpass("Acceptance passphrase: "), verifier)
+    except (EOFError, KeyboardInterrupt, OSError, settlement.PolicyError):
+        return None
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     if env_tid and env_tid != task_id:
@@ -921,7 +1235,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                                        force=bool(getattr(args, "force", False)),
+                                        human_acceptance=_cli_human_acceptance(args))
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
@@ -951,17 +1266,25 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
-    if result is None and (summary is not None or raw_metadata is not None):
-        return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if result is None and raw_metadata is not None:
+        return _err("kanban edit: --metadata requires --result", 2)
+    if all(value is None for value in (title, body, priority, result, summary)):
+        return _err("kanban edit: provide --title, --body, --priority, --result, or --summary", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
     with kbc.connect_closing() as conn:
+        # --summary alone corrects an idle review card's handoff summary; with --result it is
+        # the done-card backfill's summary, as before.
+        if result is None and summary is not None:
+            ok, why = kbrs.edit_review_summary(conn, args.task_id, summary=summary)
+            if not ok:
+                return _err(f"cannot edit the summary of {args.task_id}: {why}")
+            if all(value is None for value in (title, body, priority)):
+                return _ok_or_err(True, "", f"Edited {args.task_id} (review summary)")
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
-            result=result, summary=summary, metadata=metadata,
+            result=result, summary=summary if result is not None else None, metadata=metadata,
         )
     return _ok_or_err(
         ok,
@@ -1320,7 +1643,8 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
-    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "assign": _cmd_assign, "set-model": _cmd_set_model, "set-remote": _cmd_set_remote,
+    "set-kind": _cmd_set_kind, "set-effort": _cmd_set_effort, "ref": _dispatch_ref, "contract": _dispatch_contract, "acceptance": _dispatch_acceptance,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
@@ -1352,6 +1676,8 @@ Common subcommands:
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
+  `ref add <id> --type branch --repo <path> --ref <name>`  Link a branch/ticket/PR to a task
+  `ref find --repo <path> --ref <name>`  Which task a branch/ticket/PR belongs to
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive

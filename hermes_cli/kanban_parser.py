@@ -146,6 +146,48 @@ _BOARD_SPECS = [
     )),
 ]
 
+_ACCEPTANCE_SPECS = [
+    _cmd("show", [], help="Show the shared human-acceptance policy"),
+    _cmd("protect", [_arg("boards", nargs="+", metavar="BOARD")], help="Require trusted-human Done on these boards ('*' = all)"),
+    _cmd("unprotect", [_arg("boards", nargs="+", metavar="BOARD")], help="Stop requiring trusted-human Done on these boards"),
+    _cmd("set-verifier", [], help="Set the acceptance passphrase (prompted, never echoed or passed in argv)"),
+]
+
+
+_CONTRACT_SPECS = [
+    _cmd("declare", [
+        _TASK_ID,
+        _arg("--require", dest="require", action="append", required=True, metavar="NAME[:MIN_BYTES]",
+             help="Deliverable file basename the card must produce (repeatable); optional minimum size in bytes"),
+        _arg("--contains", dest="contains", action="append", default=[], metavar="NAME=TEXT",
+             help="Text the named deliverable must contain (repeatable)"),
+        _arg("--json-keys", dest="json_keys", action="append", default=[], metavar="NAME=key1,key2",
+             help="Top-level JSON keys the named deliverable must have (repeatable)"),
+    ], help="Declare required deliverables a card must evidence at Review/Done (operator-only)"),
+    _cmd("show", [_TASK_ID, _json_flag()], help="Show a task's declared deliverable contract"),
+]
+
+
+_REF_SPECS = [
+    _cmd("add", [
+        _TASK_ID,
+        _arg("--type", dest="ref_type", required=True,
+             help="Free-form reference kind, e.g. branch, ado-workitem, connect-ticket, pr-url"),
+        _arg("--repo", help="Repo path this reference belongs to"),
+        _arg("--ref", dest="ref_value", help="Branch name, PR URL, ticket id, or other ref value"),
+        _arg("--host", help="Hostname this reference's work lives on, if host-specific"),
+        _arg("--note", help="Free-text note, for a reference with no repo/ref/host (e.g. a ticket id)"),
+    ], help="Attach a typed reference (branch, ticket, PR, ...) to a task"),
+    _cmd("list", [_TASK_ID, _json_flag()], help="List a task's references"),
+    _cmd("rm", [_arg("ref_id", type=int)], help="Remove one reference by id"),
+    _cmd("find", [
+        _arg("--repo", help="Match references with this repo path"),
+        _arg("--ref", dest="ref_value", help="Match references with this ref value (branch/ticket/PR)"),
+        _json_flag(),
+    ], help="Find the task(s) a repo/ref value is linked to -- across every board, or just the "
+            "current one when --board is given"),
+]
+
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
@@ -257,6 +299,31 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-kind", [
+        _TASK_ID,
+        _arg("kind", nargs="?", help="Herdr agent kind for this task's worker (e.g. codex, pi, "
+                                      "opencode), or 'none' to clear and use the board's default"),
+    ], help="Pin (or clear) this task's own agent kind, overriding kanban.herdr_board_agents "
+            "for just this card (takes effect on the next dispatch)"),
+    _cmd("set-effort", [
+        _TASK_ID,
+        _arg("effort", nargs="?", help="Reasoning effort for this task's worker, or 'none' to "
+                                        "clear and use the profile/board default"),
+    ], help="Pin (or clear) this task's own reasoning effort (takes effect on the next dispatch)"),
+    _cmd("set-remote", [
+        _TASK_ID,
+        _arg("host", nargs="?",
+             help="Hostname (socket.gethostname()) this task's work is pinned to, or 'none' to clear"),
+    ], help="Pin a task to a specific host, or clear the pin. A direct-Herdr bridge board "
+            "skips its fast local-spawn path for a task pinned elsewhere, so a card continuing "
+            "a specific cross-host session falls through to the normal dispatch path instead."),
+    _cmd("ref", children=("ref_action", _REF_SPECS),
+         help="Attach/list/remove/find typed references (branch, ADO work item, Connect ticket, "
+              "PR URL, ...) a task corresponds to -- a task can have any number, across repos"),
+    _cmd("acceptance", children=("acceptance_action", _ACCEPTANCE_SPECS),
+         help="Operator: shared human-acceptance policy (which boards need trusted-human Done)"),
+    _cmd("contract", children=("contract_action", _CONTRACT_SPECS),
+         help="Declare/show the deliverable evidence a card must carry to enter Review or Done"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
@@ -303,6 +370,9 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),
+        _arg("--accept", action="store_true",
+             help="Human acceptance for review-required boards: prompts for the acceptance "
+                  "passphrase on the terminal (kanban.human_acceptance.verifier)."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
@@ -311,7 +381,8 @@ _SPECS = [
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
-    ], help="Edit task fields or recovery fields on an already-completed task"),
+    ], help="Edit task fields, recovery fields on an already-completed task, "
+         "or an idle review task's handoff summary (--summary without --result)"),
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),

@@ -223,18 +223,19 @@ class _KanbanDispatcher:
         Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
         ``claim_task`` and never spawnable — a queue full of those is
         "correctly idle", not "stuck". The review column is probed only when
-        review dispatch is on (same gate as the dispatcher): a task waiting
-        for a human reviewer is idle, not stuck.
+        review dispatch is on for THAT board (same board-scoped gate as the
+        dispatcher, ``kanban.review_dispatch_boards``) — a task waiting for a
+        human reviewer is idle, not stuck, and the gate can differ per board.
         """
         kbd = _kbd()
-        _review_probe = kbd.review_dispatch_enabled()
         from hermes_cli import kanban_db as _kb
         with _kb.pin_first_board_resolution():
             for slug in self._board_slugs():
                 conn = None
                 try:
                     conn = _kbc().connect(board=slug)
-                    if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
+                    review_probe = kbd.review_dispatch_enabled(slug)
+                    if kbd.has_spawnable_ready(conn) or (review_probe and kbd.has_spawnable_review(conn)):
                         return True
                 except Exception:
                     continue

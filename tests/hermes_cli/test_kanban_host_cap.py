@@ -27,6 +27,21 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_connect as kbc
 
 
+def _patch_review_dispatch_boards(monkeypatch: pytest.MonkeyPatch, boards) -> None:
+    """Enable ``kanban.review_dispatch_boards`` for the ``default`` board these
+    fairness tests run against (``kbc.connect()`` with no ``board=``). Patches the
+    real reader (``config_effective.load_user_config_effective``), not the legacy
+    ``cfgmod.load_config`` these tests used before the board-scoped allowlist
+    replaced the flat ``kanban.review_dispatch`` boolean."""
+    from hermes_cli import config_effective
+
+    monkeypatch.setattr(
+        config_effective,
+        "load_user_config_effective",
+        lambda *a, **k: {"kanban": {"review_dispatch_boards": boards}},
+    )
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -201,11 +216,7 @@ def _park_in_review(conn: sqlite3.Connection, title: str, assignee: str) -> str:
 def test_review_lane_gets_reserved_slot_under_ready_backlog(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    import hermes_cli.config as cfgmod
-    monkeypatch.setattr(
-        cfgmod, "load_config",
-        lambda *a, **k: {"kanban": {"review_dispatch": True}},
-    )
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
 
     spawns: list = []
     with kbc.connect() as conn:
@@ -250,12 +261,8 @@ def test_unspawnable_review_does_not_reserve_the_only_ready_slot(
     """A review card the review loop would refuse this tick (respawn guard,
     per-profile cap) must not consume the fairness reservation — otherwise the
     ready lane starves every tick while the reserved slot goes unused."""
-    import hermes_cli.config as cfgmod
-
-    monkeypatch.setattr(
-        cfgmod, "load_config",
-        lambda *a, **k: {"kanban": {"review_dispatch": True}},
-    )
+    
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
 
     spawns: list = []
     with kbc.connect() as conn:
@@ -271,12 +278,8 @@ def test_unguarded_review_reserves_the_only_ready_slot(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     """A dispatchable review card still receives the single shared slot."""
-    import hermes_cli.config as cfgmod
-
-    monkeypatch.setattr(
-        cfgmod, "load_config",
-        lambda *a, **k: {"kanban": {"review_dispatch": True}},
-    )
+    
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
 
     spawns: list = []
     with kbc.connect() as conn:
@@ -292,11 +295,7 @@ def test_unguarded_review_reserves_the_only_ready_slot(
 def test_review_reservation_released_when_no_review_work(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    import hermes_cli.config as cfgmod
-    monkeypatch.setattr(
-        cfgmod, "load_config",
-        lambda *a, **k: {"kanban": {"review_dispatch": True}},
-    )
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
 
     spawns: list = []
     with kbc.connect() as conn:
@@ -314,13 +313,9 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     kanban_home, monkeypatch,
 ):
     """Review tasks parked for humans (no real profile) release the slot."""
-    import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
 
-    monkeypatch.setattr(
-        cfgmod, "load_config",
-        lambda *a, **k: {"kanban": {"review_dispatch": True}},
-    )
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
     # Only 'alice' is a real profile; the review assignee is a human lane.
     monkeypatch.setattr(
         profmod, "profile_exists", lambda name: name == "alice"
@@ -343,11 +338,7 @@ def test_review_budget_still_bounded_by_shared_cap(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     """The reservation caps the ready lane; it grants review no extra slots."""
-    import hermes_cli.config as cfgmod
-    monkeypatch.setattr(
-        cfgmod, "load_config",
-        lambda *a, **k: {"kanban": {"review_dispatch": True}},
-    )
+    _patch_review_dispatch_boards(monkeypatch, ["default"])
 
     spawns: list = []
     with kbc.connect() as conn:

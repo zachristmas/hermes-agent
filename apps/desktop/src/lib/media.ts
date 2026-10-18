@@ -440,6 +440,33 @@ export function captureGatewayFileDownload() {
     downloadGatewayFileWithFeedback(path, { owner: { connectionId, profile }, suggestedName })
 }
 
+/** Capture an inline-preview reader alongside a REST read, pinned to the same
+ *  (connection, profile) owner as `captureGatewayFileDownload`. It returns the
+ *  file as a `data:` URL through the existing authenticated read path
+ *  (`/api/fs/read-data-url`, with the backend's own path confinement and size
+ *  cap). Only absolute gateway paths are read; anything that does not come back
+ *  as a data URL (e.g. a bare `file://` fallback) is rejected rather than
+ *  handed to the renderer. */
+export function captureGatewayFilePreview() {
+  const { connectionId, profile } = capabilityScoped()
+
+  return async (path: string): Promise<string> => {
+    const trimmed = path?.trim()
+
+    if (!trimmed || !isFileMediaPath(trimmed)) {
+      throw new Error('Missing gateway file path')
+    }
+
+    const dataUrl = await resolveMediaDisplaySrc(trimmed, { connectionId, profile })
+
+    if (!/^data:/i.test(dataUrl)) {
+      throw new Error('Preview unavailable for this file')
+    }
+
+    return dataUrl
+  }
+}
+
 export function mediaDisplayLabel(path: string): string {
   const escaped = mediaName(path).replace(/[[\]\\]/g, '\\$&')
   const kind = mediaKind(path)

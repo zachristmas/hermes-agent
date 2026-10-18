@@ -87,6 +87,8 @@ export interface KanbanComment {
   author: string
   body: string
   created_at: number
+  edited_at?: number
+  edits?: number
 }
 
 export interface KanbanEvent {

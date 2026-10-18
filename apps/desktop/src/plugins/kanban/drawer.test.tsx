@@ -140,6 +140,66 @@ describe('task attachment compatibility', () => {
     )
   })
 
+  it('previews a Markdown attachment inline through its original owner', async () => {
+    const api = vi.fn().mockResolvedValue({ dataUrl: `data:text/markdown;base64,${btoa('# Plan\n\nship it')}` })
+    vi.stubGlobal('hermesDesktop', { api })
+    setApiRequestConnection('remote-owner')
+    setApiRequestProfile('cs')
+    detail = {
+      ...legacyDetail,
+      attachments: [{ id: 5, filename: 'plan.md', stored_path: '/persisted/attachments/plan.md' }]
+    }
+    openDrawer()
+    const toggle = await screen.findByRole('button', { name: 'Preview plan.md' })
+    setApiRequestConnection('other-host')
+    fireEvent.click(toggle)
+    expect(await screen.findByText('ship it')).toBeTruthy()
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: 'remote-owner',
+        path: '/api/fs/read-data-url?path=%2Fpersisted%2Fattachments%2Fplan.md',
+        profile: 'cs'
+      })
+    )
+    expect(screen.getByRole('button', { name: 'Hide preview of plan.md' })).toBeTruthy()
+  })
+
+  it('previews a plain-text attachment verbatim and reports a failed read', async () => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce({ dataUrl: `data:text/plain;base64,${btoa('line one\n<b>raw</b>')}` })
+      .mockRejectedValueOnce(new Error('File not found'))
+
+    vi.stubGlobal('hermesDesktop', { api })
+    setApiRequestConnection('remote-owner')
+    detail = {
+      ...legacyDetail,
+      attachments: [
+        { id: 1, filename: 'notes.txt', stored_path: '/persisted/notes.txt' },
+        { id: 2, filename: 'gone.log', stored_path: '/persisted/gone.log' }
+      ]
+    }
+    openDrawer()
+    fireEvent.click(await screen.findByRole('button', { name: 'Preview notes.txt' }))
+    expect(await screen.findByText(/<b>raw<\/b>/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Preview gone.log' }))
+    expect(await screen.findByText('Preview unavailable')).toBeTruthy()
+  })
+
+  it('offers no preview for unsupported types, missing paths, or oversized files', async () => {
+    detail = {
+      ...legacyDetail,
+      attachments: [
+        { id: 1, filename: 'pic.png', stored_path: '/persisted/pic.png' },
+        { id: 2, filename: 'old.md' },
+        { id: 3, filename: 'huge.txt', stored_path: '/persisted/huge.txt', size: 50 * 1024 * 1024 }
+      ]
+    }
+    openDrawer()
+    await screen.findByRole('button', { name: 'Download pic.png' })
+    expect(screen.queryByRole('button', { name: /^Preview / })).toBeNull()
+  })
+
   it('disables downloads with no persisted path instead of guessing a workspace path', async () => {
     detail = { ...legacyDetail, attachments: [{ id: 1, filename: 'gone.md' }] }
     openDrawer()
