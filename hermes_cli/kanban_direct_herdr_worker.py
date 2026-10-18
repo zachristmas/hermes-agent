@@ -94,6 +94,9 @@ _START_BUSY_BACKOFF_S = 2.0
 
 _SETTLED_STATUSES = ("idle", "done", "finished")
 _LAST_SETTLED_AGENT: Optional[str] = None
+# The native transcript this process read from the agent it settled, immediately before closing that
+# agent's pane. Once closed, the agent no longer exists, so ``_mark_card`` cannot re-read it.
+_CLOSED_AGENT_REPORT: Optional[tuple[str, str]] = None
 
 
 class BridgeError(RuntimeError):
@@ -463,7 +466,7 @@ def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional
     rule: a blocked or still-working agent's pane is never closed, so a human can still reach it.
     Only an agent confirmed genuinely settled (idle/done/finished) by BOTH checks is closed.
     """
-    global _LAST_SETTLED_AGENT
+    global _LAST_SETTLED_AGENT, _CLOSED_AGENT_REPORT
     _LAST_SETTLED_AGENT = name
     status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000, machine_id=machine_id)
     if status == "blocked":
@@ -498,6 +501,8 @@ def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional
     closed = True
     if pane_id is not None:
         closed = close_pane(pane_id)
+        if closed:
+            _CLOSED_AGENT_REPORT = (name, report)
     return True, report, not closed
 
 
@@ -736,8 +741,9 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
     subprocess calls, not network round trips) that the live dry runs validating this bridge never
     triggered either one.
     """
-    global _LAST_SETTLED_AGENT
+    global _LAST_SETTLED_AGENT, _CLOSED_AGENT_REPORT
     _LAST_SETTLED_AGENT = None
+    _CLOSED_AGENT_REPORT = None
     name = pane_name(board, task_id)
     try:
         existing = find_existing_agent(name)
@@ -988,10 +994,16 @@ def _mark_card(
         raise BridgeError("dispatcher settlement ownership is required")
     if not agent_name:
         raise BridgeError("settled native agent identity is missing")
-    status = agent_status(agent_name, machine_id=machine_id)
-    if status not in _SETTLED_STATUSES:
-        raise BridgeError(f"native Herdr agent is not settled: {status!r}")
-    report = read_agent(agent_name, machine_id=machine_id).strip()
+    closed = _CLOSED_AGENT_REPORT
+    if machine_id is None and closed is not None and closed[0] == agent_name and _agent_info(agent_name) is None:
+        # This process settled the agent and closed its pane: use the native read taken right before
+        # the close. The caller's ``report`` is still never trusted.
+        report = closed[1].strip()
+    else:
+        status = agent_status(agent_name, machine_id=machine_id)
+        if status not in _SETTLED_STATUSES:
+            raise BridgeError(f"native Herdr agent is not settled: {status!r}")
+        report = read_agent(agent_name, machine_id=machine_id).strip()
     if success and _requires_open_pr_handoff(board):
         # On an /open-pr board the verified handoff is the deliverable, not a workspace file.
         success, summary, block_kind = _apply_handoff_contract(task_id, board, run_id, success, report, block_kind)
