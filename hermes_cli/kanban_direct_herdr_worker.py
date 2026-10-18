@@ -64,6 +64,8 @@ import subprocess
 import sys
 from typing import Any, Optional
 
+from hermes_cli import kanban_direct_herdr_handoff as handoff
+
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _DEFAULT_MODEL = "claude-sonnet-5-5"
 _DEFAULT_EFFORT = "medium"
@@ -461,11 +463,12 @@ def _settle_and_close(name: str, pane_id: Optional[str]) -> tuple[bool, str, boo
 
 
 def start_agent(name: str, pane_id: str, model: str, effort: str, kind: str = _DEFAULT_KIND) -> None:
-    """``herdr agent start <name> --kind <kind> --pane <pane> -- --model <model> --effort
-    <effort>`` — the interactive coding-agent path, never a raw provider API. ``kind`` is whatever
-    the dispatcher resolved from ``kanban.herdr_board_agents`` for this board (``run()``'s own
-    caller); it is a parameter rather than hardcoded so this one function serves every installed
-    ``herdr agent`` kind, not just Claude/Codex.
+    """Start the selected interactive harness with its own CLI options.
+
+    Claude model/effort defaults must never leak into another harness. Codex uses its
+    own model config when the dispatcher supplies a Claude default, and its native
+    config override for reasoning effort. Windows Codex stays in the owned terminal
+    rather than attaching to the shared daemon.
 
     ``agent_not_ready`` is not treated as fatal on its own: Herdr returns it when it could not
     confirm input-readiness in time, but the agent may still be present and about to become
@@ -475,11 +478,23 @@ def start_agent(name: str, pane_id: str, model: str, effort: str, kind: str = _D
     name, so prompting/closing would then act on the wrong pane while leaving the real one
     orphaned) and is refused rather than silently adopted.
     """
+    agent_args: list[str] = []
+    if kind == "claude":
+        agent_args = ["--model", model, "--effort", effort]
+    elif kind == "codex":
+        if os.name == "nt":
+            agent_args = ["--yolo", "--no-daemon"]
+        if model and not model.lower().startswith("claude"):
+            agent_args += ["--model", model]
+        if effort:
+            agent_args += ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
+    args = [
+        "agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", "60000",
+    ]
+    if agent_args:
+        args += ["--", *agent_args]
     try:
-        _run_herdr([
-            "agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", "60000",
-            "--", "--model", model, "--effort", effort,
-        ], timeout=_AGENT_START_TIMEOUT_S)
+        _run_herdr(args, timeout=_AGENT_START_TIMEOUT_S)
     except HerdrCliError as exc:
         if exc.code != "agent_not_ready":
             raise
@@ -561,11 +576,14 @@ def close_pane(pane_id: str) -> bool:
         return False
 
 
-def _compose_prompt(task_id: str, board: Optional[str]) -> str:
+def _compose_prompt(task_id: str, board: Optional[str], run_id: Optional[int] = None) -> str:
     """``"work kanban task <id>"`` enriched with the card's own title/description when the DB is
     reachable, so the agent's first move isn't a blind re-fetch of the card it was already handed.
     Best-effort: any read failure falls back to the bare instruction rather than blocking dispatch
     on a problem the agent itself can also just fix by reading the card.
+
+    On a board that enforces the ``/open-pr`` handoff contract, the instructions for it are
+    appended (``run_id`` names the run the handoff block must be tied to).
     """
     base = f"work kanban task {task_id}"
     try:
@@ -580,14 +598,22 @@ def _compose_prompt(task_id: str, board: Optional[str]) -> str:
     except Exception:  # health: allow BLE001 -- best-effort enrichment only; any DB/connect
         # failure here (missing board, locked file, schema drift) must fall back to the bare
         # instruction, never block dispatch over a problem the agent can fix by reading the card.
-        return base
-    if task is None:
-        return base
-    lines = [base, "", f"Title: {task.title}"]
-    if task.body:
-        lines.append("")
-        lines.append(task.body.strip())
-    return "\n".join(lines)
+        task = None
+    lines = [base]
+    if task is not None:
+        lines += ["", f"Title: {task.title}"]
+        if task.body:
+            lines += ["", task.body.strip()]
+    prompt = "\n".join(lines)
+    if run_id is not None and _requires_open_pr_handoff(board):
+        prompt += "\n" + handoff.contract_instructions(task_id, run_id)
+    return prompt
+
+
+def _requires_open_pr_handoff(board: Optional[str]) -> bool:
+    from hermes_cli.kanban_db_dispatch_herdr import _board_requires_open_pr_handoff
+
+    return _board_requires_open_pr_handoff(board)
 
 
 def _annotate_preserved_pane(success: bool, report: str, pane_preserved: bool) -> str:
@@ -605,7 +631,8 @@ def _annotate_preserved_pane(success: bool, report: str, pane_preserved: bool) -
 
 
 def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
-        herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND) -> tuple[bool, str]:
+        herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND,
+        run_id: Optional[int] = None) -> tuple[bool, str]:
     """Drive one card through the herdr-dispatch skill's workspace -> pane -> link -> agent
     lifecycle.
 
@@ -663,7 +690,7 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
             status = agent_status(name)
             if status not in ("working", "busy", "blocked", "running"):
                 try:
-                    prompt_agent(name, _compose_prompt(task_id, board))
+                    prompt_agent(name, _compose_prompt(task_id, board, run_id))
                 except AgentBlockedError as exc:
                     return False, (
                         f"agent {name} is blocked on an approval/question dialog and was not "
@@ -707,7 +734,7 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
             close_pane(pane_id)
             raise
         try:
-            prompt_agent(name, _compose_prompt(task_id, board))
+            prompt_agent(name, _compose_prompt(task_id, board, run_id))
         except AgentBlockedError as exc:
             return False, (
                 f"agent {name} is blocked on an approval/question dialog and was not "
@@ -772,7 +799,7 @@ def _continue_remote_matches(matches: list[dict], task_id: str, board: Optional[
 
 def dispatch(
     task_id: str, board: str, workspace_dir: str, model: str, effort: str,
-    herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND,
+    herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND, run_id: Optional[int] = None,
 ) -> tuple[bool, str, str]:
     """Entry point for :func:`main`: checks for this card's existing Herdr state on OTHER
     machines first, then falls through to :func:`run` (which already covers the local case).
@@ -795,7 +822,10 @@ def dispatch(
     if matches:
         success, report = _continue_remote_matches(matches, task_id, board)
         return success, report, "transient"
-    success, report = run(task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind)
+    success, report = run(
+        task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind,
+        run_id=run_id,
+    )
     # Appended, not prepended: request_review's event payload keeps only the summary's FIRST
     # LINE as its headline (`_first_line`), so this housekeeping note must never push the actual
     # work's own report out of that line.
@@ -805,6 +835,70 @@ def dispatch(
         f"(saved machines checked: {where}); none found; proceeded here."
     )
     return success, report + suffix, "transient"
+
+
+def _archive_transcript(task_id: str, board: Optional[str], run_id: int, transcript: str) -> Optional[str]:
+    """Keep the raw terminal capture as a task attachment (audit only, never the Review summary).
+    Returns the stored filename, or ``None`` when there was nothing to keep or it could not be
+    stored: the card transition must not depend on its own audit copy."""
+    if not transcript.strip():
+        return None
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    try:
+        conn = kbc.connect(board=board)
+        try:
+            att_id = kb.store_attachment_bytes(
+                conn, task_id, f"herdr-transcript-run{run_id}.txt", transcript.encode("utf-8"),
+                content_type="text/plain", uploaded_by="direct-herdr-bridge", board=board,
+            )
+            att = kb.get_attachment(conn, att_id)
+        finally:
+            conn.close()
+    except Exception as exc:  # health: allow BLE001 -- audit copy is best-effort by design
+        print(f"kanban_direct_herdr_worker: could not archive the raw transcript: {exc}", file=sys.stderr)
+        return None
+    return att.filename if att else None
+
+
+def _last_comment_body(task_id: str, board: Optional[str]) -> Optional[str]:
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect(board=board)
+    try:
+        comments = kb.list_comments(conn, task_id)
+    finally:
+        conn.close()
+    return max(comments, key=lambda c: (c.created_at or 0, c.id)).body if comments else None
+
+
+def _apply_handoff_contract(
+    task_id: str, board: str, run_id: int, success: bool, report: str, block_kind: str,
+) -> tuple[bool, str, str]:
+    """On a board enforcing the ``/open-pr`` handoff contract, turn a settled turn into a Review
+    only when it carries a deliberate handoff (see ``kanban_direct_herdr_handoff``); the raw
+    terminal capture is archived as an attachment, never used as the summary. A rejected handoff
+    blocks the card as ``needs_input`` (sticky, not auto-retried) with the transcript tail as
+    evidence. Other boards and bridge failures pass through unchanged.
+    """
+    if not success or not _requires_open_pr_handoff(board):
+        return success, report, block_kind
+    result = handoff.resolve_handoff(
+        report, _compose_prompt(task_id, board, run_id), task_id, run_id,
+        _last_comment_body(task_id, board),
+    )
+    archived = _archive_transcript(task_id, board, run_id, report)
+    audit = f"\n\nRaw terminal capture kept as attachment {archived}." if archived else ""
+    if not result.ok:
+        return False, result.reason + audit, "needs_input"
+    summary = result.summary
+    if "could not be confirmed closed" in report:
+        summary += "\n\nThe Herdr pane could not be confirmed closed; check it."
+    if result.source == "card_comment":
+        summary += "\n\nHandoff taken from the card's last comment."
+    return True, summary + audit, block_kind
 
 
 def _mark_card(
@@ -888,13 +982,21 @@ def main() -> int:
     try:
         success, report, block_kind = dispatch(
             task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind,
+            run_id=run_id,
         )
     except Exception as exc:  # health: allow BLE001 -- this is the process's top-level boundary;
         # a worker must exit cleanly with a reported reason, never hang or crash out with a
         # traceback the dispatcher's crash accounting can't read as a business failure.
         success, report, block_kind = False, f"direct-herdr bridge crashed: {exc}", "transient"
 
-    print(report)
+    print(report)  # the raw capture always reaches the worker log, whatever the card summary becomes
+    try:
+        success, report, block_kind = _apply_handoff_contract(
+            task_id, board, run_id, success, report, block_kind,
+        )
+    except Exception as exc:  # health: allow BLE001 -- same top-level boundary as above: a failed
+        # contract check must block the card with a reason, not crash past the card transition.
+        success, report, block_kind = False, f"handoff contract check failed: {exc}", "transient"
     try:
         card_ok, card_reason = _mark_card(task_id, board, run_id, success, report, block_kind)
     except Exception as exc:  # health: allow BLE001 -- the pane/agent work already happened; a

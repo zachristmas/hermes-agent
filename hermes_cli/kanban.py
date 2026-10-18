@@ -21,6 +21,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_db_review_summary as kbrs
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
 from hermes_cli.kanban_output import (
@@ -1125,17 +1126,25 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
-    if result is None and (summary is not None or raw_metadata is not None):
-        return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if result is None and raw_metadata is not None:
+        return _err("kanban edit: --metadata requires --result", 2)
+    if all(value is None for value in (title, body, priority, result, summary)):
+        return _err("kanban edit: provide --title, --body, --priority, --result, or --summary", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
     with kbc.connect_closing() as conn:
+        # --summary alone corrects an idle review card's handoff summary; with --result it is
+        # the done-card backfill's summary, as before.
+        if result is None and summary is not None:
+            ok, why = kbrs.edit_review_summary(conn, args.task_id, summary=summary)
+            if not ok:
+                return _err(f"cannot edit the summary of {args.task_id}: {why}")
+            if all(value is None for value in (title, body, priority)):
+                return _ok_or_err(True, "", f"Edited {args.task_id} (review summary)")
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
-            result=result, summary=summary, metadata=metadata,
+            result=result, summary=summary if result is not None else None, metadata=metadata,
         )
     return _ok_or_err(
         ok,
