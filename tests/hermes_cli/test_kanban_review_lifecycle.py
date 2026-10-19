@@ -463,6 +463,19 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
 
         assert kbd.check_respawn_guard(conn, ready_id) == "active_pr"
         assert kbd.check_respawn_guard(conn, review_id, lane="review") is None
+        first_review = kbd.dispatch_once(conn, dry_run=True)
+        assert review_id in [s[0] for s in first_review.spawned]
+
+        # A completed review requires an explicit reopen before it can run again.
+        _now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at, summary) "
+                "VALUES (?, 'reviewer', 'completed', 'completed', ?, ?, ?)",
+                (review_id, _now, _now + 10, "Review completed"),
+            )
+        assert kbd.check_respawn_guard(conn, review_id, lane="review") == "recent_success"
 
         res = kbd.dispatch_once(conn, dry_run=True)
         spawned_ids = [s[0] for s in res.spawned]
