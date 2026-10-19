@@ -1067,3 +1067,42 @@ def test_run_sends_no_work_to_an_executor_it_could_not_link(happy_herdr):
     agent_pane = start[start.index("--pane") + 1]
     assert not [c for c in calls if c[:2] == ["agent", "prompt"]]
     assert ["pane", "close", agent_pane] not in [c[:3] for c in calls]
+
+
+def test_wait_until_settled_keeps_observing_a_working_agent_past_one_wait_slice(monkeypatch):
+    """A wait slice that times out while the agent is still working must not fail the run."""
+    calls = {"wait": 0, "beats": 0}
+
+    def fake_wait(name, timeout_ms, machine_id=None):
+        calls["wait"] += 1
+        if calls["wait"] == 1:
+            raise bridge.HerdrCliError("timeout", "timed out waiting for agent status")
+        if calls["wait"] == 2:
+            return "working"
+        return "idle"
+
+    monkeypatch.setattr(bridge, "wait_agent", fake_wait)
+    monkeypatch.setattr(bridge, "agent_status", lambda name, machine_id=None: "working")
+    monkeypatch.setattr(bridge, "_heartbeat_claim_best_effort", lambda: calls.__setitem__("beats", calls["beats"] + 1))
+    assert bridge._wait_until_settled("titan-t_x") == "idle"
+    assert calls == {"wait": 3, "beats": 2}
+
+
+def test_wait_until_settled_still_raises_a_timeout_when_the_agent_is_not_working(monkeypatch):
+    def fake_wait(name, timeout_ms, machine_id=None):
+        raise bridge.HerdrCliError("timeout", "timed out")
+
+    monkeypatch.setattr(bridge, "wait_agent", fake_wait)
+    monkeypatch.setattr(bridge, "agent_status", lambda name, machine_id=None: "")
+    import pytest
+    with pytest.raises(bridge.HerdrCliError):
+        bridge._wait_until_settled("titan-t_x")
+
+
+def test_wait_until_settled_stops_at_the_observe_cap(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HERDR_MAX_OBSERVE_S", "1")
+    monkeypatch.setattr(bridge, "wait_agent", lambda *a, **k: "working")
+    monkeypatch.setattr(bridge, "_heartbeat_claim_best_effort", lambda: None)
+    ticks = iter([0.0, 0.5, 5.0, 5.0, 5.0])
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: next(ticks))
+    assert bridge._wait_until_settled("titan-t_x") == "working"

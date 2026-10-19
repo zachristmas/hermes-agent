@@ -87,6 +87,11 @@ _CLI_TIMEOUT_S = 30
 _AGENT_START_TIMEOUT_S = 90
 _AGENT_PROMPT_TIMEOUT_S = 45
 _AGENT_WAIT_TIMEOUT_S = 600
+# One ``agent wait`` slice is bounded by _AGENT_WAIT_TIMEOUT_S. A live agent that is still working
+# at the end of a slice is observed again (heartbeating the claim between slices) until this overall
+# cap, instead of failing the run and letting the dispatcher count a crash while the owner works on.
+# Override with HERMES_KANBAN_HERDR_MAX_OBSERVE_S. ``enforce_max_runtime`` remains the outer backstop.
+_AGENT_OBSERVE_CAP_S = 6 * 60 * 60
 # A freshly created pane is not a usable shell until its shell has drawn a prompt (herdr 0.9.3:
 # ``pane get`` shows ``revision`` 0 and no ``terminal_title`` until then). ``agent start`` into it
 # earlier fails ``agent_pane_busy: ... is not an available shell``.
@@ -473,6 +478,54 @@ def sweep_other_hosts_for_task(task_id: str) -> tuple[list[dict], list[str], lis
     return matches, unreachable, checked
 
 
+def _observe_cap_s() -> float:
+    try:
+        return max(float(os.environ.get("HERMES_KANBAN_HERDR_MAX_OBSERVE_S", _AGENT_OBSERVE_CAP_S)), 1.0)  # health: allow HX002 -- same handoff convention
+    except ValueError:
+        return float(_AGENT_OBSERVE_CAP_S)
+
+
+def _heartbeat_claim_best_effort() -> None:
+    """Extend this run's claim while the bridge keeps observing a live agent. Best effort: a failed
+    heartbeat never ends the observation, and the claim fence is unchanged (same claim lock)."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    board = os.environ.get("HERMES_KANBAN_BOARD")
+    lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")  # health: allow HX002 -- dispatcher->worker handoff
+    if not (task_id and lock):
+        return
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        conn = kbc.connect(board=board)
+        try:
+            kb.heartbeat_claim(conn, task_id, claimer=lock)
+        finally:
+            conn.close()
+    except Exception:  # health: allow BLE001 -- observation must outlive a transient DB error
+        pass
+
+
+def _wait_until_settled(name: str, *, machine_id: Optional[str] = None) -> str:
+    """``wait_agent`` slices until the agent leaves working/busy/running or the observe cap passes.
+
+    A slice that times out while the agent is still working (herdr ``timeout`` error, or a returned
+    working status) is not a failure: re-check the live status and wait again. Any other herdr
+    error still propagates. Returns the last observed status."""
+    deadline = time.monotonic() + _observe_cap_s()
+    while True:
+        try:
+            status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000, machine_id=machine_id)
+        except HerdrCliError as exc:
+            if exc.code != "timeout":
+                raise
+            status = agent_status(name, machine_id=machine_id)
+            if status not in _RESUMED_STATUSES:
+                raise
+        if status not in _RESUMED_STATUSES or time.monotonic() >= deadline:
+            return status
+        _heartbeat_claim_best_effort()
+
+
 def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional[str] = None) -> tuple[bool, str, bool]:
     """Wait out the agent, then close its pane only if that's actually safe.
 
@@ -487,7 +540,7 @@ def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional
     # still doing this card's work: wait it out again, a bounded number of times, instead of
     # failing the run while it keeps working.
     for _ in range(_SETTLE_REWAITS + 1):
-        status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000, machine_id=machine_id)
+        status = _wait_until_settled(name, machine_id=machine_id)
         if status == "blocked":
             return False, f"agent {name} is blocked on an approval/question dialog: {_read_agent_for_report(name, machine_id=machine_id)}", True
         if status not in _SETTLED_STATUSES:
