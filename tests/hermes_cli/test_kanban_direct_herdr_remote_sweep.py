@@ -120,13 +120,13 @@ def test_dispatch_blocks_with_needs_input_when_a_machine_is_unreachable(tmp_path
         encoding="utf-8",
     )
     monkeypatch.setenv("HERDR_BIN", f"{sys.executable} {script}")
-    success, report, block_kind = bridge.dispatch("t_a87265e1", "gsd", "/tmp/ws", "m", "medium")
+    success, report, block_kind, _agent, _machine = bridge.dispatch("t_a87265e1", "gsd", "/tmp/ws", "m", "medium")
     assert success is False
     assert block_kind == "needs_input"
     assert "Personal MacBook" in report
 
 
-def test_dispatch_continues_an_existing_remote_match_instead_of_spawning_fresh(tmp_path, monkeypatch):
+def test_an_existing_remote_match_is_surfaced_for_a_person_never_settled_as_this_runs_result(tmp_path, monkeypatch):
     _stub(
         tmp_path, monkeypatch,
         machines=[{"id": "mac1", "label": "Personal MacBook", "enabled": True}],
@@ -137,12 +137,12 @@ def test_dispatch_continues_an_existing_remote_match_instead_of_spawning_fresh(t
             ],
         },
     )
-    success, report, block_kind = bridge.dispatch("t_a87265e1", "gsd", "/tmp/ws", "m", "medium")
-    assert success is True
-    assert block_kind == "transient"
+    success, report, block_kind, _agent, _machine = bridge.dispatch("t_a87265e1", "gsd", "/tmp/ws", "m", "medium")
+    assert success is False  # that session never received this run's assignment
+    assert block_kind == "needs_input"
     assert "Personal MacBook" in report
     assert "gsd-t_a87265e1" in report
-    assert "already did the work here" in report
+    assert "not accepted as this run's result" in report
 
 
 @pytest.mark.parametrize("status", ["blocked"])
@@ -157,6 +157,6 @@ def test_dispatch_surfaces_a_blocked_remote_match_as_not_settled(tmp_path, monke
             ],
         },
     )
-    success, report, _block_kind = bridge.dispatch("t_a87265e1", "gsd", "/tmp/ws", "m", "medium")
+    success, report, _block_kind, _agent, _machine = bridge.dispatch("t_a87265e1", "gsd", "/tmp/ws", "m", "medium")
     assert success is False
     assert "blocked on an approval" in report

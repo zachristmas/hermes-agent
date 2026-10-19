@@ -3812,6 +3812,10 @@
     return h("div", { className: "hermes-kanban-drawer-shade", onClick: props.onClose },
       h("div", {
         className: "hermes-kanban-drawer",
+        // Drawer add-ons (kanban-herdr) scope lookups to this card's board,
+        // not whichever board another tab last saved to localStorage.
+        "data-board": boardSlug || "",
+        "data-task": props.taskId,
         onClick: function (e) { e.stopPropagation(); },
       },
         h("div", { className: "hermes-kanban-drawer-head" },

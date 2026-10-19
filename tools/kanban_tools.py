@@ -969,7 +969,7 @@ def _handle_comment(args: dict, **kw) -> str:
     # with what reads as a system directive. See #19713.
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
-        cid = kb.add_comment(conn, tid, author=author, body=str(body))
+        cid = kb.add_comment(conn, tid, author=author, body=str(body), source="agent")
         return _ok(task_id=tid, comment_id=cid)
 
 

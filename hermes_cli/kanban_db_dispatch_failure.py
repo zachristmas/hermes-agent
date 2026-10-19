@@ -1,13 +1,22 @@
-"""Run-failure accounting and the circuit breaker (``_record_task_failure``), split out of
-``kanban_db_dispatch.py`` to keep that facade under its line cap. Facade names
+"""Run-failure accounting and the circuit breaker (``_record_task_failure``) plus the error
+grouping it feeds (``_error_fingerprint``), split out of ``kanban_db_dispatch.py`` to keep that
+facade under its line cap. Facade names
 (``_kb``, ``DEFAULT_FAILURE_LIMIT``) are late-imported inside the function: this module loads
 mid-way through ``kanban_db_dispatch``, before either facade is complete. Callers and patches
 keep using ``kanban_db_dispatch._record_task_failure``.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Any, Optional
+
+
+def _error_fingerprint(error_text: str) -> str:
+    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
+    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
+    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
+    return fp.lower().strip()
 
 
 def _record_task_failure(

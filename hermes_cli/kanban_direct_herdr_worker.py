@@ -63,9 +63,12 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_direct_herdr_handoff as handoff
+from hermes_cli import kanban_direct_herdr_link as herdr_link
+from hermes_cli import kanban_direct_herdr_report as run_report
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _DEFAULT_MODEL = "claude-sonnet-5-5"
@@ -287,18 +290,21 @@ def create_pane(name: str, workspace_dir: str, *, herdr_workspace: str) -> str:
     return pane_id
 
 
-def link_pane(pane_id: str, task_id: str, board: str) -> None:
+def link_pane(pane_id: str, task_id: str, board: str, fence: Optional[str] = None) -> None:
     """Tag the pane exactly as ``kanban_herdr_link(action="link", ...)`` / the skill's
     ``pane report-metadata`` fallback would, then read it back and verify (same contract as the
-    tool: a tag that doesn't read back the same is a bridge failure, not a silent partial link)."""
+    tool: a tag that doesn't read back the same is a bridge failure, not a silent partial link).
+    ``fence`` (``run-<id>`` / ``reply-...``) also names the run whose prompt the pane now holds."""
+    run_token = ["--token", f"kanban_run={fence}"] if fence else []
     _run_herdr([
         "pane", "report-metadata", pane_id, "--source", "kanban-link",
-        "--token", f"kanban_task={task_id}", "--token", f"kanban_board={board}",
+        "--token", f"kanban_task={task_id}", "--token", f"kanban_board={board}", *run_token,
     ])
     after = _run_herdr(["pane", "get", pane_id])
     pane = after.get("pane") or after if isinstance(after, dict) else {}
     tokens = pane.get("tokens") or {}
-    if tokens.get("kanban_task") != task_id or tokens.get("kanban_board") != board:
+    if tokens.get("kanban_task") != task_id or tokens.get("kanban_board") != board or (
+            fence and tokens.get("kanban_run") != fence):
         raise BridgeError(f"pane {pane_id} tag did not verify after linking: {tokens!r}")
 
 
@@ -370,6 +376,13 @@ def _list_agents(*, machine_id: Optional[str] = None) -> list[dict]:
     result = _run_herdr(["agent", "list"], machine_id=machine_id)
     agents = result.get("agents") if isinstance(result, dict) else None
     return [a for a in (agents or ()) if isinstance(a, dict)]
+
+
+def list_local_panes() -> list[dict]:
+    """``pane list``: the query the dashboard's Herdr drawer discovers a card's panes with."""
+    result = _run_herdr(["pane", "list"])
+    panes = result.get("panes") if isinstance(result, dict) else None
+    return [p for p in (panes or ()) if isinstance(p, dict)]
 
 
 def find_existing_agent(name: str) -> Optional[dict]:
@@ -729,7 +742,9 @@ def _annotate_preserved_pane(success: bool, report: str, pane_preserved: bool) -
 
 def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
         herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND,
-        run_id: Optional[int] = None) -> tuple[bool, str]:
+        run_id: Optional[int] = None, prompt: Optional[str] = None,
+        fence: Optional[str] = None,
+        link_fn: Optional[Callable[[str, str], None]] = None) -> tuple[bool, str]:
     """Drive one card through the herdr-dispatch skill's workspace -> pane -> link -> agent
     lifecycle.
 
@@ -746,13 +761,15 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
     different card isn't safely identifiable as this card's own, and is refused rather than
     adopted. This has to happen before :func:`link_pane`, not after: that call's own
     ``report-metadata`` step unconditionally overwrites the tag, so a write-then-verify would just
-    confirm the write it itself made, never the pane's prior ownership. A genuinely mid-flight
-    agent (working/busy/blocked) goes straight to the wait/close path below; anything else (idle,
-    or any other status) gets the task prompt (re-)sent first: an `idle` status here can't be
-    trusted to mean "already handled this" -- the previous attempt may have crashed between
-    starting this agent and ever prompting it, and resending to an agent that already finished the
-    work is a safe no-op (it just re-confirms), while silently waiting on a never-prompted agent
-    would report a false success built from an unrelated transcript.
+    confirm the write it itself made, never the pane's prior ownership. A reused agent always gets
+    THIS run's prompt (``prompt``, fenced by ``fence``) before this run waits on it: a mid-flight
+    agent is still on an earlier run's prompt, so it is waited out first and then prompted, never
+    adopted as-is. Adopting it is how t_6465d3ec's run 114 settled run 113's orphaned work (old
+    test claims plus the echoed original brief) to Review. A blocked agent is never prompted.
+
+    ``link_fn(name, pane_id)`` is the startup gate (``kanban_direct_herdr_link``): it verifies and
+    records the executor on the card after the agent is up and before the prompt. When it fails the
+    agent stays idle and unprompted in its tagged pane for the next run to adopt.
 
     Known residual risk, accepted rather than chased further: the ownership read above and the
     close-safety recheck in ``_settle_and_close`` are both check-then-act, not atomic. Something
@@ -768,6 +785,8 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
     _LAST_SETTLED_AGENT = None
     _CLOSED_AGENT_REPORT = None
     name = pane_name(board, task_id)
+    if prompt is None:
+        prompt = _compose_prompt(task_id, board, run_id)
     try:
         existing = find_existing_agent(name)
         if existing is not None:
@@ -786,16 +805,28 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
                     f"(kanban_task={owner_task!r}, kanban_board={owner_board!r}); refusing to "
                     f"adopt it"
                 )
-            link_pane(pane_id, task_id, board)
+            link_pane(pane_id, task_id, board, fence)
             status = agent_status(name)
-            if status not in ("working", "busy", "blocked", "running"):
-                try:
-                    prompt_agent(name, _compose_prompt(task_id, board, run_id))
-                except AgentBlockedError as exc:
+            if status == "blocked":
+                return False, (
+                    f"agent {name} is blocked on an approval/question dialog; not auto-answered "
+                    f"and not re-prompted"
+                )
+            if status in _RESUMED_STATUSES:
+                status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000)
+                if status not in _SETTLED_STATUSES:
                     return False, (
-                        f"agent {name} is blocked on an approval/question dialog and was not "
-                        f"auto-answered: {exc}"
+                        f"agent {name} is still on an earlier run's prompt (status={status!r}); "
+                        f"its pane is preserved and it was not re-prompted"
                     )
+            _link_executor(link_fn, name, pane_id)
+            try:
+                prompt_agent(name, prompt)
+            except AgentBlockedError as exc:
+                return False, (
+                    f"agent {name} is blocked on an approval/question dialog and was not "
+                    f"auto-answered: {exc}"
+                )
             success, report, pane_preserved = _settle_and_close(name, pane_id)
             return success, _annotate_preserved_pane(success, report, pane_preserved)
 
@@ -810,7 +841,7 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
                 # safe to close without deleting the workspace out from under it (see
                 # ensure_board_workspace's docstring for why this can't happen any earlier).
                 close_pane(stale_root_pane_id)
-            link_pane(pane_id, task_id, board)
+            link_pane(pane_id, task_id, board, fence)
             wait_pane_shell_ready(pane_id)
         except BridgeError:
             # link_pane only ever touches pane metadata -- no agent exists yet at this point, so a
@@ -834,18 +865,32 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
                 )
             close_pane(pane_id)
             raise
+        _link_executor(link_fn, name, pane_id)
         try:
-            prompt_agent(name, _compose_prompt(task_id, board, run_id))
+            prompt_agent(name, prompt)
         except AgentBlockedError as exc:
             return False, (
                 f"agent {name} is blocked on an approval/question dialog and was not "
                 f"auto-answered: {exc}"
             )
-        report = read_agent(name)
+        # No transcript read here: Herdr refuses a scrollback read while the agent is working
+        # (agent_not_idle), which crashed t_6465d3ec's runs 97-113 right after a delivered prompt.
         success, report, pane_preserved = _settle_and_close(name, pane_id)
         return success, _annotate_preserved_pane(success, report, pane_preserved)
     except BridgeError as exc:
         return False, str(exc)
+
+
+def _link_executor(link_fn: Optional[Callable[[str, str], None]], name: str, pane_id: str) -> None:
+    if link_fn is None:
+        return
+    try:
+        link_fn(name, pane_id)
+    except herdr_link.LinkError as exc:
+        raise BridgeError(
+            f"executor linkage failed before the assignment was sent ({exc}); agent {name} is left "
+            f"idle and unprompted in pane {pane_id} for the next run to adopt"
+        ) from exc
 
 
 def _continue_remote_matches(matches: list[dict], task_id: str, board: Optional[str]) -> tuple[bool, str]:
@@ -902,16 +947,17 @@ def _continue_remote_matches(matches: list[dict], task_id: str, board: Optional[
 def dispatch(
     task_id: str, board: str, workspace_dir: str, model: str, effort: str,
     herdr_workspace: Optional[str] = None, kind: str = _DEFAULT_KIND, run_id: Optional[int] = None,
+    prompt: Optional[str] = None, fence: Optional[str] = None,
+    link_fn: Optional[Callable[[str, str], None]] = None,
 ) -> tuple[bool, str, str, Optional[str], Optional[str]]:
     """Entry point for :func:`main`: checks for this card's existing Herdr state on OTHER
     machines first, then falls through to :func:`run` (which already covers the local case).
 
-    Returns ``(success, report, block_kind)`` -- ``block_kind`` only matters when ``success`` is
-    ``False`` and is ``"transient"`` (today's existing behaviour: auto-retryable) except for the
-    one case that genuinely can't be resolved mechanically: a saved machine this sweep could not
-    reach at all. That case alone gets ``"needs_input"`` -- not because a session was found, but
-    because the sweep cannot say whether one exists, and guessing either way risks exactly the
-    double-dispatch this whole check exists to prevent.
+    Returns ``(success, report, block_kind, agent_name, machine_id)``. ``block_kind`` only matters
+    when ``success`` is ``False``: ``"transient"`` (auto-retryable) for local runs, ``"needs_input"``
+    when a saved machine could not be reached (guessing risks the double-dispatch this check
+    prevents) or already holds a session for this card (that session never received this run's
+    assignment, so its transcript is not this run's result).
     """
     matches, unreachable, checked = sweep_other_hosts_for_task(task_id)
     if unreachable:
@@ -922,11 +968,17 @@ def dispatch(
             f"here. Check connectivity to that machine, then retry."
         ), "needs_input", None, None
     if matches:
-        success, report = _continue_remote_matches(matches, task_id, board)
-        return success, report, "transient", str(matches[0].get("name") or "") or None, matches[0].get("_machine_id") if success else None
+        # Another machine's session is acknowledged and waited on, but its transcript is not this
+        # run's report and that agent never received this run's assignment: a person decides.
+        _, report = _continue_remote_matches(matches, task_id, board)
+        return False, (
+            f"{report}\n\n[direct-herdr-dispatch bridge] that session was not given this run's "
+            f"assignment and its transcript is not accepted as this run's result; continue the card "
+            f"from that machine or close that session, then retry."
+        ), "needs_input", None, None
     success, report = run(
         task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind,
-        run_id=run_id,
+        run_id=run_id, prompt=prompt, fence=fence, link_fn=link_fn,
     )
     # Appended, not prepended: request_review's event payload keeps only the summary's FIRST
     # LINE as its headline (`_first_line`), so this housekeeping note must never push the actual
@@ -978,6 +1030,7 @@ def _last_comment_body(task_id: str, board: Optional[str]) -> Optional[str]:
 
 def _apply_handoff_contract(
     task_id: str, board: str, run_id: int, success: bool, report: str, block_kind: str,
+    prompt: Optional[str] = None,
 ) -> tuple[bool, str, str]:
     """On a board enforcing the ``/open-pr`` handoff contract, turn the settled agent's own report
     into a Review receipt only when it carries a deliberate handoff (see
@@ -989,7 +1042,7 @@ def _apply_handoff_contract(
     if not success or not _requires_open_pr_handoff(board):
         return success, report, block_kind
     result = handoff.resolve_handoff(
-        report, _compose_prompt(task_id, board, run_id), task_id, run_id,
+        report, prompt if prompt is not None else _compose_prompt(task_id, board, run_id), task_id, run_id,
         _last_comment_body(task_id, board),
     )
     archived = _archive_transcript(task_id, board, run_id, report)
@@ -1004,50 +1057,89 @@ def _apply_handoff_contract(
     return True, summary + audit, block_kind
 
 
+def _settled_transcript(agent_name: str, machine_id: Optional[str]) -> str:
+    """The settled agent's own transcript (handoff boards only): the read taken just before this
+    process closed its pane, else a fresh read of a still-settled agent."""
+    closed = _CLOSED_AGENT_REPORT
+    if machine_id is None and closed is not None and closed[0] == agent_name and _agent_info(agent_name) is None:
+        return closed[1].strip()
+    status = agent_status(agent_name, machine_id=machine_id)
+    if status not in _SETTLED_STATUSES:
+        raise BridgeError(f"native Herdr agent is not settled: {status!r}")
+    return read_agent(agent_name, machine_id=machine_id).strip()
+
+
+def _post_run_reply(task_id: str, board: Optional[str], run_id: int, through_id: int, body: str) -> None:
+    """The run's answer to the comments it was asked about, posted as the assignee and fenced by
+    the run, before the receipt can settle the run away."""
+    from hermes_cli import kanban_comment_replies as replies
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect(board=board)
+    try:
+        task = kb.get_task(conn, task_id)
+        replies.record_reply(conn, task_id, through_id=through_id, author=(task.assignee if task else None) or "worker",
+                             body=body, run_id=run_id)
+    finally:
+        conn.close()
+
+
 def _mark_card(
     task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str,
     block_kind: str = "transient", workspace_dir: Optional[str] = None,
     settlement_owner: bool = False, agent_name: Optional[str] = None,
-    machine_id: Optional[str] = None,
+    machine_id: Optional[str] = None, report_path: Optional[Path] = None,
+    answered_through: Optional[int] = None, prompt: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Verify the exact settled Herdr executor and persist its run-scoped receipt."""
+    """Persist this run's receipt. A failure records the bridge's own reason. A success counts
+    only through the settled agent's run-scoped final report (``report_path``), never terminal
+    scrollback: a missing report is a retryable failure, ``blocked`` needs a person, and an unmet
+    requested deliverable (a PR asked for in a later comment included) settles as a partial."""
     from hermes_cli import kanban_settlement as settlement
 
     if not settlement_owner:
         raise BridgeError("dispatcher settlement ownership is required")
+    if not success:
+        # Requiring a settled agent here turned every failure before settle into an unrecorded
+        # crash and an unfenced retry (t_6465d3ec runs 97-113): the bridge's reason is the evidence.
+        return _record_receipt(task_id, board, run_id, False, report, (), block_kind, False)
     if not agent_name:
         raise BridgeError("settled native agent identity is missing")
-    closed = _CLOSED_AGENT_REPORT
-    if machine_id is None and closed is not None and closed[0] == agent_name and _agent_info(agent_name) is None:
-        # This process settled the agent and closed its pane: use the native read taken right before
-        # the close. The caller's ``report`` is still never trusted.
-        report = closed[1].strip()
-    else:
-        status = agent_status(agent_name, machine_id=machine_id)
-        if status not in _SETTLED_STATUSES:
-            raise BridgeError(f"native Herdr agent is not settled: {status!r}")
-        report = read_agent(agent_name, machine_id=machine_id).strip()
-    if success and _requires_open_pr_handoff(board):
-        # On an /open-pr board the verified handoff is the deliverable, not a workspace file.
-        success, summary, block_kind = _apply_handoff_contract(task_id, board, run_id, success, report, block_kind)
+    if _requires_open_pr_handoff(board):
+        # On an /open-pr board the verified handoff block is the deliverable, not a workspace file.
+        transcript = _settled_transcript(agent_name, machine_id)
+        success, summary, block_kind = _apply_handoff_contract(
+            task_id, board, run_id, success, transcript, block_kind, prompt)
         saved, why = _record_receipt(task_id, board, run_id, success, summary, (), block_kind, False)
         if saved and not success:
             return True, f"{_HANDOFF_REJECTED}; durable needs_input receipt recorded"
         return saved, why
-    review_summary = settlement._review_summary(report)
-    artifacts = settlement._verified_review_artifacts(report, workspace_dir or "") if success else ()
-    # A success with no files still reaches Review on its summary. Settlement (require_artifacts=True)
-    # holds back only a handoff-only report, as a truthful partial that keeps the owner instead of a
-    # transient block that would drop the card out of the queue.
-    if success and artifacts:
-        artifact_names = ", ".join(artifacts[:4])
-        review_summary = f"Deliverable ready for review: {artifact_names}. {review_summary}".strip()
-    return _record_receipt(task_id, board, run_id, success, review_summary, artifacts, block_kind, True)
+    final = run_report.read_final_report(report_path) if report_path is not None else None
+    if final is None:
+        return _record_receipt(task_id, board, run_id, False, (
+            f"agent {agent_name} settled without writing its final report to {report_path}; its "
+            f"terminal transcript is not accepted as this run's result"), (), "transient", False)
+    if answered_through is not None and final.reply and run_id is not None:
+        _post_run_reply(task_id, board, run_id, answered_through, final.reply)
+    summary = run_report.review_text(final) or "(the agent's final report has no summary)"
+    if final.status == "blocked":
+        return _record_receipt(task_id, board, run_id, False, summary, (), "needs_input", False)
+    unmet = run_report.unmet_requested(final, run_report.requested_for(task_id, board))
+    if final.status != "complete" and not unmet:
+        unmet = [f"the agent reported status {final.status!r}, not complete"]
+    artifacts = settlement._verified_review_artifacts(summary, workspace_dir or "")
+    if artifacts and not unmet:
+        summary = f"Deliverable ready for review: {', '.join(artifacts[:4])}. {summary}"
+    elif not artifacts and settlement._review_summary(summary) == settlement.HANDOFF_ONLY_SUMMARY:
+        # A "complete" report that only describes a handoff still settles as a partial.
+        summary = f"{settlement.HANDOFF_ONLY_SUMMARY} {summary}"
+    return _record_receipt(task_id, board, run_id, True, summary, artifacts, block_kind, True, unmet=unmet)
 
 
 def _record_receipt(
     task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str,
-    artifacts, block_kind: str, require_artifacts: bool,
+    artifacts, block_kind: str, require_artifacts: bool, unmet=(),
 ) -> tuple[bool, Optional[str]]:
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_settlement as settlement
@@ -1057,6 +1149,7 @@ def _record_receipt(
         saved = settlement.record_result_receipt(
             conn, task_id, run_id, success=success, report=report,
             artifacts=artifacts, block_kind=block_kind, require_artifacts=require_artifacts,
+            unmet=unmet,
         )
         if not saved:
             return False, "result receipt was already present or the run fence no longer matched"
@@ -1083,6 +1176,14 @@ def main() -> int:
         has_model_override="HERMES_KANBAN_HERDR_MODEL" in os.environ,  # health: allow HX002 -- same handoff convention
         has_effort_override="HERMES_KANBAN_HERDR_EFFORT" in os.environ,  # health: allow HX002 -- same handoff convention
     )
+    reply_lock = os.environ.get("HERMES_KANBAN_REPLY_LOCK")  # health: allow HX002 -- dispatcher->worker reply-lease handoff, same convention as TASK/BOARD
+    raw_through = os.environ.get("HERMES_KANBAN_REPLY_THROUGH")  # health: allow HX002 -- same reply-lease handoff
+    if reply_lock or raw_through:
+        if not (reply_lock and raw_through and raw_through.isdigit()):
+            print("kanban_direct_herdr_worker: incomplete reply lease env; refusing.", file=sys.stderr)
+            return 1
+        return _main_reply(task_id, board, workspace_dir, model, effort, herdr_workspace, kind,
+                           lock=reply_lock, through=int(raw_through))
     # A missing or malformed run id would drop the run-ownership fence that keeps a stale or
     # duplicate run from overwriting a card a newer run already owns: a hard failure, never a fallback.
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
@@ -1098,10 +1199,18 @@ def main() -> int:
     success, block_kind = False, "transient"
     agent_name: Optional[str] = None
     machine_id: Optional[str] = None
+    prompt: Optional[str] = None
+    report_path: Optional[Path] = None
+    answered_through: Optional[int] = None
+    fence = f"run-{run_id}"
     try:
+        prompt, report_path, answered_through = run_report.write_assignment(task_id, board, fence)
+        if _requires_open_pr_handoff(board):
+            prompt += "\n" + handoff.contract_instructions(task_id, run_id)
         success, report, block_kind, agent_name, machine_id = dispatch(
             task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind,
-            run_id=run_id,
+            run_id=run_id, prompt=prompt, fence=fence,
+            link_fn=_executor_linker(task_id, board, fence, run_id=run_id),
         )
     except Exception as exc:  # health: allow BLE001 -- this is the process's top-level boundary;
         # a worker must exit cleanly with a reported reason, never crash out with a traceback.
@@ -1111,6 +1220,7 @@ def main() -> int:
         card_ok, reason = _mark_card(
             task_id, board, run_id, success, report, block_kind, workspace_dir=workspace_dir,
             settlement_owner=True, agent_name=agent_name, machine_id=machine_id,
+            report_path=report_path, answered_through=answered_through, prompt=prompt,
         )
     except Exception as exc:  # health: allow BLE001 -- the pane/agent work already happened; a
         # failure to record it must still exit non-zero so the dispatcher's failure accounting sees it.
@@ -1122,6 +1232,61 @@ def main() -> int:
     if reason and reason.startswith(_HANDOFF_REJECTED):
         return 1
     return 0 if success else 1
+
+
+def _executor_linker(task_id: str, board: str, fence: str, *, run_id: Optional[int] = None,
+                     lock: Optional[str] = None) -> Callable[[str, str], None]:
+    def link(name: str, pane_id: str) -> None:
+        executor = herdr_link.resolve_executor(
+            name, pane_id, task_id, board, fence, agent_info=_agent_info, list_panes=list_local_panes)
+        herdr_link.persist_executor(task_id, board, executor, run_id=run_id, lock=lock)
+    return link
+
+
+def _main_reply(
+    task_id: str, board: str, workspace_dir: str, model: str, effort: str,
+    herdr_workspace: Optional[str], kind: str, *, lock: str, through: int,
+) -> int:
+    """Answer human comments on a card at rest as its assignee, under the reply lease ``lock``.
+    The agent answers in a report file; an explicit request is routed into the normal run
+    lifecycle (review reopen / unblock), never done here. Every failure closes the lease through
+    ``fail_reply``, which bounds retries and leaves a truthful note."""
+    from hermes_cli import kanban_comment_replies as replies
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    fence = run_report.reply_fence(through, lock)
+    report_path: Optional[Path] = None
+    success = False
+    try:
+        prompt, report_path, _ = run_report.write_assignment(task_id, board, fence, reply_through=through)
+        success, report, _, _, _ = dispatch(
+            task_id, board, workspace_dir, model, effort, herdr_workspace=herdr_workspace, kind=kind,
+            prompt=prompt, fence=fence, link_fn=_executor_linker(task_id, board, fence, lock=lock),
+        )
+    except Exception as exc:  # health: allow BLE001 -- process boundary; recorded on the lease below
+        report = f"direct-herdr reply failed: {type(exc).__name__}: {exc}"
+    print(report)
+    final = run_report.read_final_report(report_path) if success and report_path is not None else None
+    conn = kbc.connect(board=board)
+    try:
+        if final is None or not final.reply:
+            reason = report if not success else f"the agent settled without a reply in {report_path}"
+            print(f"kanban_direct_herdr_worker: reply {replies.fail_reply(conn, task_id, lock=lock, reason=reason)}",
+                  file=sys.stderr)
+            return 1
+        task = kb.get_task(conn, task_id)
+        author = (task.assignee if task else None) or "worker"
+        if replies.record_reply(conn, task_id, through_id=through, author=author, body=final.reply, lock=lock) is None:
+            print("kanban_direct_herdr_worker: reply lease no longer held; nothing posted", file=sys.stderr)
+            return 1
+        if final.disposition == "action":
+            action = final.get("action") or final.reply.splitlines()[0]
+            print(f"kanban_direct_herdr_worker: requested action {replies.route_requested_action(conn, task_id, author=author, action=action)}")
+        return 0
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
     # Same PM-install bootstrap precedent as kanban_worker_client.py: a bare `sys.executable -m`

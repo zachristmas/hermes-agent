@@ -1054,7 +1054,8 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        # Agents drive this CLI through their terminal tool, so it never admits a reply request.
+        kb.add_comment(conn, args.task_id, author, body, source="cli")
     print(f"Comment added to {args.task_id}")
     return 0
 

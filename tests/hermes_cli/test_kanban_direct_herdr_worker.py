@@ -73,8 +73,22 @@ elif a[:2] == ["pane", "get"]:
     print(json.dumps({"result": {"pane": {"id": pane_id, "tokens": state["tokens"].get(pane_id, {})}}}))
 elif a[:2] == ["agent", "start"]:
     print(json.dumps({"result": {"agent": {"name": a[2]}}}))
+    state.setdefault("agents", []).append({"name": a[2], "pane_id": a[a.index("--pane") + 1], "agent_status": "idle"})
+    _save(state)
 elif a[:2] == ["agent", "prompt"]:
+    # A cooperative agent: it writes the run-scoped final report the assignment names.
+    marker = "your report to "
+    if marker in a[3] and state.get("report_file", "") is not None:
+        path = a[3].split(marker, 1)[1].split(" in the format", 1)[0].strip()
+        with open(path, "w") as f:
+            f.write(state.get("report_file") or (
+                "## Status\ncomplete\n## Reply\nnone\n## Deliverables\n- [x] the fix\n"
+                "## Summary\nCard done: fixed the thing.\n"))
     print(json.dumps({"result": {}}))
+elif a[:2] == ["pane", "list"]:
+    panes = [{"pane_id": p, "workspace_id": p.split(":")[0], "tab_id": p.split(":")[0] + ":t1",
+              "terminal_id": "term_" + p, "tokens": tok} for p, tok in state["tokens"].items()]
+    print(json.dumps({"result": {"panes": panes}}))
 elif a[:2] == ["agent", "wait"]:
     # Settling is what "wait" means -- any tracked agent (the reuse-path fixtures) moves to idle
     # here, so a later `agent get` re-check (the pre-close freshness recheck) sees it consistently,
@@ -89,7 +103,13 @@ elif a[:2] == ["agent", "get"]:
     name = a[2]
     known = next((ag for ag in state.get("agents", []) if ag.get("name") == name), None)
     status = known.get("agent_status", "idle") if known else "idle"
-    print(json.dumps({"result": {"agent": {"agent_status": status}}}))
+    agent = {"agent_status": status}
+    if known:
+        pane = known.get("pane_id")
+        agent.update(pane_id=pane, tokens=state["tokens"].get(pane, {}), workspace_id=pane.split(":")[0],
+                     tab_id=pane.split(":")[0] + ":t1", terminal_id="term_" + pane,
+                     agent_session={"value": "native-" + name})
+    print(json.dumps({"result": {"agent": agent}}))
 elif a[:2] == ["agent", "list"]:
     print(json.dumps({"result": {"agents": state.get("agents", [])}}))
 elif a[:2] == ["agent", "read"]:
@@ -182,6 +202,15 @@ def _set_stub_report(state_path, text):
     path = Path(state_path)
     state = json.loads(path.read_text()) if path.exists() else {"tokens": {}, "calls": [], "workspaces": []}
     state["report"] = text
+    path.write_text(json.dumps(state))
+
+
+def _set_stub_report_file(state_path, summary, *, status="complete", deliverables="- [x] the fix"):
+    """What the cooperative stub agent writes to this run's report file when prompted."""
+    path = Path(state_path)
+    state = json.loads(path.read_text()) if path.exists() else {"tokens": {}, "calls": [], "workspaces": []}
+    state["report_file"] = (f"## Status\n{status}\n## Reply\nnone\n## Deliverables\n{deliverables}\n"
+                            f"## Summary\n{summary}\n")
     path.write_text(json.dumps(state))
 
 
@@ -341,7 +370,9 @@ def test_find_existing_agent_returns_none_when_no_agent_matches(happy_herdr):
 
 def test_run_reuses_a_surviving_agent_instead_of_spawning_a_second_one(happy_herdr):
     """A dispatcher retry after this bridge's own process crashed mid-run must not create a
-    second pane/agent onto the same name -- it re-tags and waits on the one already live."""
+    second pane/agent onto the same name. It re-tags the live one, lets its earlier work settle,
+    then sends THIS run's fenced assignment: the earlier run's output is never this run's result
+    (t_6465d3ec run 114 adopted run 113's scrollback as success)."""
     state = {"tokens": {}, "calls": [], "workspaces": [],
               "agents": [{"name": "titan-t_cb0795f9", "pane_id": "w1:p9", "agent_status": "working"}]}
     happy_herdr.write_text(json.dumps(state), encoding="utf-8")
@@ -356,8 +387,7 @@ def test_run_reuses_a_surviving_agent_instead_of_spawning_a_second_one(happy_her
     assert ("workspace", "create") not in kinds
     assert ("tab", "create") not in kinds
     assert ("agent", "start") not in kinds
-    assert ("agent", "prompt") not in kinds
-    assert ("agent", "wait") in kinds
+    assert kinds.index(("agent", "wait")) < kinds.index(("agent", "prompt"))
 
 
 def test_run_reprompts_a_reused_agent_that_is_idle_rather_than_assuming_it_already_ran(happy_herdr):
@@ -746,7 +776,7 @@ def test_main_happy_path_records_receipt_and_the_dispatcher_sweep_enters_review(
         workspace = kanban_home.parent / "workspace"
         workspace.mkdir()
         (workspace / "DELIVERABLE.md").write_text("reviewable artifact")
-        _set_stub_report(happy_herdr, f"Final deliverable: {workspace / 'DELIVERABLE.md'}")
+        _set_stub_report_file(happy_herdr, f"Final deliverable: {workspace / 'DELIVERABLE.md'}")
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
@@ -768,6 +798,12 @@ def test_main_happy_path_records_receipt_and_the_dispatcher_sweep_enters_review(
     assert reviewed and any("DELIVERABLE.md" in p for p in reviewed[0].payload["artifacts"])
     summaries = " ".join(str((e.payload or {}).get("summary", "")) for e in events)
     assert "DELIVERABLE.md" in summaries
+    # The executor was verified and recorded on the card before the agent got its assignment.
+    linked = [e for e in events if e.kind == "executor_linked"]
+    assert linked and linked[0].payload["native_session"] and linked[0].payload["fence"].startswith("run-")
+    with kbc.connect() as conn:
+        refs = conn.execute("SELECT ref FROM task_refs WHERE task_id = ? AND ref_type = 'herdr'", (tid,)).fetchall()
+    assert [r["ref"] for r in refs] == [linked[0].payload["ref"]]
 
 
 def test_success_receipt_requires_the_exact_settled_native_agent(happy_herdr, kanban_home, tmp_path):
@@ -789,21 +825,6 @@ def test_success_receipt_requires_the_exact_settled_native_agent(happy_herdr, ka
         assert not [e for e in kb.list_events(conn, tid) if e.kind == "worker_result_receipt"]
 
 
-def test_success_receipt_refused_while_the_native_agent_is_not_terminal(kanban_home, tmp_path, monkeypatch):
-    with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="fence2", assignee="default")
-        run_id = kb.claim_task(conn, tid).current_run_id
-    ws = tmp_path / "ws-fence2"
-    ws.mkdir()
-    (ws / "D.md").write_text("artifact")
-    monkeypatch.setattr(bridge, "agent_status", lambda name, machine_id=None: "working")
-    with pytest.raises(bridge.BridgeError):
-        bridge._mark_card(tid, None, run_id, True, f"done {ws / 'D.md'}", workspace_dir=str(ws),
-                          settlement_owner=True, agent_name="a1")
-    with kbc.connect() as conn:
-        assert not [e for e in kb.list_events(conn, tid) if e.kind == "worker_result_receipt"]
-
-
 def test_main_withholds_review_without_a_real_artifact(happy_herdr, kanban_home, monkeypatch):
     from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect() as conn:
@@ -812,7 +833,7 @@ def test_main_withholds_review_without_a_real_artifact(happy_herdr, kanban_home,
         assert claimed is not None
         workspace = kanban_home.parent / "workspace-handoff-only"
         workspace.mkdir()
-        _set_stub_report(happy_herdr, "Handoff written; ready for Review.")
+        _set_stub_report_file(happy_herdr, "Handoff written; ready for Review.")
         monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
         monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
@@ -856,10 +877,10 @@ def test_main_exits_nonzero_when_the_card_transition_is_rejected(happy_herdr, ka
     assert task.status == "running"  # the rejected transition left the card exactly where it was
 
 
-def test_main_failure_without_a_native_agent_writes_no_receipt_and_leaves_the_card_fenced(unreachable_herdr, kanban_home, monkeypatch):
-    """Herdr unreachable: no exact native agent exists, so the bridge refuses to write ANY receipt
-    (it never fabricates a result). The card is untouched and stays Running under its lease; the
-    lease/owner-fence sweep (not the bridge) later closes it or holds it visibly."""
+def test_main_failure_before_any_agent_records_a_truthful_failure_receipt(unreachable_herdr, kanban_home, monkeypatch):
+    """Herdr unreachable: no agent ever ran. The bridge records its own failure reason as the run's
+    receipt (it used to require a settled agent identity even to fail, so every such run crashed
+    unrecorded and was retried blind: t_6465d3ec runs 97-113). Nothing reaches Review or Done."""
     from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="direct herdr card (down)", assignee="default")
@@ -871,13 +892,15 @@ def test_main_failure_without_a_native_agent_writes_no_receipt_and_leaves_the_ca
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
-        exit_code = bridge.main()
-        assert exit_code == 1
+        assert bridge.main() == 1
+        receipts = [e for e in kb.list_events(conn, tid) if e.kind == "worker_result_receipt"]
+        assert receipts and receipts[0].payload["success"] is False
+        assert "herdr" in receipts[0].payload["report"].lower()
         kbd.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
-    assert task.status == "running"  # fresh lease: nothing transitions it, nothing reaches Done/Review
-    assert not any(e.kind in {"worker_result_receipt", "completed", "review_requested"} for e in events)
+    assert task.status == "blocked" and task.block_kind == "transient"
+    assert not any(e.kind in {"completed", "review_requested"} for e in events)
 
 
 def test_main_exits_nonzero_without_required_env(monkeypatch):
@@ -1025,3 +1048,22 @@ def test_run_waits_for_the_new_pane_shell_before_starting_the_agent(tmp_path, mo
     calls = json.loads(state.read_text())["calls"]
     start_idx = next(i for i, c in enumerate(calls) if tuple(c[:2]) == ("agent", "start"))
     assert sum(1 for c in calls[:start_idx] if tuple(c[:2]) == ("pane", "get")) >= 4
+
+
+def test_run_sends_no_work_to_an_executor_it_could_not_link(happy_herdr):
+    """Startup invariant: tags verified, identity recorded on the card, THEN the prompt. A linkage
+    failure leaves the agent idle and unprompted in its tagged pane for the next run to adopt."""
+    from hermes_cli import kanban_direct_herdr_link as herdr_link
+
+    def refuse(name, pane_id):
+        raise herdr_link.LinkError("pane is not listed")
+
+    success, report = bridge.run(
+        "t_cb0795f9", "titan", "C:\\workspace\\t_cb0795f9", "claude-sonnet-5-5", "medium", link_fn=refuse,
+    )
+    assert success is False and "executor linkage failed before the assignment was sent" in report
+    calls = json.loads(happy_herdr.read_text())["calls"]
+    start = next(c for c in calls if c[:2] == ["agent", "start"])
+    agent_pane = start[start.index("--pane") + 1]
+    assert not [c for c in calls if c[:2] == ["agent", "prompt"]]
+    assert ["pane", "close", agent_pane] not in [c[:3] for c in calls]

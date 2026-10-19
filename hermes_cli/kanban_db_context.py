@@ -89,6 +89,43 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append("")
 
 
+_CTX_LATEST_INSTRUCTIONS = 5
+
+
+def _ctx_latest_instructions(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """The newest comments, newest first, right after the body and ahead of prior attempts: on a
+    card that has been retried and redirected, the latest instruction (a new deliverable, "do not
+    run tests") is what the worker must follow, and burying it under every earlier attempt is how a
+    retry re-ran the original brief (t_6465d3ec). Human provenance comes from the server-side ``commented`` event, never the
+    author string. Comments still awaiting the assignee's answer are listed for a reply."""
+    from hermes_cli import kanban_comment_replies as replies
+
+    comments = _kb.list_comments(conn, task_id)
+    if not comments:
+        return
+    human = set(replies.human_comment_ids(conn, task_id))
+    lines.append("## Latest instructions (newest first)")
+    lines.append(
+        "_Where these conflict with the body or with earlier attempts, the newest instruction "
+        "wins: honour added or changed deliverables and constraints exactly._")
+    for c in reversed(comments[-_CTX_LATEST_INSTRUCTIONS:]):
+        who = "human, dashboard" if c.id in human else "comment from worker"
+        safe_author = (c.author or "").replace("`", "")
+        lines.append(f"- #{c.id} `{safe_author}` ({who}, {_ctx_stamp(c.created_at, now)}): "
+                     f"{_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES)}")
+    deliverables = replies.requested_deliverables(comments)
+    if deliverables:
+        lines.append("")
+        lines.append("Deliverables added by later instructions:")
+        lines += [f"- {d}" for d in deliverables]
+    pending = replies.pending_human_comments(conn, task_id)
+    if pending:
+        lines.append("")
+        lines.append("Awaiting your reply on the card: " + ", ".join(f"#{c.id}" for c in pending)
+                     + ". Answer them directly in your final report.")
+    lines.append("")
+
+
 def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
     """Absolute on-disk paths so the worker's file tools read them directly
     (remote terminal backends need the attachments dir mounted)."""

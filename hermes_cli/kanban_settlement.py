@@ -265,12 +265,15 @@ def operator_resume(conn, task_id: str, *, actor: str) -> bool:
 def record_result_receipt(
     conn, task_id: str, run_id: Optional[int], *, success: bool, report: str,
     artifacts: Iterable[str] = (), block_kind: str = "transient",
-    require_artifacts: bool = False,
+    require_artifacts: bool = False, unmet: Iterable[str] = (),
 ) -> bool:
     """Persist a finished attempt's result BEFORE any card transition.
 
     ``require_artifacts``: the producer (e.g. the Herdr bridge) asks settlement to hold back a
     success whose report is a handoff only (no files attached) as a partial result.
+    ``unmet``: requested deliverables the worker's own final report says it did not deliver (a
+    requested PR with no PR URL, say); settlement keeps the card with its owner as a partial
+    instead of letting the rest of the work carry it to Review.
 
     Idempotent per run. If the coordinator dies after this commit, the next
     sweep settles the card from the receipt (see :func:`reconcile_settlements`).
@@ -288,7 +291,7 @@ def record_result_receipt(
         kb._append_event(conn, task_id, "worker_result_receipt", {
             "success": bool(success), "report": (report or "")[:8000],
             "artifacts": [str(a) for a in artifacts], "block_kind": block_kind,
-            "require_artifacts": bool(require_artifacts),
+            "require_artifacts": bool(require_artifacts), "unmet": [str(u) for u in unmet],
             "required_next_action": "human review" if success else "operator or retry per block kind",
         }, run_id=int(run_id))
     return True
@@ -328,6 +331,9 @@ def settle_from_receipt(conn, task_id: str) -> Optional[str]:
         # A finished turn needs no file to reach Review: the summary can be the deliverable (board
         # edits, a merged PR). Only a handoff-only report is held back; a declared contract or a
         # claimed file is enforced by request_review below.
+        if data.get("unmet"):
+            return settle_partial(conn, task_id, run_id, summary=report.strip()[:1200],
+                                  unmet=[str(u) for u in data["unmet"]])
         if data.get("require_artifacts") and not data.get("artifacts") and \
                 report.strip().startswith(HANDOFF_ONLY_SUMMARY):
             return settle_partial(

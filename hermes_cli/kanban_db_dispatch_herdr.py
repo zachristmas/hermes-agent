@@ -228,4 +228,30 @@ def _direct_herdr_worker_argv() -> list[str]:
     pins the package root on PYTHONPATH for any ``-m hermes_cli.<module>`` child, this one
     included.
     """
+    from pathlib import Path
+
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    if not (Path(__file__).resolve().parent / "kanban_direct_herdr_worker.py").is_file():
+        # The checkout this dispatcher spawns from no longer carries the bridge (t_6465d3ec run
+        # 111: the live tree was switched to a branch without it and the child died on "No module
+        # named hermes_cli.kanban_direct_herdr_worker"). A host condition, so the dispatcher's
+        # infrastructure path defers the spawn without spending the card's retry budget.
+        raise RestartSafeScopeUnavailable(
+            "hermes_cli/kanban_direct_herdr_worker.py is missing from the Hermes checkout this "
+            "dispatcher spawns from; restore that checkout's branch before dispatching")
     return [sys.executable, "-m", "hermes_cli.kanban_direct_herdr_worker"]
+
+
+def run_comment_reply_phase(conn, board: Optional[str]) -> list[str]:
+    """Start the current assignee's reply run for each direct-Herdr card at rest that has
+    unanswered human comments (``kanban_comment_replies``). Runs every spawning tick, after the
+    reclaim phase and before the lanes, so a lease taken here also guards this tick's lanes."""
+    from hermes_cli import kanban_comment_replies as replies
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    def spawn(task, workspace, board_, env):
+        return kbd._default_spawn(task, workspace, board=board_, extra_env=env)
+
+    return replies.reconcile_comment_replies(
+        conn, board=board, spawn_fn=spawn, eligible=lambda task: _board_uses_direct_herdr_dispatch(board, task))

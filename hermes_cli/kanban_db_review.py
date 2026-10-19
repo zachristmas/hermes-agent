@@ -1,6 +1,7 @@
 """Review transitions: ``request_review`` (implementer -> Review, with the artifact contract,
-deliverable verification and result-receipt reconciliation) and ``request_changes`` (reviewer ->
-implementer), plus their workspace/provenance helpers.
+deliverable verification and result-receipt reconciliation), ``request_changes`` (reviewer ->
+implementer) and ``reopen_review_task`` (Review -> the current assignee), plus their
+workspace/provenance helpers.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
 late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
@@ -386,6 +387,48 @@ def request_changes(
             run_id=run_id,
         )
     return True, implementer
+
+
+def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
+    comments; restores the implementer from the ``review_requested`` event.
+    Preserves ``consecutive_failures`` and the block loop counter (review is
+    not a block; only :func:`complete_task` clears them)."""
+    now = int(time.time())
+    with _kb.write_txn(conn):
+        _kb._reclaim_dangling_run(
+            conn, task_id, statuses=("review",), now=now,
+            note="invariant recovery on review reopen",
+        )
+        new_status = _kb._landing_status_after_parents(conn, task_id)
+        review_event = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        # A reassignment after the handoff is the newer routing decision: restoring the
+        # implementer recorded at review time would route the card back to a stale handler.
+        reassigned = review_event is not None and conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'assigned' AND id > ?",
+            (task_id, review_event["id"])).fetchone() is not None
+        implementer = None if reassigned else _kb._nonblank_str(_kb._json_dict(_kb._row_get(review_event, "payload")).get("implementer"))
+        params: tuple[Any, ...] = (new_status, *((implementer,) if implementer else ()), task_id)
+        cur = conn.execute(
+            # consecutive_failures deliberately PRESERVED: review reopen is not
+            # a success signal; only complete_task resets the breaker (#35072).
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+            + (", assignee = ?" if implementer else "")
+            + " WHERE id = ? AND status = 'review'",
+            params,
+        )
+        if cur.rowcount != 1:
+            return False
+        payload: dict[str, Any] = {"status": new_status}
+        if implementer:
+            payload["implementer"] = implementer
+        _kb._append_event(
+            conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
+        )
+        return True
 
 
 from hermes_cli import kanban_db as _kb

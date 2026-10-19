@@ -838,7 +838,9 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
         raise HTTPException(status_code=400, detail="body is required")
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
-        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body)
+        # The UI surface (dashboard + desktop drawer) is the human channel: its comments are
+        # queued for the assignee's reply. ``author`` is client-supplied, so provenance is not.
+        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body, source="dashboard")
         return {"ok": True}
 
 

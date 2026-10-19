@@ -43,18 +43,15 @@ def _events(conn, tid, kind):
     return conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, kind)).fetchall()
 
 
-@pytest.fixture(autouse=True)
-def _settled_native_agent(monkeypatch):
-    """The bridge's native-agent fence stays ON: these tests supply a terminal agent whose own
-    report is the one recorded (the caller-supplied text is never trusted)."""
-    monkeypatch.setattr(bridge, "agent_status", lambda name, machine_id=None: "idle")
-    monkeypatch.setattr(bridge, "read_agent", lambda name, machine_id=None: bridge._TEST_REPORT)
-
-
-def _bridge_result(tid, run_id, ws, report):
-    bridge._TEST_REPORT = report
+def _bridge_result(tid, run_id, ws, summary, *, deliverables="- [x] the requested output"):
+    """The settled agent's run-scoped final report is the only result evidence (the caller's text
+    and the terminal transcript are never read)."""
+    report_path = ws.parent / f"run-{run_id}.report.md"
+    report_path.write_text(
+        f"## Status\ncomplete\n## Reply\nnone\n## Deliverables\n{deliverables}\n## Summary\n{summary}\n",
+        encoding="utf-8")
     return bridge._mark_card(tid, None, run_id, True, "ignored caller text", workspace_dir=str(ws),
-                             settlement_owner=True, agent_name="native-1")
+                             settlement_owner=True, agent_name="native-1", report_path=report_path)
 
 
 def test_bridge_writes_receipt_only_and_the_sweep_enters_review(kanban_home, tmp_path):
@@ -98,6 +95,33 @@ def test_declared_contract_miss_settles_as_partial_not_review(kanban_home, tmp_p
         detail = json.loads(_events(conn, tid, "partial_result_detail")[0]["payload"])
         assert detail["unmet"] and detail["next_owner"] == "worker"
         assert not _events(conn, tid, "review_requested")
+
+
+def test_a_settled_agent_without_a_final_report_is_a_failure_not_review(kanban_home, tmp_path):
+    with kbc.connect() as conn:
+        tid, run_id = _running(conn)
+        ok, _ = bridge._mark_card(tid, None, run_id, True, "tests passed", workspace_dir=str(tmp_path),
+                                  settlement_owner=True, agent_name="native-1",
+                                  report_path=tmp_path / "missing.report.md")
+        receipt = json.loads(_events(conn, tid, "worker_result_receipt")[0]["payload"])
+        assert ok and receipt["success"] is False and "without writing its final report" in receipt["report"]
+        kbd.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)
+        assert _status(conn, tid) != "review" and not _events(conn, tid, "review_requested")
+
+
+def test_a_pull_request_asked_for_in_a_later_comment_is_unmet_without_a_pr_url(kanban_home, tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "out.md").write_text("result " * 50)
+    with kbc.connect() as conn:
+        tid, run_id = _running(conn)
+        kb.add_comment(conn, tid, "zach", "The deliverable should be a pull request. Do not run tests.",
+                       source="dashboard")
+        _bridge_result(tid, run_id, ws, f"implemented, see {ws}/out.md")
+        kbd.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)
+        assert _status(conn, tid) != "review" and not _events(conn, tid, "review_requested")
+        detail = json.loads(_events(conn, tid, "partial_result_detail")[0]["payload"])
+        assert any("pull request" in u for u in detail["unmet"])
 
 
 def test_unowned_bridge_transition_is_refused(kanban_home, tmp_path):

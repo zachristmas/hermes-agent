@@ -918,13 +918,6 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     return reconciled
 
 
-def _error_fingerprint(error_text: str) -> str:
-    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
-    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
-    return fp.lower().strip()
-
-
 # ~96% of "clean exit without a terminal tool call" tasks complete on a later
 # run, so a protocol violation gets a bounded retry before the breaker trips.
 # The budget is a violation-only STREAK (``_protocol_violation_streak``),
@@ -1365,7 +1358,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
 
 
 # Failure accounting + circuit breaker live in this sibling (line-cap offload).
-from hermes_cli.kanban_db_dispatch_failure import _record_task_failure
+from hermes_cli.kanban_db_dispatch_failure import _error_fingerprint, _record_task_failure
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=None, claim_lock=None) -> None:
@@ -1457,7 +1450,9 @@ def check_respawn_guard(
     ).fetchone()
     if row is None:
         return None
-
+    from hermes_cli.kanban_comment_replies import reply_in_flight
+    if reply_in_flight(conn, task_id):
+        return "comment_reply_in_flight"  # the assignee is answering a comment on this card
     now = int(time.time())
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
@@ -1693,6 +1688,7 @@ from hermes_cli.kanban_db_dispatch_herdr import _board_uses_direct_herdr_dispatc
 from hermes_cli.kanban_db_dispatch_herdr import _board_uses_review_dispatch
 from hermes_cli.kanban_db_dispatch_herdr import _direct_herdr_worker_argv
 from hermes_cli.kanban_db_dispatch_herdr import _herdr_agent_profile_for_board
+from hermes_cli.kanban_db_dispatch_herdr import run_comment_reply_phase
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
@@ -2297,7 +2293,8 @@ def _dispatch_once_locked(
     )
     if not may_spawn:
         return result
-
+    if spawn_fn is None and not dry_run:
+        run_comment_reply_phase(conn, board)
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
@@ -2718,7 +2715,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, extra_env: Optional[dict] = None) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -2825,7 +2822,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # `--cli` is the highest-precedence TUI override; dropping HERMES_TUI covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
-
+    env.update(extra_env or {})  # a reply run's lease (kanban_comment_replies)
     if _board_uses_direct_herdr_dispatch(board, task):
         # Per-board opt-in (card t_cb0795f9): swap the usual worker argv + these three extra env
         # vars for the direct-Herdr bridge; everything else about spawn is unchanged. kind/model/

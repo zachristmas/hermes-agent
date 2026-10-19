@@ -136,9 +136,16 @@ def _enable(home: Path, *boards: str) -> None:
     )
 
 
-def _script_native_agent(monkeypatch, transcript):
-    """The bridge records only the settled native agent's own report, never the caller's text."""
-    monkeypatch.setattr(bridge, "dispatch", lambda *a, **k: (True, "ignored caller text", "transient", "native-1", None))
+def _script_native_agent(monkeypatch, transcript, report_summary=None):
+    """The bridge records only the settled native agent's own report, never the caller's text: the
+    handoff transcript on an opted-in board, the run's report file (``report_summary``) otherwise."""
+    def dispatch(*a, **k):
+        if report_summary is not None:
+            path = k["prompt"].split("your report to ", 1)[1].split(" in the format", 1)[0].strip()
+            Path(path).write_text(f"## Status\ncomplete\n## Reply\nnone\n## Summary\n{report_summary}\n",
+                                  encoding="utf-8")
+        return True, "ignored caller text", "transient", "native-1", None
+    monkeypatch.setattr(bridge, "dispatch", dispatch)
     monkeypatch.setattr(bridge, "agent_status", lambda name, machine_id=None: "idle")
     monkeypatch.setattr(bridge, "read_agent", lambda name, machine_id=None: transcript)
 
@@ -164,7 +171,8 @@ def _run_main(kanban_home, monkeypatch, transcript_for, *, comment=None, enable=
     monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
-    _script_native_agent(monkeypatch, transcript_for(tid, run_id))
+    transcript = transcript_for(tid, run_id)
+    _script_native_agent(monkeypatch, transcript, None if enable else transcript)
     code = bridge.main()
     with kbc.connect() as conn:
         kbd.dispatch_once(conn, max_spawn=0, spawn_fn=lambda *a, **k: None)
