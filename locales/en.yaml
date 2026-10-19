@@ -242,6 +242,7 @@ gateway:
       implementer_suffix: " → implementer @{implementer}"
       changes_requested: "🛑 {board_tag}Kanban {task_id} review requested changes/BLOCK: {reason}{provenance}"
       triage: "🛑 {head} routed to TRIAGE — {why}{recurrences}{reason}"
+      retries_stopped: "⏸ {head} stopped automatic retries and stays {status}{recurrences}{reason}. Coordinator attention needed."
       triage_decision: "needs a human decision"
       triage_attention: "for orchestration attention"
       triage_recurrences: " (blocked {value}x for the same cause)"

@@ -418,12 +418,13 @@ are complete, or **`todo`** while any parent remains open. A `todo` task keeps
 its source-phase provenance and returns to `review` or `ready` automatically
 when the dependency gate clears. `unblock` never routes directly to `triage`.
 
-If you unblock a task and it later shows up in **`triage`**, the unblock is not
-what put it there. A subsequent *re-block for the same reason* did: after a task
+If you unblock a task and it later stops retrying with a `block_loop_detected`
+diagnostic, the unblock is not what stopped it. A subsequent *re-block for the same reason* did: after a task
 is blocked → unblocked → re-blocked for the same cause `BLOCK_RECURRENCE_LIMIT`
-times (default `2`), the unblock-loop breaker stops sending it back to `blocked`
-— where a cron would just keep unblocking it — and routes it to `triage` for
-orchestration attention. This is a deterministic DB guard, not an LLM judgment call, and
+times (default `2`), the unblock-loop breaker stops automatic retries: the task stays
+`blocked` (sticky, so a cron cannot keep unblocking it) and a `block_loop_detected`
+diagnostic goes to the coordinator. It never moves the task to `triage`; only a
+`scope_question` block does, for a genuinely unresolved scope or routing question. This is a deterministic DB guard, not an LLM judgment call, and
 a task's body text cannot opt out of it: the recurrence counter deliberately
 survives each unblock (it resets only on a successful `complete`). To keep an
 unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
@@ -465,7 +466,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
-| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
+| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks stop automatic retries and raise a coordinator diagnostic; `kind=scope_question` routes to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |

@@ -31,14 +31,20 @@ _CHECK_RE = re.compile(r"^\s*[-*]\s*\[([ xX])\]\s*(.+?)\s*$")
 
 RUN_REPORT_FORMAT = """\
 ## Status
-complete | partial | blocked
+complete | partial | blocked | waiting
 ## Reply
 <a direct answer to each comment awaiting your reply, or "none">
 ## Deliverables
 - [x] <each deliverable the body and later instructions ask for> - <evidence: path, URL, commit>
 - [ ] <a requested deliverable you did not deliver> - <why>
 ## Summary
-<what you did in THIS run and how you verified it; do not repeat earlier runs' claims you did not re-check>"""
+<what you did in THIS run and how you verified it; do not repeat earlier runs' claims you did not re-check>
+## Remaining
+<only for partial/waiting/blocked: what is left to do, one item per line, or "none">
+## Next
+<only for partial/waiting/blocked: owner: <who acts next> | trigger: <what starts it, e.g. the first SAP order arriving>>
+## Recheck
+<only for waiting: how to check read-only whether the awaited event happened | every <N> minutes | up to <M> checks>"""
 
 REPLY_REPORT_FORMAT = """\
 ## Disposition
@@ -189,6 +195,49 @@ def read_final_report(report_path: Path) -> Optional[FinalReport]:
     if not report.status and not report.disposition:
         return None
     return report
+
+
+def _lines(text: str) -> list[str]:
+    return [re.sub(r"^\s*[-*]\s*", "", ln).strip() for ln in text.splitlines()
+            if ln.strip() and ln.strip().lower() not in ("none", "n/a")]
+
+
+def _field(text: str, name: str) -> str:
+    match = re.search(rf"{name}\s*:\s*([^|\n]+)", text, re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def progress_from_report(report: FinalReport, *, approval_pending: bool = False) -> Optional[dict]:
+    """The card-level progress record a report implies: what finished, what remains, who owns the
+    next action, what triggers it, and why the card is waiting. ``None`` when the report records no
+    progress at all (nothing to preserve beyond the transcript).
+
+    ``wait_kind``: ``external_event`` for a ``waiting`` report (the awaited event is outside the
+    task, so the card sits in Scheduled with a bounded read-only recheck); otherwise ``approval``
+    when the executor stopped at an approval, else ``prerequisite``: a person has to act."""
+    remaining = _lines(report.get("remaining")) + list(report.unmet)
+    if not (report.delivered or remaining or report.status == "waiting"):
+        return None
+    nxt = report.get("next")
+    recheck_text = report.get("recheck")
+    recheck: dict = {}
+    if recheck_text:
+        recheck["how"] = re.split(r"\s*\|\s*", recheck_text.strip().splitlines()[0])[0]
+        minutes = re.search(r"every\s+(\d+)\s*min", recheck_text, re.IGNORECASE)
+        checks = re.search(r"up to\s+(\d+)", recheck_text, re.IGNORECASE)
+        if minutes:
+            recheck["interval_seconds"] = int(minutes.group(1)) * 60
+        if checks:
+            recheck["max_checks"] = int(checks.group(1))
+    if report.status == "waiting":
+        wait_kind = "external_event"
+    else:
+        wait_kind = "approval" if approval_pending else "prerequisite"
+    return {
+        "finished": list(report.delivered), "remaining": remaining,
+        "next_owner": _field(nxt, "owner") or ("the assignee" if wait_kind == "external_event" else "a person"),
+        "trigger": _field(nxt, "trigger"), "wait_kind": wait_kind, "recheck": recheck,
+    }
 
 
 def review_text(report: FinalReport) -> str:

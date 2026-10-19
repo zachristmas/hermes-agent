@@ -2128,6 +2128,7 @@ def _run_reclaim_phase(
     try:
         _settlement.reconcile_settlements(conn)
         _settlement.reconcile_pending_pauses(conn)
+        _settlement.reconcile_rechecks(conn)
     except Exception:  # health: allow BLE001 -- logged with traceback; the rest of the sweep must still run
         _kb._log.exception("kanban settlement reconcile failed; continuing sweep")
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)

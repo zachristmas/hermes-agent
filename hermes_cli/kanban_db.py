@@ -113,9 +113,12 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 # ``operator_pause`` is an explicit, sticky operator hold: it never counts toward
 # block-loop recurrence or the failure breaker (see kanban_settlement.operator_pause).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "operator_pause"}
+# ``scope_question`` is the only kind that routes to ``triage``: a genuinely unresolved scope or
+# routing question for the coordinator, not a repeated failure.
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "operator_pause", "scope_question"}
 
-# Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
+# Same-reason block -> unblock -> re-block cycles before automatic retries stop (the card stays
+# ``blocked``, sticky, and a ``block_loop_detected`` diagnostic goes to the coordinator).
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
@@ -3289,6 +3292,9 @@ def block_task(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        if payload.get("retries_stopped"):
+            # Coordinator diagnostic only: the sticky ``blocked`` event above is what holds the card.
+            _append_event(conn, task_id, "block_loop_detected", {**payload, "status": new_status}, run_id=run_id)
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
@@ -3308,12 +3314,17 @@ def _route_block(
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
     as something to "unblock". Callers that pass ``dependency`` with no
     incomplete parent are re-kinded to ``needs_input`` before this runs
-    (see :func:`block_task`). Every other kind counts unblock-loop
+    (see :func:`block_task`). ``scope_question`` routes to ``triage``: an
+    unresolved scope or routing question is the only reason to leave the
+    working lanes. Every other kind counts unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``BLOCK_RECURRENCE_LIMIT`` automatic retries stop: the card stays
+    ``blocked`` (a ``blocked`` event keeps it sticky) and the payload carries
+    ``retries_stopped`` so :func:`block_task` also raises the
+    ``block_loop_detected`` diagnostic. The loop never moves the card to ``triage``.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
@@ -3324,9 +3335,11 @@ def _route_block(
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    if kind == "scope_question":
+        return "triage", "blocked", set_sql, (kind, recurrences), payload
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
+        payload["retries_stopped"] = True
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
@@ -3741,6 +3754,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         raise ValueError(f"unknown task {task_id}")
     from hermes_cli.kanban_db_context import (
         _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
+        _ctx_recorded_progress,
         _ctx_latest_instructions, _ctx_role_history,
     )
     # One clock reading so every relative age in this rendering agrees.
@@ -3750,6 +3764,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_latest_instructions(lines, conn, task_id, now)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
+    _ctx_recorded_progress(lines, conn, task_id)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)

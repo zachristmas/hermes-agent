@@ -171,6 +171,36 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
         lines.append("")
 
 
+def _ctx_recorded_progress(lines: list[str], conn: sqlite3.Connection, task_id: str) -> None:
+    """Progress a past run recorded on this card. Finished work is not redone; a run that follows a
+    scheduled wait is a READ-ONLY recheck of the awaited event."""
+    import json
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN "
+        "('progress_recorded', 'recheck_started') ORDER BY id DESC LIMIT 2", (task_id,)).fetchall()
+    progress = next((r for r in rows if r["kind"] == "progress_recorded"), None)
+    if progress is None:
+        return
+    try:
+        data = json.loads(progress["payload"]) or {}
+    except ValueError:
+        return
+    lines.append("## Recorded progress (earlier run)")
+    lines.append("Finished work is on the card and in its evidence. Do NOT repeat it: no second production write.")
+    for key, label in (("finished", "Finished"), ("remaining", "Remaining")):
+        for item in data.get(key) or []:
+            lines.append(f"- {label}: {item}")
+    if data.get("next_owner"):
+        lines.append(f"- Next action owner: {data['next_owner']}")
+    if data.get("trigger"):
+        lines.append(f"- Triggered by: {data['trigger']}")
+    if rows and rows[0]["kind"] == "recheck_started":
+        how = (data.get("recheck") or {}).get("how") or "check whether the awaited event has happened"
+        lines.append(f"This run is a bounded READ-ONLY recheck: {how}. Change nothing. Report status "
+                     "`waiting` if the event has not happened yet.")
+    lines.append("")
+
+
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
     """Done-parent handoffs: newest ``completed`` run's summary+metadata,
     falling back to ``task.result`` for pre-runs-table data. Stamped with a

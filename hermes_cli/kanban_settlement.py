@@ -35,6 +35,13 @@ ARTIFACT_CONTRACT_REF = "review_artifact_contract"
 # What _review_summary returns for a report that only hands the work off.
 HANDOFF_ONLY_SUMMARY = "Worker handoff only. Requested deliverable remains incomplete."
 ACCEPTANCE_MAX_AGE_SECONDS = 600
+# A card waiting in ``scheduled`` for an external event is re-checked read-only at most this many
+# times, this far apart, before the wait is handed to the coordinator as a diagnostic.
+RECHECK_DEFAULT_INTERVAL_SECONDS = 1800
+RECHECK_DEFAULT_MAX_CHECKS = 8
+# Executor problems in a row (no clean recheck between) before automatic rechecks stop.
+EXECUTOR_PROBLEM_LIMIT = 2
+WAIT_EXTERNAL = "external_event"
 
 
 def _kb():
@@ -265,9 +272,13 @@ def operator_resume(conn, task_id: str, *, actor: str) -> bool:
 def record_result_receipt(
     conn, task_id: str, run_id: Optional[int], *, success: bool, report: str,
     artifacts: Iterable[str] = (), block_kind: str = "transient",
-    require_artifacts: bool = False, unmet: Iterable[str] = (),
+    require_artifacts: bool = False, unmet: Iterable[str] = (), closeout: Optional[dict] = None,
 ) -> bool:
     """Persist a finished attempt's result BEFORE any card transition.
+
+    ``closeout``: ``{"progress": {...}, "executor_problem": str | None}``. The attempt is settled
+    separately from the business task (see :func:`settle_closeout`): recorded progress survives an
+    executor problem, and the card's status follows the work that remains.
 
     ``require_artifacts``: the producer (e.g. the Herdr bridge) asks settlement to hold back a
     success whose report is a handoff only (no files attached) as a partial result.
@@ -292,6 +303,7 @@ def record_result_receipt(
             "success": bool(success), "report": (report or "")[:8000],
             "artifacts": [str(a) for a in artifacts], "block_kind": block_kind,
             "require_artifacts": bool(require_artifacts), "unmet": [str(u) for u in unmet],
+            "closeout": closeout or None,
             "required_next_action": "human review" if success else "operator or retry per block kind",
         }, run_id=int(run_id))
     return True
@@ -327,6 +339,8 @@ def settle_from_receipt(conn, task_id: str) -> Optional[str]:
         return None
     data = _json(receipt["payload"])
     report = str(data.get("report") or "")
+    if isinstance(data.get("closeout"), dict) and data["closeout"].get("progress"):
+        return settle_closeout(conn, task_id, run_id, data["closeout"], report)
     if data.get("success"):
         # A finished turn needs no file to reach Review: the summary can be the deliverable (board
         # edits, a merged PR). Only a handoff-only report is held back; a declared contract or a
@@ -364,6 +378,157 @@ def settle_from_receipt(conn, task_id: str) -> Optional[str]:
         return "blocked"
     _settle_error(conn, task_id, run_id, "block_task refused")
     return None
+
+
+# --------------------------------------------------------------------------- #
+# 3b. Closeout: settle the execution attempt separately from the business task.
+# --------------------------------------------------------------------------- #
+
+def _progress_line(progress: dict) -> str:
+    """What finished, what remains, who owns the next action, what triggers it."""
+    def joined(key: str) -> str:
+        items = [str(i).strip() for i in (progress.get(key) or []) if str(i).strip()]
+        return "; ".join(items) or "nothing"
+    parts = [f"Finished: {joined('finished')}.", f"Remaining: {joined('remaining')}."]
+    if progress.get("next_owner"):
+        parts.append(f"Next action owner: {progress['next_owner']}.")
+    if progress.get("trigger"):
+        parts.append(f"Triggered by: {progress['trigger']}.")
+    return " ".join(parts)[:1200]
+
+
+def settle_closeout(conn, task_id: str, run_id: int, closeout: dict, report: str) -> Optional[str]:
+    """Apply a closeout receipt: keep the task's recorded progress, file the executor problem on its
+    own, and choose the card's status from the REMAINING work.
+
+    - ``wait_kind == external_event`` (the first SAP order has not arrived): ``scheduled`` with a
+      bounded read-only recheck (:func:`reconcile_rechecks`).
+    - ``approval`` / ``prerequisite`` (a person must act): ``blocked`` as ``needs_input``.
+
+    Neither path touches ``consecutive_failures`` or the block-loop counter: an executor that hit a
+    push approval or wrote no report did not fail the task. The status transition closes the run,
+    so completed work and its evidence stay on the card; nothing re-queues the card, which is what
+    prevents a second production write.
+    """
+    kb = _kb()
+    progress = dict(closeout.get("progress") or {})
+    wait_kind = str(progress.get("wait_kind") or "")
+    problem = str(closeout.get("executor_problem") or "").strip()
+    summary = _progress_line(progress)
+    if problem:
+        summary = f"{summary} Executor problem (not a task blocker): {problem}"[:1500]
+    with kb.write_txn(conn):
+        row = conn.execute("SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] != run_id:
+            return None
+        if _run_event(conn, task_id, "progress_recorded", run_id) is None:
+            kb._append_event(conn, task_id, "progress_recorded", {**progress, "summary": summary}, run_id=run_id)
+        if problem and _run_event(conn, task_id, "executor_closeout_problem", run_id) is None:
+            kb._append_event(conn, task_id, "executor_closeout_problem", {
+                "problem": problem[:500], "diagnostics": closeout.get("diagnostics"),
+                "task_status_unaffected": True}, run_id=run_id)
+    if wait_kind == WAIT_EXTERNAL:
+        recheck = dict(progress.get("recheck") or {})
+        prev = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='scheduled_recheck' "
+            "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        # A run that a recheck released continues the same bounded wait; any other run starts one.
+        checks_done = 0
+        if prev is not None and _event_count_after(conn, task_id, "recheck_started", prev["id"]):
+            checks_done = int(_json(prev["payload"]).get("checks_done") or 0) + 1
+        interval = max(int(recheck.get("interval_seconds") or RECHECK_DEFAULT_INTERVAL_SECONDS), 60)
+        max_checks = max(int(recheck.get("max_checks") or RECHECK_DEFAULT_MAX_CHECKS), 1)
+        ok = kb.schedule_task(conn, task_id, reason=summary, expected_run_id=run_id)
+        disposition = "scheduled"
+        if ok:
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "scheduled_recheck", {
+                    "next_at": int(time.time()) + interval, "interval_seconds": interval,
+                    "max_checks": max_checks, "checks_done": checks_done,
+                    "how": str(recheck.get("how") or "")[:400],
+                    "read_only": True}, run_id=run_id)
+    else:
+        ok = kb.block_task(conn, task_id, reason=summary, kind="needs_input", expected_run_id=run_id)
+        disposition = "blocked"
+    if not ok:
+        _settle_error(conn, task_id, run_id, f"closeout transition to {disposition} refused")
+        return None
+    with kb.write_txn(conn):
+        kb._append_event(conn, task_id, "settled_from_receipt", {
+            "disposition": disposition, "next_action": progress.get("next_owner") or "coordinator"},
+            run_id=run_id)
+    return disposition
+
+
+def _event_count_after(conn, task_id: str, kind: str, after_id: int) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=? AND id>?",
+        (task_id, kind, after_id)).fetchone()[0]
+
+
+def _last_clean_progress_id(conn, task_id: str) -> int:
+    """Newest ``progress_recorded`` whose run had no executor problem: the last clean closeout."""
+    row = conn.execute(
+        "SELECT p.id FROM task_events p WHERE p.task_id=? AND p.kind='progress_recorded' AND NOT EXISTS ("
+        "SELECT 1 FROM task_events e WHERE e.task_id=p.task_id AND e.run_id IS p.run_id "
+        "AND e.kind='executor_closeout_problem') ORDER BY p.id DESC LIMIT 1", (task_id,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def reconcile_rechecks(conn, now: Optional[int] = None) -> list[str]:
+    """Release each due ``scheduled`` card for ONE bounded read-only recheck.
+
+    The recheck run's context says finished work is recorded and must not be repeated (see
+    ``_ctx_recorded_progress``). Two bounds, each raised once as a coordinator diagnostic while the
+    card stays ``scheduled``: ``max_checks`` rechecks, or ``EXECUTOR_PROBLEM_LIMIT`` executor
+    problems in a row. Never moves a card to ``triage`` or ``blocked``.
+    """
+    kb = _kb()
+    now = int(now if now is not None else time.time())
+    released: list[str] = []
+    for row in conn.execute("SELECT id FROM tasks WHERE status='scheduled'").fetchall():
+        task_id = row["id"]
+        spec = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='scheduled_recheck' "
+            "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        if spec is None:
+            continue
+        data = _json(spec["payload"])
+        interval = int(data.get("interval_seconds") or RECHECK_DEFAULT_INTERVAL_SECONDS)
+        last = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='recheck_started' AND id>? "
+            "ORDER BY id DESC LIMIT 1", (task_id, spec["id"])).fetchone()
+        due_at = int(_json(last["payload"]).get("at") or 0) + interval if last else int(data.get("next_at") or 0)
+        if now < due_at:
+            continue
+        max_checks = int(data.get("max_checks") or RECHECK_DEFAULT_MAX_CHECKS)
+        # Rechecks already used by this wait, and executor problems since the last clean closeout.
+        started = int(data.get("checks_done") or 0)
+        problems = _event_count_after(conn, task_id, "executor_closeout_problem",
+                                      _last_clean_progress_id(conn, task_id))
+        stop = None
+        if problems >= EXECUTOR_PROBLEM_LIMIT:
+            stop = ("recurring_executor_problem",
+                    f"{problems} executor problems in a row; automatic rechecks stopped")
+        elif started >= max_checks:
+            stop = ("recheck_exhausted",
+                    f"{started} read-only rechecks done; the awaited event has not occurred")
+        if stop:
+            seen = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND kind='block_loop_detected' AND id>? "
+                "AND payload LIKE ?", (task_id, spec["id"], f"%{stop[0]}%")).fetchone()
+            if seen is None:
+                with kb.write_txn(conn):
+                    kb._append_event(conn, task_id, "block_loop_detected", {
+                        "kind": stop[0], "reason": stop[1], "status": "scheduled",
+                        "retries_stopped": True, "recurrences": max(problems, started)})
+            continue
+        if kb.unblock_task(conn, task_id):
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "recheck_started", {
+                    "n": started + 1, "of": max_checks, "read_only": True, "at": now})
+            released.append(task_id)
+    return released
 
 
 def reconcile_settlements(conn) -> list[str]:

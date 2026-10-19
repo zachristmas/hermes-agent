@@ -107,6 +107,14 @@ _LAST_SETTLED_AGENT: Optional[str] = None
 # The native transcript this process read from the agent it settled, immediately before closing that
 # agent's pane. Once closed, the agent no longer exists, so ``_mark_card`` cannot re-read it.
 _CLOSED_AGENT_REPORT: Optional[tuple[str, str]] = None
+# Raw terminal captures taken for a failure report. They are diagnostics (worker log + card
+# attachment), never card text: a capture holds shell commands, terminal UI and approval prompts.
+_DIAGNOSTICS: list[tuple[str, str]] = []
+# What a short, readable one-line failure summary may carry from an error message.
+_SUMMARY_MAX_CHARS = 240
+# Set when the run stopped at an approval/question dialog, so progress the agent already reported
+# is filed as waiting on that approval rather than as a failed task.
+_APPROVAL_PENDING = False
 
 
 class BridgeError(RuntimeError):
@@ -501,8 +509,8 @@ def _heartbeat_claim_best_effort() -> None:
             kb.heartbeat_claim(conn, task_id, claimer=lock)
         finally:
             conn.close()
-    except Exception:  # health: allow BLE001 -- observation must outlive a transient DB error
-        pass
+    except Exception as exc:  # health: allow BLE001 -- observation must outlive a transient DB error
+        print(f"kanban_direct_herdr_worker: claim heartbeat failed, still observing: {exc}", file=sys.stderr)
 
 
 def _wait_until_settled(name: str, *, machine_id: Optional[str] = None) -> str:
@@ -526,6 +534,32 @@ def _wait_until_settled(name: str, *, machine_id: Optional[str] = None) -> str:
         _heartbeat_claim_best_effort()
 
 
+_BLOCKED_SUMMARY = (
+    "agent {name} is blocked on an approval/question dialog and needs a person to answer it. "
+    "It was not auto-answered; its pane is left open."
+)
+
+
+def _short(text: object, limit: int = _SUMMARY_MAX_CHARS) -> str:
+    """First meaningful line of ``text``, ANSI/control characters stripped, capped for a summary."""
+    clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", str(text or ""))
+    for line in clean.splitlines():
+        line = re.sub(r"[^\x20-\x7e]", "", line).strip()
+        if line:
+            return line if len(line) <= limit else line[: limit - 3].rstrip() + "..."
+    return ""
+
+
+def _keep_diagnostic(label: str, name: str, *, machine_id: Optional[str] = None) -> None:
+    """Capture the agent's screen for the run's diagnostics. Best effort: a failed read must not
+    change the settlement the summary reports."""
+    try:
+        capture = _read_agent_for_report(name, machine_id=machine_id)
+    except BridgeError as exc:
+        capture = f"(capture failed: {exc})"
+    _DIAGNOSTICS.append((label, capture))
+
+
 def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional[str] = None) -> tuple[bool, str, bool]:
     """Wait out the agent, then close its pane only if that's actually safe.
 
@@ -534,7 +568,7 @@ def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional
     rule: a blocked or still-working agent's pane is never closed, so a human can still reach it.
     Only an agent confirmed genuinely settled (idle/done/finished) by BOTH checks is closed.
     """
-    global _LAST_SETTLED_AGENT, _CLOSED_AGENT_REPORT
+    global _LAST_SETTLED_AGENT, _CLOSED_AGENT_REPORT, _APPROVAL_PENDING
     _LAST_SETTLED_AGENT = name
     # An agent that settles and then resumes on its own (a background subagent finishing, say) is
     # still doing this card's work: wait it out again, a bounded number of times, instead of
@@ -542,7 +576,9 @@ def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional
     for _ in range(_SETTLE_REWAITS + 1):
         status = _wait_until_settled(name, machine_id=machine_id)
         if status == "blocked":
-            return False, f"agent {name} is blocked on an approval/question dialog: {_read_agent_for_report(name, machine_id=machine_id)}", True
+            _APPROVAL_PENDING = True
+            _keep_diagnostic("blocked on an approval/question dialog", name, machine_id=machine_id)
+            return False, _BLOCKED_SUMMARY.format(name=name), True
         if status not in _SETTLED_STATUSES:
             return False, f"agent {name} did not reach idle/done before the wait timeout (status={status!r})", True
         # Re-verify immediately before closing: `wait_agent` can itself time out and return a stale
@@ -554,9 +590,10 @@ def _settle_and_close(name: str, pane_id: Optional[str], *, machine_id: Optional
         if live_status in _SETTLED_STATUSES or live_status not in _RESUMED_STATUSES:
             break
     if live_status not in _SETTLED_STATUSES:
+        _keep_diagnostic("not confirmed settled", name, machine_id=machine_id)
         return False, (
             f"agent {name} reported {status!r} on wait but is now {live_status!r}, not confirmed "
-            f"settled; not closing its pane: {_read_agent_for_report(name, machine_id=machine_id)}"
+            f"settled; its pane was not closed"
         ), True
     # Read the report BEFORE closing: closing a pane tears down the agent living in it (verified
     # live -- a `read` issued after `close_pane` gets `agent_not_found`, not the transcript).
@@ -779,6 +816,13 @@ def _requires_open_pr_handoff(board: Optional[str]) -> bool:
     return _board_requires_open_pr_handoff(board)
 
 
+def _blocked_at_prompt(name: str, exc: Exception) -> tuple[bool, str]:
+    global _APPROVAL_PENDING
+    _APPROVAL_PENDING = True
+    _DIAGNOSTICS.append(("blocked at the prompt", str(exc)))
+    return False, _BLOCKED_SUMMARY.format(name=name)
+
+
 def _annotate_preserved_pane(success: bool, report: str, pane_preserved: bool) -> str:
     """Surface ``_settle_and_close``'s ``pane_preserved`` signal in the report text itself --
     computing it and then dropping it on the floor would make the TOCTOU/close-failure handling in
@@ -834,9 +878,11 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
     subprocess calls, not network round trips) that the live dry runs validating this bridge never
     triggered either one.
     """
-    global _LAST_SETTLED_AGENT, _CLOSED_AGENT_REPORT
+    global _LAST_SETTLED_AGENT, _CLOSED_AGENT_REPORT, _APPROVAL_PENDING
     _LAST_SETTLED_AGENT = None
     _CLOSED_AGENT_REPORT = None
+    _APPROVAL_PENDING = False
+    _DIAGNOSTICS.clear()
     name = pane_name(board, task_id)
     if prompt is None:
         prompt = _compose_prompt(task_id, board, run_id)
@@ -876,10 +922,7 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
             try:
                 prompt_agent(name, prompt)
             except AgentBlockedError as exc:
-                return False, (
-                    f"agent {name} is blocked on an approval/question dialog and was not "
-                    f"auto-answered: {exc}"
-                )
+                return _blocked_at_prompt(name, exc)
             success, report, pane_preserved = _settle_and_close(name, pane_id)
             return success, _annotate_preserved_pane(success, report, pane_preserved)
 
@@ -922,16 +965,14 @@ def run(task_id: str, board: str, workspace_dir: str, model: str, effort: str,
         try:
             prompt_agent(name, prompt)
         except AgentBlockedError as exc:
-            return False, (
-                f"agent {name} is blocked on an approval/question dialog and was not "
-                f"auto-answered: {exc}"
-            )
+            return _blocked_at_prompt(name, exc)
         # No transcript read here: Herdr refuses a scrollback read while the agent is working
         # (agent_not_idle), which crashed t_6465d3ec's runs 97-113 right after a delivered prompt.
         success, report, pane_preserved = _settle_and_close(name, pane_id)
         return success, _annotate_preserved_pane(success, report, pane_preserved)
     except BridgeError as exc:
-        return False, str(exc)
+        _DIAGNOSTICS.append(("bridge error", str(exc)))
+        return False, f"direct-herdr bridge could not finish the run: {_short(exc)}"
 
 
 def _link_executor(link_fn: Optional[Callable[[str, str], None]], name: str, pane_id: str) -> None:
@@ -978,9 +1019,10 @@ def _continue_remote_matches(matches: list[dict], task_id: str, board: Optional[
             status = wait_agent(name, _AGENT_WAIT_TIMEOUT_S * 1000, machine_id=machine_id)
         if status == "blocked":
             any_unsettled = True
+            _keep_diagnostic(f"{name} on {host} blocked", name, machine_id=machine_id)
             lines.append(
                 f"- {name} on {host} (pane {pane_id}): blocked on an approval/question dialog, not "
-                f"auto-answered: {read_agent(name, machine_id=machine_id)}"
+                f"auto-answered"
             )
             continue
         if status not in _SETTLED_STATUSES:
@@ -1069,6 +1111,16 @@ def _archive_transcript(task_id: str, board: Optional[str], run_id: int, transcr
     return att.filename if att else None
 
 
+def _archive_diagnostics(task_id: str, board: Optional[str], run_id: int) -> Optional[str]:
+    """Print every raw capture to the worker log and keep them as one card attachment; returns the
+    attachment filename, or ``None`` when there was nothing to keep."""
+    if not _DIAGNOSTICS:
+        return None
+    text = "\n\n".join(f"===== {label} =====\n{body}" for label, body in _DIAGNOSTICS)
+    print(text)
+    return _archive_transcript(task_id, board, run_id, text)
+
+
 def _last_comment_body(task_id: str, board: Optional[str]) -> Optional[str]:
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
@@ -1144,6 +1196,7 @@ def _mark_card(
     settlement_owner: bool = False, agent_name: Optional[str] = None,
     machine_id: Optional[str] = None, report_path: Optional[Path] = None,
     answered_through: Optional[int] = None, prompt: Optional[str] = None,
+    diagnostics: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Persist this run's receipt. A failure records the bridge's own reason. A success counts
     only through the settled agent's run-scoped final report (``report_path``), never terminal
@@ -1156,7 +1209,10 @@ def _mark_card(
     if not success:
         # Requiring a settled agent here turned every failure before settle into an unrecorded
         # crash and an unfenced retry (t_6465d3ec runs 97-113): the bridge's reason is the evidence.
-        return _record_receipt(task_id, board, run_id, False, report, (), block_kind, False)
+        # An executor problem (push approval, no report) is filed apart from the task: when the
+        # agent already reported progress, that progress is kept and the card follows what remains.
+        closeout = _closeout_from_report(report_path, report, diagnostics)
+        return _record_receipt(task_id, board, run_id, False, report, (), block_kind, False, closeout=closeout)
     if not agent_name:
         raise BridgeError("settled native agent identity is missing")
     if _requires_open_pr_handoff(board):
@@ -1173,6 +1229,11 @@ def _mark_card(
         return _record_receipt(task_id, board, run_id, False, (
             f"agent {agent_name} settled without writing its final report to {report_path}; its "
             f"terminal transcript is not accepted as this run's result"), (), "transient", False)
+    if final.status == "waiting":
+        progress = run_report.progress_from_report(final)
+        closeout = {"progress": progress, "executor_problem": None, "diagnostics": diagnostics}
+        return _record_receipt(task_id, board, run_id, True, run_report.review_text(final) or "Waiting.",
+                               (), "needs_input", False, closeout=closeout)
     if answered_through is not None and final.reply and run_id is not None:
         _post_run_reply(task_id, board, run_id, answered_through, final.reply)
     summary = run_report.review_text(final) or "(the agent's final report has no summary)"
@@ -1190,9 +1251,23 @@ def _mark_card(
     return _record_receipt(task_id, board, run_id, True, summary, artifacts, block_kind, True, unmet=unmet)
 
 
+def _closeout_from_report(
+    report_path: Optional[Path], problem: str, diagnostics: Optional[str],
+) -> Optional[dict]:
+    """The closeout for an executor failure, built from the progress the agent already reported.
+    ``None`` when no report exists or it records nothing: the plain failure path then applies."""
+    final = run_report.read_final_report(report_path) if report_path is not None else None
+    if final is None:
+        return None
+    progress = run_report.progress_from_report(final, approval_pending=_APPROVAL_PENDING)
+    if progress is None:
+        return None
+    return {"progress": progress, "executor_problem": problem, "diagnostics": diagnostics}
+
+
 def _record_receipt(
     task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str,
-    artifacts, block_kind: str, require_artifacts: bool, unmet=(),
+    artifacts, block_kind: str, require_artifacts: bool, unmet=(), closeout: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_settlement as settlement
@@ -1202,7 +1277,7 @@ def _record_receipt(
         saved = settlement.record_result_receipt(
             conn, task_id, run_id, success=success, report=report,
             artifacts=artifacts, block_kind=block_kind, require_artifacts=require_artifacts,
-            unmet=unmet,
+            unmet=unmet, closeout=closeout,
         )
         if not saved:
             return False, "result receipt was already present or the run fence no longer matched"
@@ -1268,12 +1343,16 @@ def main() -> int:
     except Exception as exc:  # health: allow BLE001 -- this is the process's top-level boundary;
         # a worker must exit cleanly with a reported reason, never crash out with a traceback.
         report = f"direct-herdr bridge failed: {type(exc).__name__}: {exc}"
-    print(report)  # the raw capture always reaches the worker log, whatever the card summary becomes
+    print(report)
+    diagnostics = _archive_diagnostics(task_id, board, run_id)
+    if diagnostics and not success:
+        report = f"{report}\n\nRaw terminal capture kept as attachment {diagnostics}."
     try:
         card_ok, reason = _mark_card(
             task_id, board, run_id, success, report, block_kind, workspace_dir=workspace_dir,
             settlement_owner=True, agent_name=agent_name, machine_id=machine_id,
             report_path=report_path, answered_through=answered_through, prompt=prompt,
+            diagnostics=diagnostics,
         )
     except Exception as exc:  # health: allow BLE001 -- the pane/agent work already happened; a
         # failure to record it must still exit non-zero so the dispatcher's failure accounting sees it.

@@ -442,6 +442,13 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
     question for the owner).
     """
     kind = _payload(ev, "kind")
+    if _payload(ev, "retries_stopped"):
+        # The card keeps its own status (blocked or scheduled); only automatic retries stopped.
+        return t(
+            "gateway.kanban.ping.retries_stopped", head=n.head, status=_payload(ev, "status") or "blocked",
+            recurrences=_clip(ev, "recurrences", "gateway.kanban.ping.triage_recurrences", 200),
+            reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160),
+        ), None, None
     decision = kind == "needs_input"
     msg = t(
         "gateway.kanban.ping.triage", head=n.head,
