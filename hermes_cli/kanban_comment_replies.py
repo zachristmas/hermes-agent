@@ -32,6 +32,7 @@ from typing import Any, Callable, Optional
 HUMAN_COMMENT_SOURCES = frozenset({"dashboard"})
 REPLY_SOURCE = "kanban-reply"
 SYSTEM_SOURCE = "kanban-system"
+WORKER_COMMENT_SOURCES = frozenset({"agent", REPLY_SOURCE, SYSTEM_SOURCE})
 REPLY_LEASE_SECONDS = 45 * 60
 REPLY_MAX_ATTEMPTS = 2
 # Cards at rest: nobody is working them, so a reply run is the only way the assignee answers.
@@ -65,6 +66,14 @@ def human_comment_ids(conn, task_id: str) -> list[int]:
     return [
         int(p["comment_id"]) for _, p in _events(conn, task_id, "commented")
         if p.get("source") in HUMAN_COMMENT_SOURCES and isinstance(p.get("comment_id"), int)
+    ]
+
+
+def worker_comment_ids(conn, task_id: str) -> list[int]:
+    """Comment ids an agent or the system wrote (never an instruction to the next run)."""
+    return [
+        int(p["comment_id"]) for _, p in _events(conn, task_id, "commented")
+        if p.get("source") in WORKER_COMMENT_SOURCES and isinstance(p.get("comment_id"), int)
     ]
 
 

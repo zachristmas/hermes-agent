@@ -247,6 +247,8 @@ gateway:
       kept_failing: "wiederholt fehlgeschlagen"
       last_error: " (zuletzt: {value})"
       gave_up: "⛔ {head} ist jetzt blockiert: {count}{last}. Beheben Sie die Ursache, dann `hermes kanban unblock {task_id}` (oder `hermes kanban reassign {task_id}`). Logs: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ {head} versucht es nicht mehr: {count}{last}. Abgleich für @{owner} / Koordinator eingereiht. Nächster Schritt: {action} Belege: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ Abgleich für {head} ist nach {hours} h noch offen (Verantwortlich @{owner}). Nächster Schritt: {action}"
       limit_minutes: "das Limit von {minutes} Minuten"
       limit_generic: "das Zeitlimit"
       timed_out: "⏱ {head} hat {span} überschritten und wurde gestoppt; es wird automatisch erneut versucht."

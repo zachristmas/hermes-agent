@@ -26,7 +26,7 @@ from typing import Optional
 
 _INLINE_INSTRUCTIONS = 3
 _INLINE_CHARS = 400
-_SECTION_RE = re.compile(r"^#{1,3}\s*([A-Za-z][A-Za-z ]*?)\s*:?\s*$")
+_SECTION_RE = re.compile(r"^#{1,3}\s*([A-Za-z][A-Za-z -]*?)\s*:?\s*$")
 _CHECK_RE = re.compile(r"^\s*[-*]\s*\[([ xX])\]\s*(.+?)\s*$")
 
 RUN_REPORT_FORMAT = """\
@@ -37,6 +37,15 @@ complete | partial | blocked | waiting
 ## Deliverables
 - [x] <each deliverable the body and later instructions ask for> - <evidence: path, URL, commit>
 - [ ] <a requested deliverable you did not deliver> - <why>
+## Follow-up
+<optional work the card did NOT ask for (a fix on an investigation card, extra tests), one per line, or "none">
+## Investigation
+- [x] <each read you performed: file, API call, query, page> - <what it showed>
+- [ ] <an authorized read you could do but did not> - <why; name the gate if access/approval stopped you>
+## Resolution
+exact | hypothesis | n/a
+## Blocker
+<only for blocked: kind: access|approval|human_decision|external_dependency|production_write | needs: <the concrete action that unblocks you> | owner: <who must act>>
 ## Summary
 <what you did in THIS run and how you verified it; do not repeat earlier runs' claims you did not re-check>
 ## Remaining
@@ -155,7 +164,14 @@ def write_assignment(
             f"{RUN_REPORT_FORMAT}\n\n"
             "List every deliverable the body and the later instructions ask for. Mark one [ ] when "
             "you did not deliver it; an unmet deliverable keeps the card with you instead of going "
-            "to Review. Only that report file counts: the terminal transcript is not read.\n")
+            "to Review. Work the card did not ask for goes under Follow-up, never as an unmet "
+            "deliverable. Only that report file counts: the terminal transcript is not read.\n\n"
+            "Do every authorized read before you settle (live/API/data reads included when the card "
+            "authorizes them). When the card asks for an exact resolution, a likely cause from "
+            "source alone is a hypothesis, not a resolution, and the card stays with you. Status "
+            "blocked is accepted only with a typed Blocker (kind, the concrete action that unblocks "
+            "you, who must act) after the authorized reads are done; a worker comment saying "
+            "BLOCKED or waiting is not an established prerequisite.\n")
     assignment_path.write_text(f"{instructions}\n---\n\n{context}", encoding="utf-8")
     verb = "Answer the comment on" if reply_through is not None else "work"
     prompt = "\n".join([
@@ -259,6 +275,31 @@ def unmet_requested(report: FinalReport, requested: list[str]) -> list[str]:
     if wants_pr and not any(replies.PR_URL.search(d) for d in report.delivered):
         unmet.append("pull request requested by a later instruction; no PR URL in the delivered evidence")
     return unmet
+
+
+def card_terms(task_id: str, board: Optional[str]) -> dict:
+    """What a report is judged against: the body's acceptance criteria, whether the body or a later
+    non-worker instruction asks for an exact resolution, and the deliverables later comments added."""
+    from hermes_cli import kanban_comment_replies as replies
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_report_policy as policy
+
+    conn = kbc.connect(board=board)
+    try:
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        worker = set(replies.worker_comment_ids(conn, task_id))
+    finally:
+        conn.close()
+    body = (task.body if task else "") or ""
+    assignee = task.assignee if task else None
+    instructions = [c.body for c in comments if c.id not in worker and c.author != assignee]
+    return {
+        "criteria": policy.acceptance_criteria(body),
+        "exact_required": policy.requires_exact_resolution(body, instructions),
+        "requested": replies.requested_deliverables(comments),
+    }
 
 
 def requested_for(task_id: str, board: Optional[str]) -> list[str]:

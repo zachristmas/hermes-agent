@@ -42,6 +42,8 @@ RECHECK_DEFAULT_MAX_CHECKS = 8
 # Executor problems in a row (no clean recheck between) before automatic rechecks stop.
 EXECUTOR_PROBLEM_LIMIT = 2
 WAIT_EXTERNAL = "external_event"
+# An open coordinator reconciliation (retries exhausted) is escalated once after this long.
+RECONCILE_ESCALATE_SECONDS = 4 * 3600
 
 
 def _kb():
@@ -273,6 +275,7 @@ def record_result_receipt(
     conn, task_id: str, run_id: Optional[int], *, success: bool, report: str,
     artifacts: Iterable[str] = (), block_kind: str = "transient",
     require_artifacts: bool = False, unmet: Iterable[str] = (), closeout: Optional[dict] = None,
+    follow_ups: Iterable[str] = (), blocker: Optional[dict] = None,
 ) -> bool:
     """Persist a finished attempt's result BEFORE any card transition.
 
@@ -285,6 +288,8 @@ def record_result_receipt(
     ``unmet``: requested deliverables the worker's own final report says it did not deliver (a
     requested PR with no PR URL, say); settlement keeps the card with its owner as a partial
     instead of letting the rest of the work carry it to Review.
+    ``follow_ups``: optional work outside the card's acceptance; recorded, never counted as unmet.
+    ``blocker``: the validated typed prerequisite of a business block (``kanban_report_policy``).
 
     Idempotent per run. If the coordinator dies after this commit, the next
     sweep settles the card from the receipt (see :func:`reconcile_settlements`).
@@ -303,7 +308,8 @@ def record_result_receipt(
             "success": bool(success), "report": (report or "")[:8000],
             "artifacts": [str(a) for a in artifacts], "block_kind": block_kind,
             "require_artifacts": bool(require_artifacts), "unmet": [str(u) for u in unmet],
-            "closeout": closeout or None,
+            "closeout": closeout or None, "follow_ups": [str(f) for f in follow_ups][:20],
+            "blocker": blocker or None,
             "required_next_action": "human review" if success else "operator or retry per block kind",
         }, run_id=int(run_id))
     return True
@@ -370,11 +376,16 @@ def settle_from_receipt(conn, task_id: str) -> Optional[str]:
         _settle_error(conn, task_id, run_id, reason or "request_review refused")
         return None
     kind = data.get("block_kind") if data.get("block_kind") in kb.VALID_BLOCK_KINDS else "transient"
+    blocker = data.get("blocker") if isinstance(data.get("blocker"), dict) else None
+    if blocker:
+        report = f"{prerequisite_line(blocker)}\n\n{report}"
     if kb.block_task(conn, task_id, reason=report or "worker reported failure", kind=kind,
                      expected_run_id=run_id):
         with kb.write_txn(conn):
             kb._append_event(conn, task_id, "settled_from_receipt", {
-                "disposition": "blocked", "next_action": f"resolve {kind} block"}, run_id=run_id)
+                "disposition": "blocked", "prerequisite": blocker,
+                "next_action": prerequisite_line(blocker) if blocker else f"resolve {kind} block"},
+                run_id=run_id)
         return "blocked"
     _settle_error(conn, task_id, run_id, "block_task refused")
     return None
@@ -447,9 +458,21 @@ def settle_closeout(conn, task_id: str, run_id: int, closeout: dict, report: str
                     "max_checks": max_checks, "checks_done": checks_done,
                     "how": str(recheck.get("how") or "")[:400],
                     "read_only": True}, run_id=run_id)
-    else:
+    elif wait_kind == "approval" or isinstance(progress.get("blocker"), dict):
+        # A real hold: the executor stopped at an approval dialog, or the report named a validated
+        # typed prerequisite. Only these are business blocks.
+        if isinstance(progress.get("blocker"), dict):
+            summary = f"{prerequisite_line(progress['blocker'])} {summary}"[:1500]
         ok = kb.block_task(conn, task_id, reason=summary, kind="needs_input", expected_run_id=run_id)
         disposition = "blocked"
+    else:
+        # Remaining work with no named prerequisite is not a business block (t_00c0e992): settle it
+        # as a bounded partial, so a repeat queues coordinator reconciliation instead of a Blocked
+        # card nobody can act on. The recorded progress above keeps finished work from being redone.
+        remaining = [str(r) for r in (progress.get("remaining") or [])] or ["remaining work not itemised"]
+        if problem:
+            remaining.append(f"executor problem: {problem}"[:300])
+        return settle_partial(conn, task_id, run_id, summary=summary, unmet=remaining)
     if not ok:
         _settle_error(conn, task_id, run_id, f"closeout transition to {disposition} refused")
         return None
@@ -531,6 +554,117 @@ def reconcile_rechecks(conn, now: Optional[int] = None) -> list[str]:
     return released
 
 
+# --------------------------------------------------------------------------- #
+# 3c. Coordinator reconciliation: retries exhausted, never a silent Blocked.
+# --------------------------------------------------------------------------- #
+
+def prerequisite_line(blocker: dict) -> str:
+    return (f"Prerequisite ({blocker.get('kind', '?')}): {blocker.get('needs', '?')} "
+            f"(owner: {blocker.get('owner', '?')}).")
+
+
+# Event kind -> (hold slot, label opening it, or None when the event closes it).
+_HOLD_EVENTS = {
+    "recovery_hold": ("recovery", "recovery hold on run {run_id} (uncertain effect)"),
+    "recovery_resolved": ("recovery", None),
+    "operator_pause": ("pause", "operator pause"),
+    "operator_resume": ("pause", None),
+}
+
+
+def _open_holds(conn, task_id: str) -> list[str]:
+    """Holds a reconciliation must not bypass: unresolved recovery holds and operator pauses."""
+    marks = ", ".join("?" * len(_HOLD_EVENTS))
+    rows = conn.execute(
+        f"SELECT kind, run_id FROM task_events WHERE task_id=? AND kind IN ({marks}) ORDER BY id",
+        (task_id, *_HOLD_EVENTS)).fetchall()
+    open_holds: dict[str, str] = {}
+    for row in rows:
+        slot, label = _HOLD_EVENTS[row["kind"]]
+        if label is None:
+            open_holds.pop(slot, None)
+        else:
+            open_holds[slot] = label.format(run_id=row["run_id"])
+    return list(open_holds.values())
+
+
+def queue_reconciliation(conn, task_id: str, run_id: Optional[int], *, trigger: str, error: str,
+                         assignee: Optional[str]) -> dict:
+    """Record, inside the caller's write transaction, that automatic retries are exhausted and the
+    owner/coordinator must reconcile. The payload preserves the evidence (recent attempts, their
+    unmet items and summaries, open holds) and states one explicit next action. Nothing here
+    re-queues or releases the card, so no hold is bypassed and no retry loop starts."""
+    kb = _kb()
+    attempts = [
+        {"run_id": r["id"], "outcome": r["outcome"], "error": (r["error"] or "")[:300]}
+        for r in conn.execute(
+            "SELECT id, outcome, error FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 4", (task_id,)).fetchall()]
+    if run_id is not None and all(a["run_id"] != run_id for a in attempts):
+        attempts.insert(0, {"run_id": run_id, "outcome": "gave_up", "error": error[:300]})
+    details = [_json(r["payload"]) for r in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='partial_result_detail' "
+        "ORDER BY id DESC LIMIT 2", (task_id,)).fetchall()]
+    unmet = sorted({str(u) for d in details for u in (d.get("unmet") or [])})[:10]
+    holds = _open_holds(conn, task_id)
+    if trigger == "partial_result":
+        action = ("Compare the unmet items with the card's acceptance criteria: accept the latest "
+                  "result to Review if they are optional follow-ups, or post the corrected "
+                  "instruction and unblock once if they are required.")
+    else:
+        action = ("Read the attempts' errors, fix the executor cause (or reassign), then unblock "
+                  "once; do not unblock blind.")
+    if holds:
+        action = "Resolve the open hold first (" + "; ".join(holds) + "). Then: " + action
+    payload = {
+        "trigger": trigger, "owner": assignee or "unassigned", "coordinator": "kanban coordinator",
+        "next_action": action, "attempts": attempts, "unmet": unmet,
+        "partial_summary": next((d.get("partial_summary") for d in details if d.get("partial_summary")), None),
+        "holds": holds, "error": error[:500], "state": "open",
+    }
+    kb._append_event(conn, task_id, "reconciliation_queued", payload, run_id=run_id)
+    return payload
+
+
+def open_reconciliations(conn) -> list[dict]:
+    """Blocked cards whose newest reconciliation is still open (no unblock or reassignment since)."""
+    out = []
+    rows = conn.execute(
+        "SELECT t.id, e.id AS ev_id, e.payload, e.created_at FROM tasks t JOIN task_events e "
+        "ON e.task_id=t.id AND e.kind='reconciliation_queued' WHERE t.status='blocked' AND e.id = ("
+        "SELECT MAX(id) FROM task_events WHERE task_id=t.id AND kind='reconciliation_queued')").fetchall()
+    for row in rows:
+        later = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND id>? AND kind IN "
+            "('unblocked', 'assigned')", (row["id"], row["ev_id"])).fetchone()
+        if later is None:
+            out.append({"task_id": row["id"], "event_id": row["ev_id"], "queued_at": row["created_at"],
+                        **_json(row["payload"])})
+    return out
+
+
+def reconcile_reconciliations(conn, now: Optional[int] = None) -> list[str]:
+    """Escalate, once each, reconciliations still open after ``RECONCILE_ESCALATE_SECONDS``. The
+    queue lives in ``task_events``, so it survives a gateway restart; this sweep is idempotent."""
+    kb = _kb()
+    now = int(now if now is not None else time.time())
+    escalated = []
+    for item in open_reconciliations(conn):
+        if now - int(item["queued_at"] or now) < RECONCILE_ESCALATE_SECONDS:
+            continue
+        with kb.write_txn(conn):
+            seen = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND kind='reconciliation_escalated' AND id>?",
+                (item["task_id"], item["event_id"])).fetchone()
+            if seen is not None:
+                continue
+            kb._append_event(conn, item["task_id"], "reconciliation_escalated", {
+                "open_seconds": now - int(item["queued_at"]), "owner": item.get("owner"),
+                "next_action": item.get("next_action"), "holds": item.get("holds") or []})
+        escalated.append(item["task_id"])
+    return escalated
+
+
 def reconcile_settlements(conn) -> list[str]:
     """Settle every running card whose CURRENT run has a durable result receipt, and complete any
     recorded partial-settle intent.
@@ -542,6 +676,7 @@ def reconcile_settlements(conn) -> list[str]:
     owner_hold_or_continue), which fail closed into a visible recovery hold.
     """
     settled: list[str] = reconcile_partial_intents(conn)
+    reconcile_reconciliations(conn)
     rows = conn.execute(
         "SELECT DISTINCT t.id FROM tasks t JOIN task_events e "
         "ON e.task_id = t.id AND e.run_id = t.current_run_id AND e.kind = 'worker_result_receipt' "

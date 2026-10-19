@@ -273,6 +273,8 @@ gateway:
       kept_failing: "elle n'a cessé d'échouer"
       last_error: " (dernière : {value})"
       gave_up: "⛔ {head} est maintenant bloquée : {count}{last}. Corrigez la cause, puis `hermes kanban unblock {task_id}` (ou `hermes kanban reassign {task_id}`). Journaux : `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ {head} ne réessaie plus : {count}{last}. Rapprochement mis en file pour @{owner} / coordinateur. Suite : {action} Preuves : `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ Le rapprochement de {head} est toujours ouvert après {hours} h (responsable @{owner}). Suite : {action}"
       limit_minutes: "sa limite de {minutes} minutes"
       limit_generic: "sa limite de temps"
       timed_out: "⏱ {head} a dépassé {span} et a été arrêtée ; elle sera réessayée automatiquement."

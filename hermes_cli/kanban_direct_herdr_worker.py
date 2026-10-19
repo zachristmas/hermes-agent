@@ -69,6 +69,7 @@ from typing import Any, Callable, Optional
 from hermes_cli import kanban_direct_herdr_handoff as handoff
 from hermes_cli import kanban_direct_herdr_link as herdr_link
 from hermes_cli import kanban_direct_herdr_report as run_report
+from hermes_cli import kanban_report_policy as policy
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _DEFAULT_MODEL = "claude-sonnet-5-5"
@@ -1237,18 +1238,44 @@ def _mark_card(
     if answered_through is not None and final.reply and run_id is not None:
         _post_run_reply(task_id, board, run_id, answered_through, final.reply)
     summary = run_report.review_text(final) or "(the agent's final report has no summary)"
-    if final.status == "blocked":
-        return _record_receipt(task_id, board, run_id, False, summary, (), "needs_input", False)
-    unmet = run_report.unmet_requested(final, run_report.requested_for(task_id, board))
-    if final.status != "complete" and not unmet:
-        unmet = [f"the agent reported status {final.status!r}, not complete"]
+    judged = _judge_report(final, task_id, board)
+    if final.status == "blocked" and judged.blocked_valid:
+        return _record_receipt(task_id, board, run_id, False, summary, (), "needs_input", False,
+                               blocker=judged.blocker)
+    unmet = _required_unmet(final, judged)
+    if judged.follow_ups and not unmet:
+        summary += "\n\nOptional follow-up (outside the card's acceptance, not done):\n" + "\n".join(
+            f"- {f}" for f in judged.follow_ups)
     artifacts = settlement._verified_review_artifacts(summary, workspace_dir or "")
     if artifacts and not unmet:
         summary = f"Deliverable ready for review: {', '.join(artifacts[:4])}. {summary}"
     elif not artifacts and settlement._review_summary(summary) == settlement.HANDOFF_ONLY_SUMMARY:
         # A "complete" report that only describes a handoff still settles as a partial.
         summary = f"{settlement.HANDOFF_ONLY_SUMMARY} {summary}"
-    return _record_receipt(task_id, board, run_id, True, summary, artifacts, block_kind, True, unmet=unmet)
+    return _record_receipt(task_id, board, run_id, True, summary, artifacts, block_kind, True, unmet=unmet,
+                           follow_ups=judged.follow_ups)
+
+
+def _required_unmet(final, judged: policy.Assessment) -> list[str]:
+    """What keeps the card with its owner. A refused ``blocked`` claim is not a business block
+    (t_00c0e992): it settles as a bounded partial, then coordinator reconciliation. A self-assessed
+    ``partial`` whose only open items are optional follow-ups is finished work."""
+    unmet = list(judged.required_unmet)
+    if final.status == "blocked":
+        unmet.insert(0, "blocked claim not accepted: " + "; ".join(judged.blocker_problems))
+        return unmet
+    remaining = [r for r in policy.section_items(final.get("remaining")) if r not in final.unmet]
+    judged.follow_ups += [r for r in remaining if policy.is_optional(r)]
+    if final.status != "complete" and not unmet:
+        unmet = [r for r in remaining if not policy.is_optional(r)] or (
+            [] if judged.follow_ups else [f"the agent reported status {final.status!r}, not complete"])
+    return unmet
+
+
+def _judge_report(final, task_id: str, board: Optional[str]) -> policy.Assessment:
+    terms = run_report.card_terms(task_id, board)
+    return policy.assess(final, criteria=terms["criteria"], exact_required=terms["exact_required"],
+                         extra_unmet=run_report.unmet_requested(final, terms["requested"]))
 
 
 def _closeout_from_report(
@@ -1262,12 +1289,18 @@ def _closeout_from_report(
     progress = run_report.progress_from_report(final, approval_pending=_APPROVAL_PENDING)
     if progress is None:
         return None
+    if final.status == "blocked":
+        investigated, skipped = policy.checklist(final.get("investigation"))
+        blocker = policy.parse_blocker(final.get("blocker"))
+        if not policy.validate_blocker(blocker, investigated, [s for s in skipped if not policy.is_gated(s)]):
+            progress["blocker"] = blocker
     return {"progress": progress, "executor_problem": problem, "diagnostics": diagnostics}
 
 
 def _record_receipt(
     task_id: str, board: Optional[str], run_id: Optional[int], success: bool, report: str,
     artifacts, block_kind: str, require_artifacts: bool, unmet=(), closeout: Optional[dict] = None,
+    follow_ups=(), blocker: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_settlement as settlement
@@ -1277,7 +1310,7 @@ def _record_receipt(
         saved = settlement.record_result_receipt(
             conn, task_id, run_id, success=success, report=report,
             artifacts=artifacts, block_kind=block_kind, require_artifacts=require_artifacts,
-            unmet=unmet, closeout=closeout,
+            unmet=unmet, closeout=closeout, follow_ups=follow_ups, blocker=blocker,
         )
         if not saved:
             return False, "result receipt was already present or the run fence no longer matched"

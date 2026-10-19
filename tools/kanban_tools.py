@@ -808,6 +808,23 @@ def _handle_complete(args: dict, **kw) -> str:
                        for a in kb.list_attachments(conn, tid)])
 
 
+def _business_block_prerequisite(kind: Optional[str], raw: Any) -> Optional[dict]:
+    """A needs_input/capability (or untyped) block is a claim that only a person can move the card.
+    It needs the typed prerequisite (t_00c0e992: repeated "waiting on a screen-share" blocks with
+    authorized reads never done). Other kinds route on their own and need none."""
+    from hermes_cli import kanban_report_policy as report_policy
+
+    if kind not in (None, "needs_input", "capability"):
+        return None
+    data = raw if isinstance(raw, dict) else {}
+    investigated = [_redact(i) for i in data.get("investigated") or [] if str(i).strip()]
+    fields = {k: _redact(data.get(k) or "") for k in ("kind", "needs", "owner")}
+    problems = report_policy.validate_blocker(fields if data else None, investigated, [])
+    _check(not problems, "kanban_block refused: " + "; ".join(problems) + ". Do the authorized reads, "
+           "then block with prerequisite={kind, needs, owner, investigated}, or report what you found.")
+    return {**fields, "investigated": investigated[:20]}
+
+
 @_kanban_handler("kanban_block")
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
@@ -834,8 +851,15 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
+        prerequisite = _business_block_prerequisite(kind, args.get("prerequisite"))
+        if prerequisite:
+            from hermes_cli.kanban_settlement import prerequisite_line
+            reason = f"{prerequisite_line(prerequisite)} {reason}"
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+        if prerequisite:
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "block_prerequisite", prerequisite)
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
         if kind == "dependency" and landed_kind != kind:

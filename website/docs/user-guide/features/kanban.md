@@ -466,7 +466,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
-| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks stop automatic retries and raise a coordinator diagnostic; `kind=scope_question` routes to `triage`. | `reason` |
+| `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks stop automatic retries and raise a coordinator diagnostic; `kind=scope_question` routes to `triage`. A `needs_input`, `capability` or untyped block is refused without `prerequisite={kind, needs, owner, investigated}` (see [What a Blocked claim must carry](#what-a-blocked-claim-must-carry)). | `reason` (+ `prerequisite` for business blocks) |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
@@ -558,6 +558,48 @@ Keep secrets, raw logs, tokens, OAuth material, and unrelated transcripts out of
 `metadata`. Store pointers and summaries instead. If a task has no files or
 tests, say so explicitly in `summary` and use `metadata` for the evidence that
 does exist, such as source URLs, issue ids, or manual review steps.
+
+### What a Blocked claim must carry
+
+Blocked means only a person (or an outside system) can move the card. It is
+not where a card goes because a run was incomplete or a worker guessed a
+meeting was needed. Settlement enforces this on the `kanban_block` tool and on
+direct-Herdr run reports alike:
+
+- **Typed prerequisite.** A business block names `kind` (`access`, `approval`,
+  `human_decision`, `external_dependency` or `production_write`), `needs` (the
+  concrete action that unblocks the work, not "input" or "a meeting"), `owner`
+  (who acts) and the authorized reads already done. A block without one is
+  refused by `kanban_block`; in a run report it settles as a bounded partial
+  with the reason "blocked claim not accepted". A valid prerequisite is
+  prefixed to the block reason and recorded as a `block_prerequisite` event.
+- **Reads before blocking.** An unchecked `## Investigation` item is a skipped
+  read unless it names the gate that stopped it (access denied, requires
+  approval, production write, prohibited). A block with skipped reads is not
+  accepted.
+- **Optional work is not unmet.** Work the card did not ask for goes under
+  `## Follow-up`, or is marked "not requested" / "optional" / "out of scope",
+  and is listed in the settlement summary as optional follow-up. It never
+  counts against the run, unless it matches an unconditional bullet in the
+  card's acceptance criteria.
+- **Exact resolution.** When the card body, or a later comment from someone
+  other than the assignee, asks for an exact resolution (or says not to repeat
+  source-only work), the report must say `## Resolution` `exact` with every
+  ungated read done. A likely cause from source alone settles as partial.
+- **Retry exhaustion is reconciliation, not a business block.** When the
+  failure breaker gives up (repeated partials, crashes, timeouts), the same
+  transaction records `reconciliation_queued` with the owner, the recent
+  attempts, their unmet items, any open recovery hold or operator pause, and
+  one next action. The card stays Blocked with no automatic retry; the
+  `reconciliation_pending` diagnostic shows it, the `gave_up` notification
+  names the next action, and a `reconciliation_escalated` event fires once if
+  it is still open after 4 hours. It closes when someone unblocks or
+  reassigns the card (or it otherwise leaves Blocked). An open hold is named first and the
+  diagnostic offers no one-click unblock while it stands.
+
+Approval stops (a worker parked at an approval dialog) and recovery holds
+(uncertain whether a side effect happened) keep their own paths and still
+block or hold as before.
 
 ### The worker lifecycle
 
@@ -1463,7 +1505,10 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `skipped_nonspawnable` | `{assignee}` | Dispatcher refused to spawn because the assignee profile does not exist in this home (or is not in `kanban.dispatch_profiles`). Written once per card — repeated only when another event landed in between — so `show`/`tail` name the missing profile without a row per tick. The card stays in `ready`; reassign it or install the profile. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation, worker_output?}` | Worker exited successfully while the task was still `running`, usually because it answered without a terminal board call (`kanban_complete`, `kanban_request_review` or `kanban_block`). Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. `worker_output` carries the worker's own last printed text (usually its explanation of why it stopped), also folded into `last_failure_error` and shown to the retry worker as the prior-attempt error. |
-| `gave_up` | `{failures, effective_limit, limit_source, error, terminal_provider?}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. `terminal_provider: true` means the worker exited `78` on a provider error a retry cannot fix (credential revoked, model gone) — including a startup credential failure that explicitly requires re-login (`hermes auth` / `setup`), which exits `78` before the first turn; other startup failures exit `1` — and the breaker fired on that first attempt, sticky, regardless of the limit. |
+| `gave_up` | `{failures, effective_limit, limit_source, error, terminal_provider?, reconciliation}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error; `reconciliation` is the next action from the `reconciliation_queued` event written in the same transaction. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. `terminal_provider: true` means the worker exited `78` on a provider error a retry cannot fix (credential revoked, model gone) — including a startup credential failure that explicitly requires re-login (`hermes auth` / `setup`), which exits `78` before the first turn; other startup failures exit `1` — and the breaker fired on that first attempt, sticky, regardless of the limit. |
+| `reconciliation_queued` | `{owner, coordinator, trigger, error, next_action, attempts, unmet, partial_summary, holds, state}` | Retries are exhausted and the owner/coordinator must reconcile. Preserves the recent attempts and their unmet items, names open holds, and states one next action. Open while the card stays Blocked with no later `unblocked` or `assigned`. |
+| `reconciliation_escalated` | `{open_seconds, owner, next_action, holds}` | A queued reconciliation is still open after 4 hours. Emitted once per queued event. |
+| `block_prerequisite` | `{kind, needs, owner, investigated}` | The typed prerequisite a `kanban_block` business block carried. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 

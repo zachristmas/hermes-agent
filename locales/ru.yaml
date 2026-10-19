@@ -247,6 +247,8 @@ gateway:
       kept_failing: "продолжала проваливаться"
       last_error: " (последняя: {value})"
       gave_up: "⛔ {head} теперь заблокировано: {count}{last}. Устраните причину, затем `hermes kanban unblock {task_id}` (или `hermes kanban reassign {task_id}`). Журналы: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ {head} больше не повторяется: {count}{last}. Сверка поставлена в очередь для @{owner} / координатора. Далее: {action} Доказательства: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ Сверка {head} всё ещё открыта через {hours} ч (ответственный @{owner}). Далее: {action}"
       limit_minutes: "лимит в {minutes} мин"
       limit_generic: "лимит времени"
       timed_out: "⏱ {head} превысило {span} и было остановлено; повтор будет выполнен автоматически."

@@ -159,5 +159,14 @@ def _record_task_failure(
             payload["sticky"] = True
         if event_payload_extra:
             payload.update(event_payload_extra)
+        # Retry exhaustion is a coordination problem, not a business block (t_00c0e992): queue a
+        # durable owner/coordinator reconciliation with the evidence and one explicit next action,
+        # in this same transaction so a restart can never leave the card Blocked without it.
+        from hermes_cli import kanban_settlement
+        assignee = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        queued = kanban_settlement.queue_reconciliation(
+            conn, task_id, failure_run_id if failure_run_id is not None else expected_run_id,
+            trigger=outcome, error=error, assignee=assignee["assignee"] if assignee else None)
+        payload["reconciliation"] = queued["next_action"]
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=failure_run_id)
         return True

@@ -247,6 +247,8 @@ gateway:
       kept_failing: "постійні збої"
       last_error: " (останній: {value})"
       gave_up: "⛔ {head} тепер заблоковано: {count}{last}. Усуньте причину, потім `hermes kanban unblock {task_id}` (або `hermes kanban reassign {task_id}`). Журнали: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ {head} більше не повторюється: {count}{last}. Звірку поставлено в чергу для @{owner} / координатора. Далі: {action} Докази: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ Звірка {head} досі відкрита через {hours} год (відповідальний @{owner}). Далі: {action}"
       limit_minutes: "ліміт у {minutes} хвилин"
       limit_generic: "ліміт часу"
       timed_out: "⏱ {head}: перевищено {span}, роботу зупинено; спробу буде повторено автоматично."

@@ -247,6 +247,8 @@ gateway:
       kept_failing: "lean sé ag teip"
       last_error: " (is déanaí: {value})"
       gave_up: "⛔ Tá {head} blocáilte anois: {count}{last}. Réitigh an chúis, ansin `hermes kanban unblock {task_id}` (nó `hermes kanban reassign {task_id}`). Logaí: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ Stop {head} ag athiarracht: {count}{last}. Réiteach curtha sa scuaine do @{owner} / comhordaitheoir. An chéad rud eile: {action} Fianaise: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ Tá réiteach {head} fós oscailte tar éis {hours}u (úinéir @{owner}). An chéad rud eile: {action}"
       limit_minutes: "a theorainn {minutes} nóiméad"
       limit_generic: "a theorainn ama"
       timed_out: "⏱ Rith {head} thar {span} agus stopadh é; bainfear triail eile as go huathoibríoch."

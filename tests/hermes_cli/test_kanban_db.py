@@ -270,7 +270,7 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home):
             assert row["consecutive_failures"] == expected
         assert row["status"] == "blocked"
         kinds = [e.kind for e in kb.list_events(conn, t)]
-        assert kinds[-2:] == ["reclaimed", "gave_up"]
+        assert kinds[-3:] == ["reclaimed", "reconciliation_queued", "gave_up"]
 
 
 def test_stale_claim_extend_live_worker_does_not_count_failure(

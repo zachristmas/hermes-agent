@@ -46,16 +46,17 @@ def _pin_first():
 # the task is not archived so later review cycles keep notifying.
 TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested",
                   # Lifecycle enforcement (hermes_cli/kanban_settlement.py): holds that need an operator.
-                  "recovery_hold_escalated", "settlement_escalated", "operator_pause")
+                  "recovery_hold_escalated", "settlement_escalated", "operator_pause", "reconciliation_escalated")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected",
-                "recovery_hold_escalated", "settlement_escalated")
+                "recovery_hold_escalated", "settlement_escalated", "reconciliation_escalated")
 
 
 def diagnostic_event(ev) -> bool:
     """Infrastructure attention is distinct from an explicit owner decision."""
-    if ev.kind in {"crashed", "timed_out", "gave_up", "recovery_hold_escalated", "settlement_escalated"}:
+    if ev.kind in {"crashed", "timed_out", "gave_up", "recovery_hold_escalated", "settlement_escalated",
+                   "reconciliation_escalated"}:
         return True
     if ev.kind in {"blocked", "block_loop_detected"}:
         return (ev.payload or {}).get("kind") != "needs_input"
@@ -466,7 +467,18 @@ def _fmt_gave_up(ev, n) -> tuple:
     count = (t("gateway.kanban.ping.failed_n_times", count=int(failures)) if failures
              else t("gateway.kanban.ping.kept_failing"))
     last = _clip(ev, "error", "gateway.kanban.ping.last_error", 160)
+    action = _payload(ev, "reconciliation")
+    if action:
+        # A queued coordinator reconciliation, not a business block: say who acts and how.
+        return t("gateway.kanban.ping.gave_up_reconcile", head=n.head, count=count, last=last,
+                 owner=getattr(n.task, "assignee", None) or "owner", action=str(action)[:300], task_id=n.task_id), None, None
     return t("gateway.kanban.ping.gave_up", head=n.head, count=count, last=last, task_id=n.task_id), None, None
+
+
+def _fmt_reconciliation_escalated(ev, n) -> tuple:
+    hours = max(1, round(int(_payload(ev, "open_seconds") or 0) / 3600))
+    return t("gateway.kanban.ping.reconciliation_escalated", head=n.head, hours=hours,
+             owner=_payload(ev, "owner") or "owner", action=str(_payload(ev, "next_action") or "")[:300]), None, None
 
 
 def _fmt_timed_out(ev, n) -> tuple:
@@ -492,6 +504,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
     "block_loop_detected": _fmt_block_loop_detected,
+    "reconciliation_escalated": _fmt_reconciliation_escalated,
 }
 
 

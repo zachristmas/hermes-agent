@@ -247,6 +247,8 @@ gateway:
       kept_failing: "계속 실패했어요"
       last_error: " (마지막: {value})"
       gave_up: "⛔ {head}이(가) 차단됐어요: {count}{last}. 원인을 해결한 뒤 `hermes kanban unblock {task_id}`(또는 `hermes kanban reassign {task_id}`)를 실행하세요. 로그: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ {head} 재시도를 중단했습니다: {count}{last}. @{owner} / 코디네이터에게 조정이 대기열에 추가되었습니다. 다음: {action} 증거: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ {head} 조정이 {hours}시간 후에도 열려 있습니다 (담당 @{owner}). 다음: {action}"
       limit_minutes: "{minutes}분 제한"
       limit_generic: "시간 제한"
       timed_out: "⏱ {head}이(가) {span}을(를) 넘겨 중지됐어요. 자동으로 다시 시도할게요."

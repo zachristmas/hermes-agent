@@ -418,9 +418,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
+_PREREQUISITE = {"kind": "human_decision", "needs": "choose between the two schema designs",
+                 "owner": "zach", "investigated": ["read both design docs"]}
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"reason": "need clarification", "prerequisite": _PREREQUISITE})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
