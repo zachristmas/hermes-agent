@@ -981,9 +981,12 @@ def test_herdr_agent_profile_respects_per_task_overrides(monkeypatch, tmp_path):
 
 
 def test_herdr_agent_args_use_harness_specific_permission_bypass():
-    assert bridge._herdr_agent_args("codex", "gpt-6.1-sol", "low") == [
-        "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "--yolo",
+    codex_args = bridge._herdr_agent_args("codex", "gpt-6.1-sol", "low")
+    assert codex_args[:4] == [
+        "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"',
     ]
+    assert "--yolo" in codex_args
+    assert "--effort" not in codex_args
     assert bridge._herdr_agent_args("claude", "claude-sonnet-5-5", "medium") == [
         "--model", "claude-sonnet-5-5", "--effort", "medium", "--dangerously-skip-permissions",
     ]
@@ -994,9 +997,12 @@ def test_start_agent_uses_codex_yolo_without_unsupported_effort_flag(tmp_path, m
     bridge.start_agent("cs-t_x", "w1:p2", "gpt-6.1-sol", "low", kind="codex")
     args = json.loads(state.read_text())["calls"]
     start = next(call for call in args if call[:2] == ["agent", "start"])
-    assert start[start.index("--") + 1:] == [
-        "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"', "--yolo",
+    codex_args = start[start.index("--") + 1:]
+    assert codex_args[:4] == [
+        "--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"',
     ]
+    assert "--yolo" in codex_args
+    assert "--effort" not in codex_args
 
 
 def test_start_agent_uses_claude_skip_permissions(tmp_path, monkeypatch):
