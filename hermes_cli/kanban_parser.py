@@ -418,11 +418,20 @@ _SPECS = [
         _TASK_IDS,
         _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
+    _cmd("reopen-done", [
+        _TASK_ID,
+        _arg("reason", nargs="+", help="Why this Done card is being recovered (recorded in the audit event)"),
+        _arg("--dry-run", action="store_true", help="Run every check and show the result without mutating state"),
+        _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
+    ], help="Recover an incorrectly auto-Done card to ready/todo so request-review can take it to Review"),
     _cmd("promote", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
         _bulk_ids("promote"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
+        _arg("--from-triage", action="store_true",
+             help="Promote already-specified triage cards (nonempty title+body, no claim/holds, "
+                  "parents done) to ready; requires a reason"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
     _cmd("archive", [

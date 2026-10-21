@@ -3362,22 +3362,40 @@ def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
-def promote_task(
-    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
-) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+def _promotion_refusal(
+    conn: sqlite3.Connection, task_id: str, *, from_triage: bool, reason: Optional[str],
+) -> Optional[str]:
+    """Why ``promote_task`` must refuse right now, or ``None``. One source for the
+    dry-run and for the in-transaction recheck, so they cannot drift."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
-        return False, f"task {task_id} not found"
+        return f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+    allowed = ("triage",) if from_triage else ("todo", "blocked")
+    if cur_status not in allowed:
+        return (
+            f"task {task_id} is {cur_status!r}; promote "
+            + ("--from-triage only applies to 'triage'" if from_triage
+               else "only applies to 'todo' or 'blocked' (use --from-triage for 'triage')")
         )
+    if from_triage:
+        if not _nonblank_str(reason):
+            return "promote --from-triage requires a nonblank reason (recorded in the audit event)"
+        row = conn.execute(
+            "SELECT title, body, claim_lock, current_run_id, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not _nonblank_str(row["title"]) or not _nonblank_str(row["body"]):
+            return (
+                f"task {task_id} has no usable spec (empty title or body); "
+                f"specify it first (`hermes kanban specify {task_id}`)"
+            )
+        if row["claim_lock"] is not None or row["current_run_id"] is not None or row["worker_pid"] is not None:
+            return f"task {task_id} has a live claim or open run; reclaim it first"
+        from hermes_cli.kanban_settlement import _open_holds
+        holds = _open_holds(conn, task_id)
+        if holds:
+            return f"task {task_id} has open holds that promotion cannot bypass: {'; '.join(holds)}"
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
@@ -3389,24 +3407,47 @@ def promote_task(
     ).fetchall()
     unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
     if unsatisfied:
-        return False, (
+        return (
             f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
             f"(the ready -> running claim re-checks parents, so promotion cannot "
             f"bypass them; complete the parents or drop the link with "
             f"`hermes kanban unlink <parent_id> {task_id}`)"
         )
+    return None
 
-    if dry_run:
-        return True, None
 
+def promote_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
+    dry_run: bool = False, from_triage: bool = False,
+) -> tuple[bool, Optional[str]]:
+    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
+    Refused while a parent is unfinished; ``dry_run`` only validates.
+    ``from_triage`` (explicit) instead accepts only an already-specified ``triage``
+    card, without regenerating its spec; it also needs a reason and refuses live
+    claims and open holds. Every precondition is rechecked inside the write
+    transaction. Returns ``(ok, reason)``."""
+    refusal = _promotion_refusal(conn, task_id, from_triage=from_triage, reason=reason)
+    if refusal or dry_run:
+        return (False, refusal) if refusal else (True, None)
+
+    allowed = ("triage",) if from_triage else ("todo", "blocked")
     with write_txn(conn):
+        refusal = _promotion_refusal(conn, task_id, from_triage=from_triage, reason=reason)
+        if refusal:
+            return False, refusal
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            f"WHERE id = ? AND status IN ({', '.join('?' for _ in allowed)})"
+            + (" AND claim_lock IS NULL AND current_run_id IS NULL AND worker_pid IS NULL"
+               if from_triage else ""),
+            (task_id, *allowed),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        payload = {"actor": actor, "reason": reason}
+        if from_triage:
+            payload["from_status"] = "triage"
+        _append_event(conn, task_id, "promoted_manual", payload)
 
     return True, None
 
@@ -4079,6 +4120,7 @@ from hermes_cli.kanban_db_workspace import (
 )
 from hermes_cli.kanban_db_review import (
     _task_workspace_for_review,
+    reopen_done_task,
     reopen_review_task,
     request_changes,
     request_review,

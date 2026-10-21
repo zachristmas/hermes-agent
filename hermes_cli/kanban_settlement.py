@@ -566,7 +566,7 @@ def prerequisite_line(blocker: dict) -> str:
 # Event kind -> (hold slot, label opening it, or None when the event closes it).
 _HOLD_EVENTS = {
     "recovery_hold": ("recovery", "recovery hold on run {run_id} (uncertain effect)"),
-    "recovery_resolved": ("recovery", None),
+    "recovery_hold_resolved": ("recovery", None),
     "operator_pause": ("pause", "operator pause"),
     "operator_resume": ("pause", None),
 }

@@ -11,6 +11,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
@@ -429,6 +430,108 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id, "review_reopened", payload if payload != {"status": "ready"} else None,
         )
         return True
+
+def _descendant_statuses(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str, bool]]:
+    """``(id, status, owned)`` of every transitive child of *task_id*, id order; *owned* means a
+    claim, open run or worker pid is set (a running OR review child can hold one). Read-only."""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT child_id FROM task_links WHERE parent_id = ?
+            UNION
+            SELECT l.child_id FROM task_links l JOIN descendants d ON d.id = l.parent_id
+        )
+        SELECT t.id, t.status, (t.claim_lock IS NOT NULL OR t.current_run_id IS NOT NULL
+                                OR t.worker_pid IS NOT NULL) AS owned FROM descendants d JOIN tasks t ON t.id = d.id ORDER BY t.id
+        """,
+        (task_id,),
+    ).fetchall()
+    return [(r["id"], r["status"], bool(r["owned"])) for r in rows]
+
+
+def _done_reopen_refusal(conn: sqlite3.Connection, task_id: str, reason: Optional[str]) -> Optional[str]:
+    """Why :func:`reopen_done_task` must refuse right now, or ``None``. The dry-run and the
+    in-transaction recheck both call this, so they cannot drift."""
+    from hermes_cli import kanban_settlement as _settlement
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return "reopen-done is operator-only; a running worker cannot reopen closed tasks"
+    row = conn.execute(
+        "SELECT status, claim_lock, current_run_id, worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return f"task {task_id} not found"
+    if row["status"] != "done":
+        return f"task {task_id} is {row['status']!r}; reopen-done only applies to 'done'"
+    if not reason:
+        return "reopen-done requires a nonblank reason (recorded in the audit event)"
+    board = _settlement.board_of_connection(conn)
+    if _settlement.acceptance_required(board):
+        return (
+            f"board {board!r} protects trusted human acceptance; a Done card there cannot be "
+            f"reopened from the CLI (use the signed-in dashboard)"
+        )
+    if row["claim_lock"] is not None or row["current_run_id"] is not None or row["worker_pid"] is not None:
+        return f"task {task_id} still has a claim or open run; reclaim it first"
+    holds = _settlement._open_holds(conn, task_id)
+    if holds:
+        return f"task {task_id} has open holds that reopening cannot bypass: {'; '.join(holds)}"
+    live = [cid for cid, status, owned in _descendant_statuses(conn, task_id) if owned or status == "running"]
+    if live:
+        return (
+            f"descendants are running or hold a claim, run or worker ({', '.join(live)}); "
+            f"reopening would have to kill their workers. Reclaim them first"
+        )
+    return None
+
+
+def reopen_done_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str], dry_run: bool = False,
+) -> tuple[bool, Optional[str], dict[str, Any]]:
+    """Operator recovery ``done`` -> ``ready`` (or ``todo`` while a parent is unfinished) so the
+    normal evidence-gated :func:`request_review` can take the card to Review. Keeps the task
+    row, ``result``, runs, comments, attachments and history; writes ``done_recovered``.
+    Reopening a satisfied parent demotes its descendants through the same
+    ``invalidate_descendants_for_parent_reopen`` the dashboard uses, inside one transaction
+    (any failure rolls everything back). It never grants Done, and refuses boards that protect
+    trusted human acceptance, live claims, open holds and running descendants.
+    Returns ``(ok, error, info)``; ``info`` has ``to_status`` and ``invalidate`` (descendant ids)."""
+    reason = str(_kb.redact_review_value(reason or "")).strip() or None
+    refusal = _done_reopen_refusal(conn, task_id, reason)
+    if refusal:
+        return False, refusal, {}
+    if dry_run:
+        return True, None, _reopen_done_info(conn, task_id)
+    with _kb.write_txn(conn):
+        refusal = _done_reopen_refusal(conn, task_id, reason)
+        if refusal:
+            return False, refusal, {}
+        info = _reopen_done_info(conn, task_id)
+        prior = conn.execute("SELECT completed_at FROM tasks WHERE id = ?", (task_id,)).fetchone()["completed_at"]
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, completed_at = NULL WHERE id = ? AND status = 'done' "
+            "AND claim_lock IS NULL AND current_run_id IS NULL AND worker_pid IS NULL",
+            (info["to_status"], task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} changed during reopen", {}
+        result = _kb.invalidate_descendants_for_parent_reopen(conn, task_id, author=actor)
+        info["invalidate"] = [d["id"] for d in result["invalidated"]]
+        _kb._append_event(conn, task_id, "done_recovered", {
+            "actor": actor, "reason": reason, "from_status": "done", "to_status": info["to_status"],
+            "prior_completed_at": prior, "invalidated": info["invalidate"],
+        })
+        _kb._append_event(conn, task_id, "status", {
+            "status": info["to_status"], "reason": "done_recovered", "previous_status": "done"})
+    return True, None, info
+
+
+def _reopen_done_info(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    return {
+        "to_status": _kb._landing_status_after_parents(conn, task_id),
+        "invalidate": [cid for cid, st, _owned in _descendant_statuses(conn, task_id)
+                       if st in {"ready", "review", "done"}],
+    }
 
 
 from hermes_cli import kanban_db as _kb

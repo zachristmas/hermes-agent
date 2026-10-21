@@ -211,7 +211,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "reopen-done",
     "gc",
 })
 
@@ -1412,17 +1412,43 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot reopen {tid} (not in review?)")
 
 
+def _cmd_reopen_done(args: argparse.Namespace) -> int:
+    reason = _joined_words(args.reason)
+    dry_run = bool(args.dry_run)
+    with kbc.connect_closing() as conn:
+        ok, err, info = kb.reopen_done_task(
+            conn, args.task_id, actor=_profile_author(), reason=reason, dry_run=dry_run)
+    if getattr(args, "json", False):
+        _print_json({"task_id": args.task_id, "reopened": ok, "dry_run": dry_run, "reason": reason,
+                     "error": err, **info})
+        return 0 if ok else 1
+    if not ok:
+        return _err(f"cannot reopen {args.task_id}: {err}")
+    label = "Would reopen" if dry_run else "Reopened"
+    invalidated = info.get("invalidate") or []
+    print(f"{label} {args.task_id}: done -> {info['to_status']}: {reason}"
+          + (f" (descendants {'that would be ' if dry_run else ''}invalidated: {', '.join(invalidated)})"
+             if invalidated else ""))
+    if not dry_run:
+        print(f"Next: hermes kanban request-review {args.task_id} --summary \"...\" (evidence gates apply)")
+    return 0
+
+
 def _cmd_promote(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     author = _profile_author()
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
     dry_run = bool(args.dry_run)
+    from_triage = bool(getattr(args, "from_triage", False))
+    if from_triage and not reason:
+        return _err("kanban: promote --from-triage requires a reason (recorded in the audit event)")
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run,
+                                      from_triage=from_triage)
             results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
                             "reason": reason, "error": err})
 
@@ -1654,7 +1680,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
-    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "reopen-review": _cmd_reopen_review, "reopen-done": _cmd_reopen_done, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
