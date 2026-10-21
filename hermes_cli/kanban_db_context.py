@@ -109,6 +109,43 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append("")
 
 
+_CTX_LATEST_INSTRUCTIONS = 5
+
+
+def _ctx_latest_instructions(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """The newest comments, newest first, right after the body and ahead of prior attempts: on a
+    card that has been retried and redirected, the latest instruction (a new deliverable, "do not
+    run tests") is what the worker must follow, and burying it under every earlier attempt is how a
+    retry re-ran the original brief (t_6465d3ec). Human provenance comes from the server-side ``commented`` event, never the
+    author string. Comments still awaiting the assignee's answer are listed for a reply."""
+    from hermes_cli import kanban_comment_replies as replies
+
+    comments = _kb.list_comments(conn, task_id)
+    if not comments:
+        return
+    human = set(replies.human_comment_ids(conn, task_id))
+    lines.append("## Latest instructions (newest first)")
+    lines.append(
+        "_Where these conflict with the body or with earlier attempts, the newest instruction "
+        "wins: honour added or changed deliverables and constraints exactly._")
+    for c in reversed(comments[-_CTX_LATEST_INSTRUCTIONS:]):
+        who = "human, dashboard" if c.id in human else "comment from worker"
+        safe_author = (c.author or "").replace("`", "")
+        lines.append(f"- #{c.id} `{safe_author}` ({who}, {_ctx_stamp(c.created_at, now)}): "
+                     f"{_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES)}")
+    deliverables = replies.requested_deliverables(comments)
+    if deliverables:
+        lines.append("")
+        lines.append("Deliverables added by later instructions:")
+        lines += [f"- {d}" for d in deliverables]
+    pending = replies.pending_human_comments(conn, task_id)
+    if pending:
+        lines.append("")
+        lines.append("Awaiting your reply on the card: " + ", ".join(f"#{c.id}" for c in pending)
+                     + ". Answer them directly in your final report.")
+    lines.append("")
+
+
 def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
     """Absolute on-disk paths so the worker's file tools read them directly
     (remote terminal backends need the attachments dir mounted)."""
@@ -152,6 +189,36 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
         if meta_line:
             lines.append(meta_line)
         lines.append("")
+
+
+def _ctx_recorded_progress(lines: list[str], conn: sqlite3.Connection, task_id: str) -> None:
+    """Progress a past run recorded on this card. Finished work is not redone; a run that follows a
+    scheduled wait is a READ-ONLY recheck of the awaited event."""
+    import json
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN "
+        "('progress_recorded', 'recheck_started') ORDER BY id DESC LIMIT 2", (task_id,)).fetchall()
+    progress = next((r for r in rows if r["kind"] == "progress_recorded"), None)
+    if progress is None:
+        return
+    try:
+        data = json.loads(progress["payload"]) or {}
+    except ValueError:
+        return
+    lines.append("## Recorded progress (earlier run)")
+    lines.append("Finished work is on the card and in its evidence. Do NOT repeat it: no second production write.")
+    for key, label in (("finished", "Finished"), ("remaining", "Remaining")):
+        for item in data.get(key) or []:
+            lines.append(f"- {label}: {item}")
+    if data.get("next_owner"):
+        lines.append(f"- Next action owner: {data['next_owner']}")
+    if data.get("trigger"):
+        lines.append(f"- Triggered by: {data['trigger']}")
+    if rows and rows[0]["kind"] == "recheck_started":
+        how = (data.get("recheck") or {}).get("how") or "check whether the awaited event has happened"
+        lines.append(f"This run is a bounded READ-ONLY recheck: {how}. Change nothing. Report status "
+                     "`waiting` if the event has not happened yet.")
+    lines.append("")
 
 
 def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:

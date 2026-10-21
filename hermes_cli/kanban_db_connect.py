@@ -887,6 +887,10 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Pinned hostname a task's work must run on; NULL = no pin. See SCHEMA_SQL.
+    ("remote_host", "remote_host TEXT"),
+    # Per-task Herdr agent kind override; NULL = board's herdr_board_agents default. See SCHEMA_SQL.
+    ("agent_kind_override", "agent_kind_override TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

@@ -248,6 +248,8 @@ gateway:
       kept_failing: "başarısız olmaya devam etti"
       last_error: " (son: {value})"
       gave_up: "⛔ {head} artık engellendi: {count}{last}. Nedeni giderin, ardından `hermes kanban unblock {task_id}` (veya `hermes kanban reassign {task_id}`) çalıştırın. Günlükler: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ {head} yeniden denemeyi bıraktı: {count}{last}. @{owner} / koordinatör için mutabakat kuyruğa alındı. Sonraki: {action} Kanıt: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ {head} mutabakatı {hours} saat sonra hâlâ açık (sahibi @{owner}). Sonraki: {action}"
       limit_minutes: "{minutes} dakikalık sınırını"
       limit_generic: "zaman sınırını"
       timed_out: "⏱ {head} {span} aştı ve durduruldu; otomatik olarak yeniden denenecek."

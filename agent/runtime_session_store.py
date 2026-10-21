@@ -16,11 +16,25 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
 
 _worker_process = False
+
+# An owner whose event loop is briefly saturated answers discovery late: ``starting`` or a
+# ``control_timeout``. That is a busy owner, not an absent one, so the worker waits it out for a
+# bounded time instead of failing its persistence for good. Absent, draining, mismatched and
+# unauthorized owners are never retried, and nothing is retried once a request has been sent.
+_OWNER_PATIENCE_SECONDS = 60.0
+_OWNER_RETRY_INTERVAL_SECONDS = 2.0
+
+
+def _owner_busy(discovery):
+    state = getattr(discovery, 'state', None)
+    return state == 'starting' or (
+        state == 'inaccessible' and getattr(discovery, 'reason_code', None) == 'control_timeout')
 
 
 def is_worker_process():
@@ -129,6 +143,26 @@ class WorkerRPC:
         self.link = None
         self.request_id = 0
 
+    def _discover(self):
+        from hermes_cli.gateway_runtime import discover_gateway_endpoint
+        deadline = time.monotonic() + _OWNER_PATIENCE_SECONDS
+        while True:
+            discovery = discover_gateway_endpoint(self.home, timeout=5)
+            if not _owner_busy(discovery) or time.monotonic() >= deadline:
+                return discovery
+            time.sleep(_OWNER_RETRY_INTERVAL_SECONDS)
+
+    def _identify(self, control_home):
+        from hermes_cli.gateway_runtime_discovery import query_identify
+        deadline = time.monotonic() + _OWNER_PATIENCE_SECONDS
+        while True:
+            try:
+                return query_identify(control_home, timeout=5)
+            except TimeoutError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(_OWNER_RETRY_INTERVAL_SECONDS)
+
     def _connection(self):
         if self.link is not None:
             if self.link.reader.is_alive():
@@ -136,18 +170,16 @@ class WorkerRPC:
             # The owner closed it while idle, before any send: redial with a fresh ticket.
             self._drop()
         from hermes_cli.gateway_client import _session_ticket, gateway_ws_target
-        from hermes_cli.gateway_runtime_discovery import query_identify
         from websockets.sync.client import connect
         # A served secondary has no socket; its multiplexer's descriptor names it.
-        from hermes_cli.gateway_runtime import discover_gateway_endpoint
-        discovery = discover_gateway_endpoint(self.home, timeout=5)
+        discovery = self._discover()
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
             raise WorkerPersistenceError('owner_unavailable')
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
-        descriptor = query_identify(control_home_for(self.home, endpoint), timeout=5)
+        descriptor = self._identify(control_home_for(self.home, endpoint))
         if descriptor.get('pid') == os.getpid():
             raise WorkerPersistenceError('synchronous_self_rpc')
         ticket = _session_ticket(self.home, endpoint, purpose='worker-adoption')

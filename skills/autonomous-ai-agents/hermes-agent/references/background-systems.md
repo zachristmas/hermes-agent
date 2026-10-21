@@ -83,6 +83,13 @@ sessions still have zero `kanban_*` schema footprint unless configured.
   `show`, `assign`, `link`, `unlink`, `comment`, `complete`, `block`,
   `unblock`, `archive`, `tail`. Less common: `watch`, `stats`, `runs`,
   `log`, `dispatch`, `daemon`, `gc`.
+- **Correcting a card's summary:** `hermes kanban edit <id> --summary "..."`
+  rewrites the summary an idle card shows (Review, Done, blocked) without
+  moving it; the old text is kept in a `summary_edited` event. The
+  dashboard and desktop drawers have the same edit button
+  (`PATCH /api/plugins/kanban/tasks/<id>/summary`). Use it instead of a
+  new run or a database edit when a handoff summary is raw terminal output
+  or wrong.
 - **Worker/orchestrator toolset:** `kanban_show`, `kanban_complete`,
   `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`,
   `kanban_link`; profiles that explicitly enable the `kanban` toolset

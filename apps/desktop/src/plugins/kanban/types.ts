@@ -25,6 +25,8 @@ export interface KanbanTask {
    *  run (or the backend predates it) — the clock falls back to started_at. */
   current_run_started_at?: null | number
   worker_pid?: null | number
+  /** Set while a worker or reviewer holds the card. */
+  claim_lock?: null | string
   last_heartbeat_at?: null | number
   /** Typed block reason set by the backend on kanban_block (one of
    *  VALID_BLOCK_KINDS — `dependency`, `needs_input`, `capability`,
@@ -87,6 +89,8 @@ export interface KanbanComment {
   author: string
   body: string
   created_at: number
+  edited_at?: number
+  edits?: number
 }
 
 export interface KanbanEvent {

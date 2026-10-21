@@ -177,9 +177,11 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
-        "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "getting unblocked and re-blocked for the same reason, automatic "
+        "retries stop and the coordinator is told. Use for genuine blockers "
+        "only — don't block on things you can resolve yourself. A "
+        "needs_input/capability block (or one with no kind) is refused "
+        "without ``prerequisite``: do every authorized read first."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -197,6 +199,24 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "if no parent is open it is recorded as needs_input instead. "
                 "The others surface to a human. Omit only if none apply."
             ),
+        },
+        "prerequisite": {
+            "type": "object",
+            "description": (
+                "Required for needs_input/capability (or no kind): the typed "
+                "intervention only a person can supply. 'needs' is the concrete "
+                "action that unblocks you, 'owner' who must take it, "
+                "'investigated' the authorized reads you already did. A "
+                "likely cause or a meeting you would like is not a prerequisite."
+            ),
+            "properties": {
+                "kind": {"type": "string", "enum": [
+                    "access", "approval", "human_decision", "external_dependency", "production_write"]},
+                "needs": {"type": "string"},
+                "owner": {"type": "string"},
+                "investigated": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["kind", "needs", "owner", "investigated"],
         },
     },
     ["reason"],

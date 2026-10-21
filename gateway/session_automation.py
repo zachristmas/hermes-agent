@@ -326,8 +326,17 @@ def admission_display(payload):
     return card
 
 
+# Labels a platform rewrites on a live chat after the human message was committed (a Discord
+# thread's auto-rename, a channel topic edit). They name the route; they never identify or
+# authorize it, so a producer turn must not be refused for them. Everything else on the source
+# stays compared, including the author (``user_id`` and ``user_name``: a different author is a
+# different human), and a new source field is compared until it is listed here.
+_ROUTE_LABEL_SOURCE_FIELDS = frozenset({
+    'message_id', 'chat_name', 'chat_topic', 'auto_thread_created', 'auto_thread_initial_name'})
+
+
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    return {key: value for key, value in source.to_dict().items() if key not in _ROUTE_LABEL_SOURCE_FIELDS}
 
 
 def committed_route_envelope(authority, entry):

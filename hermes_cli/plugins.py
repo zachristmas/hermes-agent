@@ -128,6 +128,7 @@ VALID_HOOKS: set[str] = {
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
+    "on_plugin_injection_result",
     "on_session_finalize", "on_session_reset", "on_session_delete",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
@@ -587,12 +588,11 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
-        origin: Mapping[str, Any] | None = None,
+        origin: Mapping[str, Any] | None = None, dedupe_key: str | None = None,
     ) -> bool:
-        """Queue *content* for a session (``session_key``) or a chat in this plugin's own profile
-        (``origin``); ``True`` means a host accepted it. Contract: plugins_injection.py, plugin docs."""
+        """Schedule a plugin turn; outcomes and optional dedupe contract: plugins_injection.py, plugin docs."""
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin, dedupe_key=dedupe_key)
 
     def session_cwd(self) -> str:
         """The calling session's recorded cwd, never the gateway's own (``plugin_session``)."""

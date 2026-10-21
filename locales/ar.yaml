@@ -248,6 +248,8 @@ gateway:
       kept_failing: "استمرّت في الفشل"
       last_error: " (آخر خطأ: {value})"
       gave_up: "⛔ {head} محظورة الآن: {count}{last}. أصلح السبب، ثم شغّل `hermes kanban unblock {task_id}` (أو `hermes kanban reassign {task_id}`). السجلات: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ توقّف {head} عن إعادة المحاولة: {count}{last}. أُدرجت مطابقة لـ @{owner} / المنسّق. التالي: {action} الأدلة: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ مطابقة {head} ما زالت مفتوحة بعد {hours} ساعة (المالك @{owner}). التالي: {action}"
       limit_minutes: "حدّها البالغ {minutes} دقيقة"
       limit_generic: "حدّها الزمني"
       timed_out: "⏱ {head} تجاوزت {span} فأُوقفت؛ ستُعاد المحاولة تلقائيًا."

@@ -821,6 +821,8 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `request-review <id>` | Move a task to `review` with a reviewer handoff — NOT a block. Flags: `--summary`, `--metadata`, `--reviewer` (reassigns before review dispatch). |
 | `request-changes <id> <reason>` | Reviewer verdict for an active review run: close the review attempt and route the task back to its original implementer. |
 | `reopen-review <id>...` | Send review task(s) back for changes (`review` → ready/todo). Flag: `--reason` (appended as a comment). |
+| `reopen-done <id> <reason...>` | Recover an incorrectly auto-Done card to ready (todo while a parent is open) so `request-review` can take it to Review. Requires a reason; flags: `--dry-run`, `--json`. Refuses protected-acceptance boards, claims, holds and running descendants; demotes descendants like the dashboard reopen. |
+| `bind-executor <id> --agent <name> [--run N]` | Bind a live, card-tagged Herdr agent to a manually claimed run before prompting it. When that same agent later settles with a new completion, the dispatcher sweep records the run's result receipt (`needs_input` unless a run-scoped final report exists), so a hand-claimed run no longer stays Running after its executor finishes. Dispatcher-spawned runs settle themselves and are refused. |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Restore a blocked task to its source phase (`review` or `ready`), or `todo` while dependencies remain open. |
 | `archive <id>` | Hide from default list. `gc` will remove scratch workspaces. |

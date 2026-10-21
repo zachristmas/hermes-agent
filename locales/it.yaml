@@ -248,6 +248,8 @@ gateway:
       kept_failing: "ha continuato a fallire"
       last_error: " (ultimo: {value})"
       gave_up: "⛔ {head} è ora bloccato: {count}{last}. Correggi la causa, poi `hermes kanban unblock {task_id}` (oppure `hermes kanban reassign {task_id}`). Log: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ {head} ha smesso di riprovare: {count}{last}. Riconciliazione in coda per @{owner} / coordinatore. Prossimo passo: {action} Prove: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ La riconciliazione di {head} è ancora aperta dopo {hours} h (responsabile @{owner}). Prossimo passo: {action}"
       limit_minutes: "il suo limite di {minutes} minuti"
       limit_generic: "il suo limite di tempo"
       timed_out: "⏱ {head} ha superato {span} ed è stato interrotto; verrà ritentato automaticamente."

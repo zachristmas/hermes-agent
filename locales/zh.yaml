@@ -248,6 +248,8 @@ gateway:
       kept_failing: "持续失败"
       last_error: " （最近一次：{value}）"
       gave_up: "⛔ {head} 现已阻塞：{count}{last}。请修复原因后运行 `hermes kanban unblock {task_id}`（或 `hermes kanban reassign {task_id}`）。日志：`hermes kanban log {task_id}`。"
+      gave_up_reconcile: "⛔ {head} 已停止重试：{count}{last}。已为 @{owner} / 协调者排队核对。下一步：{action} 证据：`hermes kanban log {task_id}`。"
+      reconciliation_escalated: "⏰ {head} 的核对在 {hours} 小时后仍未完成（负责人 @{owner}）。下一步：{action}"
       limit_minutes: "{minutes} 分钟的时限"
       limit_generic: "时限"
       timed_out: "⏱ {head} 超过{span}已被停止；将自动重试。"

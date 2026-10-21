@@ -4,7 +4,7 @@ import { setApiRequestConnection, setApiRequestProfile } from '@/api/client'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import { $connection } from '@/store/session'
 
-import { captureGatewayFileDownload } from './media'
+import { captureGatewayFileDownload, captureGatewayFilePreview } from './media'
 
 beforeEach(() => {
   clearNotifications()
@@ -85,5 +85,43 @@ describe('captured gateway file download', () => {
       path: '/persisted/file.md',
       suggestedName: 'file.md'
     })
+  })
+})
+
+describe('captured gateway file preview', () => {
+  it('reads through the pinned owner via the read-data-url contract', async () => {
+    const api = vi.fn().mockResolvedValue({ dataUrl: 'data:text/plain;base64,aGk=' })
+    vi.stubGlobal('hermesDesktop', { api })
+    setApiRequestConnection('remote')
+    setApiRequestProfile('work')
+    const preview = captureGatewayFilePreview()
+    setApiRequestConnection('other')
+    setApiRequestProfile('elsewhere')
+
+    await expect(preview('/persisted/file.md')).resolves.toBe('data:text/plain;base64,aGk=')
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: 'remote',
+        path: '/api/fs/read-data-url?path=%2Fpersisted%2Ffile.md',
+        profile: 'work'
+      })
+    )
+  })
+
+  it('rejects empty and relative paths before any read', async () => {
+    const api = vi.fn()
+    vi.stubGlobal('hermesDesktop', { api })
+    const preview = captureGatewayFilePreview()
+
+    await expect(preview('  ')).rejects.toThrow('Missing gateway file path')
+    await expect(preview('relative/file.md')).rejects.toThrow('Missing gateway file path')
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('rejects a result that is not a data URL', async () => {
+    vi.stubGlobal('hermesDesktop', { api: vi.fn().mockResolvedValue({ dataUrl: '' }) })
+    setApiRequestConnection('remote')
+
+    await expect(captureGatewayFilePreview()('/persisted/file.md')).rejects.toThrow('Preview unavailable')
   })
 })

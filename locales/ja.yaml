@@ -248,6 +248,8 @@ gateway:
       kept_failing: "失敗が続きました"
       last_error: " (直近: {value})"
       gave_up: "⛔ {head} はブロックされました: {count}{last}。原因を修正した後、`hermes kanban unblock {task_id}` (または `hermes kanban reassign {task_id}`) を実行してください。ログ: `hermes kanban log {task_id}`。"
+      gave_up_reconcile: "⛔ {head} の再試行を停止しました：{count}{last}。@{owner} / コーディネーター向けに調整をキューに追加しました。次の対応：{action} 証跡：`hermes kanban log {task_id}`。"
+      reconciliation_escalated: "⏰ {head} の調整が {hours} 時間経過しても未解決です（担当 @{owner}）。次の対応：{action}"
       limit_minutes: "{minutes} 分の制限時間"
       limit_generic: "制限時間"
       timed_out: "⏱ {head} は{span}を超過したため停止しました。自動的に再試行されます。"

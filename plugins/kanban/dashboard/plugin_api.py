@@ -10,6 +10,7 @@ dispatcher's write txns); it carries its credential in the query string (browser
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib
 import json
 import logging
@@ -24,16 +25,17 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
+    APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from hermes_cli import kanban_db
+from hermes_cli import kanban_db, kanban_settlement
 from hermes_cli import kanban_workflow
 from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_review_summary as kbrs
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
@@ -398,7 +400,10 @@ def get_task(
         _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
         return {
             "task": task_d,
-            "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
+            "comments": [
+                {**asdict(c), **edit_info.get(c.id, {})}
+                for edit_info in [kanban_db.comment_edit_info(conn, task_id)]
+                for c in kanban_db.list_comments(conn, task_id)],
             "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
             "links": links,
@@ -588,12 +593,36 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     return _set_status_direct(conn, task_id, s)
 
 
+# Acceptance proof for the CURRENT request, derived server-side by ``_acceptance_scope`` (never from the
+# body): None means "no human proof", and the Done gate on a review-required board refuses.
+_REQUEST_ACCEPTANCE: contextvars.ContextVar = contextvars.ContextVar("kanban_request_acceptance", default=None)
+_ACCEPTANCE_HEADER = "X-Hermes-Kanban-Acceptance"
+
+
+@contextmanager
+def _acceptance_scope(request: Request) -> Iterator[None]:
+    state = request.state
+    gated = bool(
+        getattr(request.app.state, "auth_required", False)
+        and getattr(state, "session", None) is not None
+        and not getattr(state, "token_authenticated", False)
+        and not getattr(state, "native_http_principal", None))
+    proof = kanban_settlement.dashboard_acceptance(
+        gated_session=gated, passphrase=request.headers.get(_ACCEPTANCE_HEADER))
+    token = _REQUEST_ACCEPTANCE.set(proof)
+    try:
+        yield
+    finally:
+        _REQUEST_ACCEPTANCE.reset(token)
+
+
 # Status verb dispatch shared by PATCH /tasks/{id} and POST /tasks/bulk: (conn, task_id,
 # payload) -> ok. ``review`` uses request_review (never a block, so it can't trip unblock-loop
 # detection) and ``done`` pass ``force=True``: a dashboard action is a human override of a live worker claim.
 _STATUS_HANDLERS: dict[str, Any] = {
     "done": lambda conn, tid, p: kanban_db.complete_task(
-        conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
+        conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True,
+        human_acceptance=_REQUEST_ACCEPTANCE.get()),
     "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "review": lambda conn, tid, p: kanban_db.request_review(
@@ -690,8 +719,8 @@ def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Option
 
 
 @router.patch("/tasks/{task_id}")
-def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
-    with _board_conn(board) as (board, conn):
+def update_task(task_id: str, payload: UpdateTaskBody, request: Request, board: Optional[str] = Query(None)):
+    with _acceptance_scope(request), _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
         # For a combined assignee+review patch, request_review must capture the
         # current implementer before the task is routed to the reviewer.
@@ -743,6 +772,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
+    # Every transition into Review/Done must use the shared lifecycle/evidence boundary.
+    # Dragging a card cannot bypass request_review's artifact contract or Done acceptance.
+    if new_status in {"review", "done"}:
+        return False
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
@@ -805,8 +838,44 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
         raise HTTPException(status_code=400, detail="body is required")
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
-        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body)
+        # The UI surface (dashboard + desktop drawer) is the human channel: its comments are
+        # queued for the assignee's reply. ``author`` is client-supplied, so provenance is not.
+        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body, source="dashboard")
         return {"ok": True}
+
+
+@router.patch("/tasks/{task_id}/comments/{comment_id}")
+def edit_comment(task_id: str, comment_id: int, payload: CommentBody, board: Optional[str] = Query(None)):
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        try:
+            kanban_db.edit_comment(conn, task_id, comment_id, payload.author or "dashboard", payload.body)
+        except kanban_db.CommentEditForbidden as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0]))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": True}
+
+
+class SummaryBody(BaseModel):
+    summary: str
+    editor: Optional[str] = "dashboard"
+
+
+@router.patch("/tasks/{task_id}/summary")
+def edit_summary(task_id: str, payload: SummaryBody, board: Optional[str] = Query(None)):
+    """Correct the summary an idle card shows; the replaced text is kept in a summary_edited event."""
+    if not payload.summary.strip():
+        raise HTTPException(status_code=400, detail="summary is required")
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        ok, why = kbrs.edit_summary(conn, task_id, summary=payload.summary,
+                                    editor=payload.editor or "dashboard", board=board)
+        if not ok:
+            raise HTTPException(status_code=409, detail=why)
+        return {"ok": True, "latest_summary": kanban_db.latest_summary(conn, task_id)}
 
 
 class LinkBody(BaseModel):
@@ -856,14 +925,14 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
 
 
 @router.post("/tasks/bulk")
-def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
+def bulk_update(payload: BulkTaskBody, request: Request, board: Optional[str] = Query(None)):
     """Apply the same patch to every id. Independent iteration — per-task
     failures don't abort siblings; returns per-id outcome for partials."""
     ids = [i for i in (payload.ids or []) if i]
     if not ids:
         raise HTTPException(status_code=400, detail="ids is required")
     results: list[dict] = []
-    with _board_conn(board) as (board, conn):
+    with _acceptance_scope(request), _board_conn(board) as (board, conn):
         for tid in ids:
             entry: dict[str, Any] = {"id": tid, "ok": True}
             try:

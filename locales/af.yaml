@@ -248,6 +248,8 @@ gateway:
       kept_failing: "dit het aanhou misluk"
       last_error: " (laaste: {value})"
       gave_up: "⛔ {head} is nou geblokkeer: {count}{last}. Herstel die oorsaak, dan `hermes kanban unblock {task_id}` (of `hermes kanban reassign {task_id}`). Logs: `hermes kanban log {task_id}`."
+      gave_up_reconcile: "⛔ {head} probeer nie meer weer nie: {count}{last}. Versoening is vir @{owner} / koördineerder in die ry geplaas. Volgende: {action} Bewyse: `hermes kanban log {task_id}`."
+      reconciliation_escalated: "⏰ {head} se versoening is ná {hours}h steeds oop (eienaar @{owner}). Volgende: {action}"
       limit_minutes: "sy limiet van {minutes} minute"
       limit_generic: "sy tydslimiet"
       timed_out: "⏱ {head} het {span} oorskry en is gestop; dit sal outomaties herprobeer word."

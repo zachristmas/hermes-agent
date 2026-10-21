@@ -7,6 +7,7 @@ test_kanban_tools.py.
 """
 from __future__ import annotations
 
+import json
 
 import pytest
 
@@ -75,10 +76,13 @@ def test_kanban_block_reason_scrubbed_jwt(worker_env):
         ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
         ".dozjgNryP4J3jVmNHl0w5N_5NjP1-iXkpHgcth826Iw"
     )
-    kt._handle_block({"reason": f"Bearer {jwt}"})
+    kt._handle_block({"reason": f"Bearer {jwt}", "prerequisite": {
+        "kind": "access", "needs": f"rotate the token Bearer {jwt}", "owner": "zach",
+        "investigated": ["read the auth log"]}})
     conn = kbc.connect()
     try:
         run = kb.latest_run(conn, worker_env)
+        events = [e.payload for e in kb.list_events(conn, worker_env) if e.kind == "block_prerequisite"]
     finally:
         conn.close()
     # block_task stores reason as run.summary
@@ -86,6 +90,7 @@ def test_kanban_block_reason_scrubbed_jwt(worker_env):
     assert run.outcome == "blocked"
     stored = run.summary or ""
     assert jwt not in stored
+    assert events and jwt not in json.dumps(events)
 
 
 # ---------------------------------------------------------------------------

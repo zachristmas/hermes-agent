@@ -17,17 +17,7 @@ DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
 LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
 
 
-def _aux(timeout, *, reasoning_effort=True, **extra):
-    """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
-
-    reasoning_effort=False omits that key (MoA blocks configure depth per slot);
-    ``extra`` keys are appended after the standard ones.
-    """
-    d = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout, "extra_body": {}}
-    if reasoning_effort:
-        d["reasoning_effort"] = ""
-    d.update(extra)
-    return d
+from hermes_cli.config_defaults_aux import _aux
 
 
 DEFAULT_CONFIG = {
@@ -1909,9 +1899,11 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
-        # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
-        # sdlc-review skill. Disable where every review is done manually from the dashboard.
-        "review_dispatch": True,
+        # dispatch_in_gateway false still runs settlement/hold maintenance ticks (max_spawn=0, no spawns).
+        "maintenance_when_paused": True,
+        # Per-board opt-in (list/comma-string): boards listed auto-claim review-column tasks and
+        # spawn the assignee; empty/None/unreadable all mean "off" (human-only review, the default).
+        "review_dispatch_boards": None,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
@@ -1964,10 +1956,14 @@ DEFAULT_CONFIG = {
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.
         "reconcile_orphans": True,
-        # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
-        # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
-        # activity for this many days so stale rows aren't scanned forever. 0 = off.
+        # Notify subscriptions survive `done` and are removed on archive; on boards that never archive,
+        # the notifier GC purges subs of tasks done with no activity for this many days. 0 = off.
         "done_sub_retention_days": 30,
+        # Board allowlists: opt into the interactive bridge and the explicit /open-pr handoff.
+        "direct_herdr_dispatch_boards": None,
+        # Per-board kind/model/effort; per-task override wins. Unlisted: Claude Sonnet, medium.
+        "herdr_board_agents": None,
+        "direct_herdr_open_pr_handoff_boards": None,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.

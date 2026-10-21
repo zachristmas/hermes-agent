@@ -664,9 +664,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked_after_kill
+    from hermes_cli.kanban_settlement import owner_hold_or_continue
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
+        if owner_hold_or_continue(conn, row["id"]):
             continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
@@ -779,9 +780,10 @@ def detect_stale_running(
         "WHERE t.status = 'running'"
     ).fetchall()
 
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked_after_kill
+    from hermes_cli.kanban_settlement import owner_hold_or_continue
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
+        if owner_hold_or_continue(conn, row["id"]):
             continue
         if row["active_started_at"] is None:
             continue
@@ -870,8 +872,9 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
+    from hermes_cli.kanban_settlement import owner_hold_or_continue
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
+        if owner_hold_or_continue(conn, row["id"]):
             continue
         tid = row["id"]
         pid = row["worker_pid"]
@@ -921,13 +924,6 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
         )
     return reconciled
-
-
-def _error_fingerprint(error_text: str) -> str:
-    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
-    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
-    return fp.lower().strip()
 
 
 # ~96% of "clean exit without a terminal tool call" tasks complete on a later
@@ -1369,127 +1365,8 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     return sweep.crashed
 
 
-def _record_task_failure(
-    conn: sqlite3.Connection,
-    task_id: str,
-    error: str,
-    *,
-    outcome: str,
-    failure_limit: int | None = None,
-    force_trip: bool = False,
-    release_claim: bool = False,
-    end_run: bool = False,
-    event_payload_extra: Optional[dict] = None,
-    infrastructure: bool = False,
-) -> bool:
-    """Record a non-success outcome and maybe trip the circuit breaker; every
-    non-success path funnels through here so ``consecutive_failures`` stays
-    consistent. Returns True when the task was auto-blocked.
-
-    ``release_claim=True, end_run=True``: spawn-failure path (task still
-    running with an open run — restore source phase or ``blocked``, release
-    claim, close run). Both False: timeout/crash path (caller already restored
-    the phase and closed the run; only the counter moves, a trip flips to
-    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
-    ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
-    unconditionally (caller applied its own bounded-retry policy).
-
-    ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
-    #114720) — nothing about the card ran, so the run and event are recorded
-    with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
-    the breaker never trips; the card stays retryable and
-    :func:`check_respawn_guard` spaces the retries.
-    """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
-    error = error[:500]
-    with _kb.write_txn(conn):
-        row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        retry_status = (
-            _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
-            if release_claim
-            else ("review" if row["status"] == "review" else "ready")
-        )
-        failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
-
-        # Per-task override wins over caller-supplied and default thresholds.
-        task_override = _kb._row_get(row, "max_retries")
-        if task_override is not None:
-            effective_limit, limit_source = int(task_override), "task"
-        else:
-            effective_limit, limit_source = int(failure_limit), "dispatcher"
-
-        if infrastructure or not (force_trip or failures >= effective_limit):
-            if release_claim:
-                # Spawn path: restore the claimed source phase + clear claim.
-                conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error, task_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error, task_id),
-                )
-            # Timeout/crash path's caller already emitted its own event.
-            if end_run:
-                detail = {"failures": failures, "retry_status": retry_status}
-                if infrastructure:
-                    detail["infrastructure"] = True
-                run_id = _kb._end_run(
-                    conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
-                )
-                _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
-            return False
-
-        # Spawn path (release_claim) is still running and also clears claim
-        # state; the timeout/crash path already did.
-        conn.execute(
-            "UPDATE tasks SET status = 'blocked', "
-            + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-               if release_claim else "")
-            + "consecutive_failures = ?, last_failure_error = ? "
-            "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-            (failures, error, task_id),
-        )
-        payload = {
-            "failures": failures,
-            "effective_limit": effective_limit,
-            "limit_source": limit_source,
-            "error": error,
-            "trigger_outcome": outcome,
-            "retry_status": retry_status,
-        }
-        run_id = None
-        if end_run:
-            # Only the spawn path has an open run to close.
-            run_id = _kb._end_run(
-                conn, task_id, outcome="gave_up", status="gave_up", error=error,
-                metadata={
-                    "failures": failures,
-                    "trigger_outcome": outcome,
-                    "effective_limit": effective_limit,
-                    "limit_source": limit_source,
-                    "retry_status": retry_status,
-                },
-            )
-        if force_trip:
-            # The caller applied its own bounded policy, so the counter cannot
-            # judge this block: ``recompute_ready`` holds it for an operator.
-            payload["sticky"] = True
-        if event_payload_extra:
-            payload.update(event_payload_extra)
-        _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
-        return True
+# Failure accounting + circuit breaker live in this sibling (line-cap offload).
+from hermes_cli.kanban_db_dispatch_failure import _error_fingerprint, _record_task_failure
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=None, claim_lock=None) -> None:
@@ -1581,7 +1458,9 @@ def check_respawn_guard(
     ).fetchone()
     if row is None:
         return None
-
+    from hermes_cli.kanban_comment_replies import reply_in_flight
+    if reply_in_flight(conn, task_id):
+        return "comment_reply_in_flight"  # the assignee is answering a comment on this card
     now = int(time.time())
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
@@ -1623,9 +1502,32 @@ def check_respawn_guard(
     if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
-    # Review-lane spawns stop here: a recent completed run and a fresh PR URL
-    # are the canonical *inputs* to a review handoff, not duplicate-work signals.
+    # Review-lane spawns stop here: the initial handoff remains eligible. After a
+    # completed review, only an explicit reopen or changes-requested transition
+    # starts another cycle. Ordinary comments do not restart completed work.
     if lane == "review":
+        events = list(_rows_since(
+            conn, "task_events", task_id, 0,
+            "AND kind IN ('review_requested', 'review_reopened', 'changes_requested')",
+            cols=", kind",
+        ))
+        completed_reviews = [t for t, _ in _rows_since(
+            conn, "task_runs", task_id, 0, "AND outcome = 'completed'",
+        )]
+        latest_handoff = max(
+            (t for t, event in events if event["kind"] == "review_requested"), default=None
+        )
+        latest_completion = max(completed_reviews, default=None)
+        if latest_completion is not None and (
+            latest_handoff is None or latest_completion >= latest_handoff
+        ):
+            latest_restart = max(
+                (t for t, event in events
+                 if event["kind"] in {"review_reopened", "changes_requested"}),
+                default=None,
+            )
+            if latest_restart is None or latest_restart <= latest_completion:
+                return "recent_success"
         return None
 
     # 3. Completed run within guard window. Exception: an explicit re-queue
@@ -1789,6 +1691,14 @@ def dispatch_profile_allowlist_summary() -> str:
             "profile, or the config could not be read — omit the key to allow any)")
 
 
+# Direct-Herdr bridge gate + per-board agent profile live in this sibling (line-cap offload).
+from hermes_cli.kanban_db_dispatch_herdr import _board_uses_direct_herdr_dispatch
+from hermes_cli.kanban_db_dispatch_herdr import _board_uses_review_dispatch
+from hermes_cli.kanban_db_dispatch_herdr import _direct_herdr_worker_argv
+from hermes_cli.kanban_db_dispatch_herdr import _herdr_agent_profile_for_board
+from hermes_cli.kanban_db_dispatch_herdr import run_comment_reply_phase
+
+
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
@@ -1819,15 +1729,14 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return _has_spawnable(conn, "review")
 
 
-def review_dispatch_enabled() -> bool:
-    """Whether review tasks dispatch automatically. Default true (Hermes ships
-    ``sdlc-review``); operators disable it for human-only review boards.
+def review_dispatch_enabled(board: Optional[str] = None) -> bool:
+    """Whether review tasks dispatch automatically for ``board`` (or the current board, if
+    None). Board-scoped via ``kanban.review_dispatch_boards`` (sibling, line-cap offload):
+    default off everywhere, operators opt a board in for genuine AI-to-AI review (e.g. a
+    writer+reviewer board); a human-only-review board (the common case) needs no config at
+    all.
     """
-    try:
-        from hermes_cli.config import load_config
-        return bool((load_config() or {}).get("kanban", {}).get("review_dispatch", True))
-    except Exception:
-        return True
+    return _board_uses_review_dispatch(board)
 
 
 # Memory-aware dispatch guard: an uncapped board once OOM'd a 1 GiB host. Two
@@ -2220,6 +2129,21 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    # Settle finished attempts from their durable result receipts BEFORE stale-claim
+    # reclaim can book them as failures, and retry pauses waiting for owner stop evidence.
+    # Runs on every tick, including maintenance-only ticks while spawning is paused.
+    from hermes_cli import kanban_settlement as _settlement
+    try:
+        # A manually claimed run whose bound Herdr executor finished gets its result receipt here, so the
+        # settlement below (and a restarted dispatcher) closes it like a bridge run.
+        from hermes_cli import kanban_direct_herdr_worker as _herdr_bridge
+        from hermes_cli import kanban_manual_executor as _manual_executor
+        _manual_executor.reconcile_manual_executors(conn, board=board, agent_info=_herdr_bridge._agent_info)
+        _settlement.reconcile_settlements(conn)
+        _settlement.reconcile_pending_pauses(conn)
+        _settlement.reconcile_rechecks(conn)
+    except Exception:  # health: allow BLE001 -- logged with traceback; the rest of the sweep must still run
+        _kb._log.exception("kanban settlement reconcile failed; continuing sweep")
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
@@ -2383,11 +2307,12 @@ def _dispatch_once_locked(
     )
     if not may_spawn:
         return result
-
+    if spawn_fn is None and not dry_run:
+        run_comment_reply_phase(conn, board)
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled(board) else []
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
@@ -2752,7 +2677,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, extra_env: Optional[dict] = None) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -2859,8 +2784,18 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # `--cli` is the highest-precedence TUI override; dropping HERMES_TUI covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
-
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    env.update(extra_env or {})  # a reply run's lease (kanban_comment_replies)
+    if _board_uses_direct_herdr_dispatch(board, task):
+        # Per-board opt-in (card t_cb0795f9): swap the usual worker argv + these three extra env
+        # vars for the direct-Herdr bridge; everything else about spawn is unchanged. kind/model/
+        # effort come from kanban.herdr_board_agents, with the task's own override still winning.
+        agent_profile = _herdr_agent_profile_for_board(board)
+        env["HERMES_KANBAN_HERDR_MODEL"] = task.model_override or agent_profile["model"]
+        env["HERMES_KANBAN_HERDR_EFFORT"] = task.reasoning_effort or agent_profile["effort"]
+        env["HERMES_KANBAN_HERDR_KIND"] = task.agent_kind_override or agent_profile["kind"]
+        cmd = _direct_herdr_worker_argv()
+    else:
+        cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # The worker is `-m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
     # bootstrap. The routed-profile scrub above strips Hermes-owned PYTHONPATH entries (user
     # children must not see our tree), so a PYTHONPATH-launched dispatcher spawned a child that

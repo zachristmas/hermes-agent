@@ -11,7 +11,7 @@ logger = logging.getLogger("hermes_cli.plugins")
 
 def inject_plugin_message(
     ctx: Any, content: str, role: str, *, session_key: Optional[str],
-    origin: Optional[Mapping[str, Any]],
+    origin: Optional[Mapping[str, Any]], dedupe_key: Optional[str] = None,
 ) -> bool:
     manager = ctx._manager
     msg = content if role == "user" else f"[{role}] {content}"
@@ -63,6 +63,8 @@ def inject_plugin_message(
         target = {"session_key": session_key, "plugin_home": manager.home_path}
     else:
         target = {"origin": dict(origin), "plugin_home": manager.home_path}
+    if dedupe_key:
+        target["dedupe_key"] = str(dedupe_key)
     try:
         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
     except Exception:

@@ -42,6 +42,9 @@ import {
   addComment,
   boardKeyPrefix,
   deleteTask,
+  DESKTOP_AUTHOR,
+  editComment,
+  editSummary,
   estimateTask,
   fetchLog,
   fetchProfiles,
@@ -61,7 +64,9 @@ import {
   type Diagnostic,
   type DiagnosticAction,
   type KanbanAttachment,
+  type KanbanComment,
   type KanbanEvent,
+  type KanbanTask,
   type KanbanTaskDetail,
   SEVERITY_TONE,
   type TaskEstimate,
@@ -428,6 +433,78 @@ function CommentComposer({
   )
 }
 
+// Only the original author (the desktop posts as DESKTOP_AUTHOR) may edit; the
+// kernel enforces it, the UI just hides the control on other authors' comments.
+function CommentItem({
+  comment,
+  onEdit,
+  pending
+}: {
+  comment: KanbanComment
+  onEdit: (id: number | string, body: string) => void
+  pending: boolean
+}) {
+  const k = useKanban()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  return (
+    <li className="flex flex-col gap-0.5">
+      <div className="flex items-baseline gap-2 text-[0.75rem]">
+        <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
+        <span className="text-[0.625rem] text-(--ui-text-quaternary)">{ago(comment.created_at)}</span>
+        {comment.edits ? (
+          <span className="text-[0.625rem] text-(--ui-text-quaternary)" title={ago(comment.edited_at ?? comment.created_at) ?? undefined}>
+            {k.commentEdited(comment.edits)}
+          </span>
+        ) : null}
+        {comment.author === DESKTOP_AUTHOR && !editing && (
+          <Button
+            aria-label={k.editComment}
+            className="ml-auto"
+            onClick={() => {
+              setDraft(comment.body)
+              setEditing(true)
+            }}
+            size="icon-xs"
+            type="button"
+            variant="ghost"
+          >
+            <Codicon name="edit" size="0.75rem" />
+          </Button>
+        )}
+      </div>
+      {editing ? (
+        <div className="flex flex-col gap-1.5">
+          <Textarea
+            className="field-sizing-content max-h-40 resize-none text-[0.8125rem]"
+            onChange={event => setDraft(event.target.value)}
+            value={draft}
+          />
+          <div className="flex justify-end gap-1.5">
+            <Button onClick={() => setEditing(false)} size="xs" type="button" variant="ghost">
+              {k.cancel}
+            </Button>
+            <Button
+              disabled={!draft.trim() || pending}
+              onClick={() => {
+                onEdit(comment.id, draft.trim())
+                setEditing(false)
+              }}
+              size="xs"
+              type="button"
+            >
+              {k.save}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <TaskMarkdown text={comment.body} />
+      )}
+    </li>
+  )
+}
+
 function DescriptionSection({ body, onSave }: { body: null | string | undefined; onSave: (body: string) => void }) {
   const k = useKanban()
   const [editing, setEditing] = useState(false)
@@ -478,6 +555,68 @@ function DescriptionSection({ body, onSave }: { body: null | string | undefined;
   )
 }
 
+// No worker or reviewer holds the card, so its summary may be corrected; the kernel enforces that too.
+const isIdle = (task: KanbanTask) => task.status !== 'running' && !task.claim_lock && !task.worker_pid
+
+function SummarySection({
+  editable,
+  onSave,
+  summary
+}: {
+  editable: boolean
+  onSave: (summary: string) => void
+  summary: string
+}) {
+  const k = useKanban()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  return (
+    <Section
+      action={
+        editable ? (
+          <Button
+            aria-label={editing ? k.cancelEdit : k.editSummary}
+            onClick={() => {
+              setDraft(summary)
+              setEditing(!editing)
+            }}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name={editing ? 'close' : 'edit'} size="0.75rem" />
+          </Button>
+        ) : undefined
+      }
+      label={k.latestSummary}
+    >
+      {editing ? (
+        <div className="flex flex-col gap-1.5">
+          <Textarea
+            className="min-h-24 text-[0.75rem]"
+            onChange={event => setDraft(event.target.value)}
+            value={draft}
+          />
+          <Button
+            className="self-end"
+            disabled={!draft.trim()}
+            onClick={() => {
+              onSave(draft.trim())
+              setEditing(false)
+            }}
+            size="xs"
+            variant="secondary"
+          >
+            {k.save}
+          </Button>
+        </div>
+      ) : (
+        <TaskMarkdown text={summary} />
+      )}
+    </Section>
+  )
+}
+
 // `latest_summary` is just the newest non-null run summary. A reclaim writes an
 // administrative note into that slot; hide those (Runs still shows them).
 const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\/direct\)$/.test(summary)
@@ -517,14 +656,129 @@ function AttachmentDownload({
   )
 }
 
+// Inline preview is text and Markdown only, picked by filename extension; every
+// other type keeps the download button alone. Bytes come from the host's
+// captured preview reader (same pinned owner as the download), never a guessed
+// path, and are capped for display so a large log can't stall the sidebar.
+const MARKDOWN_EXT = /\.(?:md|markdown)$/i
+const TEXT_EXT = /\.(?:txt|log|json|csv|tsv|ya?ml|toml|ini)$/i
+const PREVIEW_MAX_SIZE = 2 * 1024 * 1024
+const PREVIEW_MAX_CHARS = 100_000
+
+export const attachmentPreviewKind = (filename: string): 'markdown' | 'text' | null =>
+  MARKDOWN_EXT.test(filename) ? 'markdown' : TEXT_EXT.test(filename) ? 'text' : null
+
+export function decodeTextDataUrl(dataUrl: string): string {
+  const comma = dataUrl.indexOf(',')
+
+  if (!/^data:/i.test(dataUrl) || comma < 0) {
+    throw new Error('Not a data URL')
+  }
+
+  const payload = dataUrl.slice(comma + 1)
+
+  if (!/;base64$/i.test(dataUrl.slice(0, comma))) {
+    return decodeURIComponent(payload)
+  }
+
+  const bin = atob(payload)
+
+  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)))
+}
+
+function AttachmentPreview({
+  attachment,
+  kind,
+  onPreview
+}: {
+  attachment: KanbanAttachment
+  kind: 'markdown' | 'text'
+  onPreview: (path: string) => Promise<string>
+}) {
+  const k = useKanban()
+  const path = attachment.stored_path?.trim() ?? ''
+
+  const { data, isError, isPending } = useQuery({
+    queryFn: async () => decodeTextDataUrl(await onPreview(path)),
+    queryKey: ['kanban', 'attachment-preview', attachment.id, path],
+    retry: false,
+    staleTime: 60_000
+  })
+
+  if (isPending) {
+    return <Loader />
+  }
+
+  if (isError) {
+    return <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.previewFailed}</p>
+  }
+
+  const truncated = data.length > PREVIEW_MAX_CHARS
+  const text = truncated ? data.slice(0, PREVIEW_MAX_CHARS) : data
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1" data-testid="kanban-attachment-preview">
+      <div className="max-h-72 overflow-auto rounded-md border border-(--ui-border) p-2 text-[0.75rem]">
+        {kind === 'markdown' ? (
+          <MessageTextContent media={false} text={text} />
+        ) : (
+          <pre className="whitespace-pre-wrap break-words font-mono">{text}</pre>
+        )}
+      </div>
+      {truncated && <p className="text-[0.7rem] text-(--ui-text-quaternary)">{k.previewTruncated}</p>}
+    </div>
+  )
+}
+
+function AttachmentRow({
+  attachment,
+  onDownload,
+  onPreview
+}: {
+  attachment: KanbanAttachment
+  onDownload: (path: string, suggestedName: string) => Promise<void>
+  onPreview?: (path: string) => Promise<string>
+}) {
+  const k = useKanban()
+  const [open, setOpen] = useState(false)
+  const kind = attachmentPreviewKind(attachment.filename)
+  const path = attachment.stored_path?.trim()
+  const tooBig = typeof attachment.size === 'number' && attachment.size > PREVIEW_MAX_SIZE
+  const previewable = Boolean(kind && path && onPreview && !tooBig)
+
+  return (
+    <li className="flex min-w-0 flex-col gap-1 text-[0.75rem] text-(--ui-text-tertiary)">
+      <div className="flex items-center gap-1.5">
+        <AttachmentDownload attachment={attachment} onDownload={onDownload} />
+        {previewable && (
+          <Button
+            aria-expanded={open}
+            aria-label={open ? k.hidePreviewAttachment(attachment.filename) : k.previewAttachment(attachment.filename)}
+            onClick={() => setOpen(value => !value)}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name={open ? 'eye-closed' : 'eye'} size="0.8rem" />
+          </Button>
+        )}
+      </div>
+      {previewable && open && kind && onPreview && (
+        <AttachmentPreview attachment={attachment} kind={kind} onPreview={onPreview} />
+      )}
+    </li>
+  )
+}
+
 function AttachmentsSection({
   attachments,
   onDownload,
+  onPreview,
   onUpload,
   pending
 }: {
   attachments: KanbanAttachment[]
   onDownload: (path: string, suggestedName: string) => Promise<void>
+  onPreview?: (path: string) => Promise<string>
   onUpload: (file: File) => void
   pending: boolean
 }) {
@@ -565,9 +819,7 @@ function AttachmentsSection({
       {attachments.length > 0 ? (
         <ul className="flex flex-col gap-1">
           {attachments.map(attachment => (
-            <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
-              <AttachmentDownload attachment={attachment} onDownload={onDownload} />
-            </li>
+            <AttachmentRow attachment={attachment} key={attachment.id} onDownload={onDownload} onPreview={onPreview} />
           ))}
         </ul>
       ) : (
@@ -689,6 +941,7 @@ function FeedTabs({
   detail,
   log,
   onComment,
+  onEditComment,
   onRequeue,
   running
 }: {
@@ -696,6 +949,7 @@ function FeedTabs({
   detail: KanbanTaskDetail
   log: null | WorkerLog
   onComment: (body: string) => void
+  onEditComment: (id: number | string, body: string) => void
   onRequeue: (body: string) => void
   running: boolean
 }) {
@@ -731,13 +985,7 @@ function FeedTabs({
           {detail.comments.length > 0 && (
             <ul className="flex flex-col gap-3">
               {detail.comments.map(comment => (
-                <li className="flex flex-col gap-0.5" key={comment.id}>
-                  <div className="flex items-baseline gap-2 text-[0.75rem]">
-                    <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
-                    <span className="text-[0.625rem] text-(--ui-text-quaternary)">{ago(comment.created_at)}</span>
-                  </div>
-                  <TaskMarkdown text={comment.body} />
-                </li>
+                <CommentItem comment={comment} key={comment.id} onEdit={onEditComment} pending={commentPending} />
               ))}
             </ul>
           )}
@@ -905,6 +1153,12 @@ export function TaskDrawer({
 
   const commentMut = useMutation({
     mutationFn: (body: string) => addComment(id!, body),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: invalidate
+  })
+
+  const editCommentMut = useMutation({
+    mutationFn: ({ body, cid }: { body: string; cid: number | string }) => editComment(id!, cid, body),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
@@ -1083,9 +1337,11 @@ export function TaskDrawer({
                   )}
 
                   {task.latest_summary && !isAdminSummary(task.latest_summary) && (
-                    <Section label={k.latestSummary}>
-                      <TaskMarkdown text={task.latest_summary} />
-                    </Section>
+                    <SummarySection
+                      editable={isIdle(task)}
+                      onSave={summary => void mutate(() => editSummary(task.id, summary))()}
+                      summary={task.latest_summary}
+                    />
                   )}
 
                   <FeedTabs
@@ -1093,6 +1349,7 @@ export function TaskDrawer({
                     detail={detail}
                     log={log ?? null}
                     onComment={body => commentMut.mutate(body)}
+                    onEditComment={(cid, body) => editCommentMut.mutate({ body, cid })}
                     onRequeue={body => requeueMut.mutate(body)}
                     running={running}
                   />
@@ -1170,6 +1427,7 @@ export function TaskDrawer({
                   <AttachmentsSection
                     attachments={detail.attachments}
                     onDownload={detail.downloadAttachment}
+                    onPreview={detail.previewAttachment}
                     onUpload={file => uploadMut.mutate(file)}
                     pending={uploadMut.isPending}
                   />

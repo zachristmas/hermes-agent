@@ -620,6 +620,40 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_reconciliation_pending(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Retries exhausted and an owner/coordinator reconciliation is queued (``reconciliation_queued``,
+    kanban_settlement.queue_reconciliation) with no unblock, reassign or resolve since. Clears when
+    the card leaves ``blocked`` or any of those happens."""
+    if _task_field(task, "status") != "blocked":
+        return []
+    queued = None
+    for ev in events:
+        kind = _event_kind(ev)
+        if kind == "reconciliation_queued":
+            queued = ev
+        elif kind in {"unblocked", "assigned"}:
+            queued = None
+    if queued is None:
+        return []
+    data = _parse_payload(queued)
+    task_id = _task_field(task, "id")
+    actions = [_cli_hint(f"Read the evidence: hermes kanban log {task_id}", f"hermes kanban log {task_id}",
+                         suggested=True),
+               DiagnosticAction(kind="comment", label="Post the corrected instruction, then unblock once")]
+    if not data.get("holds"):
+        actions.append(DiagnosticAction(kind="unblock", label="Unblock once (after reconciling)"))
+    unmet = "; ".join(data.get("unmet") or [])
+    return [Diagnostic(
+        kind="reconciliation_pending", severity="error",
+        title=f"Retries exhausted; reconciliation queued for {data.get('owner') or 'the owner'}",
+        detail=(f"{data.get('next_action') or ''}"
+                + (f" Unmet: {unmet[:300]}." if unmet else "")
+                + (f" Open holds: {'; '.join(data['holds'])}." if data.get("holds") else "")).strip(),
+        actions=actions, first_seen_at=_event_ts(queued), last_seen_at=_event_ts(queued), count=1,
+        data={"attempts": data.get("attempts") or [], "trigger": data.get("trigger")},
+    )]
+
+
 def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic]:
     """>= cfg["block_cycle_threshold"] (default 3) blocked-after-unblocked
     cycles within cfg["block_cycle_window_seconds"] (default 24h). Complements
@@ -817,6 +851,7 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_running_with_open_parents,
     _rule_stuck_in_blocked,
+    _rule_reconciliation_pending,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
     _rule_stale_running,

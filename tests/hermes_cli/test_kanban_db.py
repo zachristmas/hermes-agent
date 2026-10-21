@@ -270,7 +270,7 @@ def test_stale_claim_reclaim_without_spawn_counts_toward_breaker(kanban_home):
             assert row["consecutive_failures"] == expected
         assert row["status"] == "blocked"
         kinds = [e.kind for e in kb.list_events(conn, t)]
-        assert kinds[-2:] == ["reclaimed", "gave_up"]
+        assert kinds[-3:] == ["reclaimed", "reconciliation_queued", "gave_up"]
 
 
 def test_stale_claim_extend_live_worker_does_not_count_failure(
@@ -562,6 +562,8 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
     failure on the same card still counts."""
     from tools import process_registry
 
+    # The probe is Linux-only (non-Linux hosts never refuse a spawn); pin it so the contract is host-independent.
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True)
     monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", "managed-gateway")
     monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
@@ -602,20 +604,9 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
         ).fetchone()[0] == 1
 
 
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # Complete / block / unblock / archive / assign
 # ---------------------------------------------------------------------------
-
-
-
-
-
 
 
 def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
