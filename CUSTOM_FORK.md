@@ -49,12 +49,18 @@ and affected checks; never force-push:
 ```sh
 git fetch https://github.com/zachristmas/hermes-agent.git stable/hermes
 git merge-base --is-ancestor FETCH_HEAD HEAD
-git push https://github.com/zachristmas/hermes-agent.git HEAD:refs/heads/stable/hermes
+git push git@github.com:zachristmas/hermes-agent.git HEAD:refs/heads/stable/hermes
 git ls-remote https://github.com/zachristmas/hermes-agent.git refs/heads/stable/hermes
 ```
 
 Start new work on a feature branch from the published `stable/hermes` and
 merge reviewed/tested work back through the same publication step.
+
+Publication uses the Mac's existing personal SSH identity (`zachristmas`).
+HTTPS on that host can select the corporate account instead; do not change
+global credentials to work around that. HTTPS fetches and ref readback remain
+valid. Keep push destinations on Zach's fork and verify the authenticated
+account before publishing from another host.
 
 ## Installed checkout alignment and updates
 
