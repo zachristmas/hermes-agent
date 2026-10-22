@@ -389,37 +389,59 @@ class GatewaySlashCommandsMixin(
         return output or t("gateway.kanban.no_output")
 
     async def _kanban_auto_subscribe(self, event: MessageEvent, task_id: str, requested_board) -> bool:
-        """Subscribe the event's chat to *task_id* notifications (notify+wake). False when the
-        source has no platform/chat to route back to."""
+        """Subscribe to the configured board channel, or fall back to the origin chat.
+
+        Board routes are passive notifications. Unmapped boards retain the origin's
+        historical notify+wake behavior. False means there is no routable destination.
+        """
         source = event.source
+        board_slug = str(requested_board or "").strip()
+        board_routes = (getattr(getattr(self, "config", None), "extra", {}) or {}).get("kanban", {})
+        board_routes = board_routes.get("notification_channels", {}) if isinstance(board_routes, dict) else {}
+        board_route = board_routes.get(board_slug, {}) if isinstance(board_routes, dict) and board_slug else {}
+        if not isinstance(board_route, dict):
+            board_route = {}
 
         def _field(name: str) -> Optional[str]:
             return str(getattr(source, name, "") or "") or None
+
         platform = getattr(source, "platform", None)
-        platform_str = (platform.value if hasattr(platform, "value") else str(platform or "")).lower()
-        chat_id, chat_type = _field("chat_id"), _field("chat_type")
-        delivery_metadata = self._reply_metadata(event) or None
-        if isinstance(delivery_metadata, dict) and chat_type:
+        source_platform_str = (platform.value if platform is not None and hasattr(platform, "value") else str(platform or "")).lower()
+        source_chat_id, source_chat_type = _field("chat_id"), _field("chat_type")
+        routed_to_board = bool(board_route.get("chat_id"))
+        platform_str = str(board_route.get("platform") or source_platform_str).lower()
+        chat_id = str(board_route.get("chat_id") or source_chat_id or "") or None
+        chat_type = "channel" if routed_to_board else source_chat_type
+        thread_id = (str(board_route.get("thread_id") or "") or None) if routed_to_board else _field("thread_id")
+        delivery_metadata = (self._reply_metadata(event) or None) if not routed_to_board else None
+        if routed_to_board:
+            delivery_metadata = {}
+            for key in ("guild_id", "parent_chat_id"):
+                value = board_route.get(key)
+                if value:
+                    delivery_metadata[key] = str(value)
+        elif isinstance(delivery_metadata, dict) and chat_type:
             delivery_metadata.setdefault("chat_type", chat_type)
         if not (platform_str and chat_id):
             return False
+        delivery_mode = "notify" if routed_to_board else "notify+wake"
+
+        from hermes_cli import kanban_db_connect as _kbc
+        from hermes_cli import kanban_db_notify as _kbn
 
         def _sub():
-            from hermes_cli import kanban_db as _kb
-            from hermes_cli import kanban_db_connect as _kbc
-            from hermes_cli import kanban_db_notify as _kbn
-            conn = _kbc.connect(board=requested_board)
+            conn = _kbc.connect() if board_slug == "default" else _kbc.connect(board=board_slug)
             try:
                 _kbn.add_notify_sub(
                     conn, task_id=task_id, platform=platform_str, chat_id=chat_id, chat_type=chat_type,
-                    thread_id=_field("thread_id"), user_id=_field("user_id"),
+                    thread_id=thread_id, user_id=_field("user_id"),
                     # Also persist the stable alt id (Signal UUID, Feishu union_id): build_session_key
                     # keys the participant on ``user_id_alt or user_id``, so a replayed wake rebuilds
                     # the same session key only when the alt id survives the round-trip.
                     user_id_alt=_field("user_id_alt"),
                     notifier_profile=_field("profile") or getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                    # Subscribing from chat: deliver the passive message and wake the destination agent.
-                    delivery_mode="notify+wake", delivery_metadata=delivery_metadata)
+                    # Board routes are passive channel notifications; origin subscriptions preserve wake behavior.
+                    delivery_mode=delivery_mode, delivery_metadata=delivery_metadata)
             finally:
                 conn.close()
         await asyncio.to_thread(_sub)

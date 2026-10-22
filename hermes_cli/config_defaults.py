@@ -1893,6 +1893,9 @@ DEFAULT_CONFIG = {
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "auto_subscribe_on_create": True,
+        # Map board slugs to passive notification destinations for tickets created via /kanban.
+        # Unmapped boards keep the origin chat's notify+wake subscription.
+        "notification_channels": {},
         # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
         # not own notification subscriptions to avoid an idle five-second board probe.
         "notify_in_gateway": True,
