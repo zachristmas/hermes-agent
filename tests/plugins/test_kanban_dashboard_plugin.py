@@ -468,6 +468,32 @@ def test_add_comment(client):
     assert comments[0]["body"] == "how's progress?"
     assert comments[0]["author"] == "teknium"
 
+
+def test_comment_author_persists_and_signs_default_comments(client):
+    """A stored display name signs bare dashboard comments and survives restarts."""
+    r = client.put("/api/plugins/kanban/comment-author", json={"body": "Zach"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "author": "Zach"}
+    assert client.get("/api/plugins/kanban/comment-author").json() == {"author": "Zach"}
+
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "y"}).json()["task"]
+    client.post(f"/api/plugins/kanban/tasks/{t['id']}/comments", json={"body": "from the drawer"})
+    comments = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["comments"]
+    assert comments[0]["author"] == "Zach"
+
+    # An explicit author always wins over the stored display name.
+    t2 = client.post("/api/plugins/kanban/tasks", json={"title": "z"}).json()["task"]
+    client.post(
+        f"/api/plugins/kanban/tasks/{t2['id']}/comments",
+        json={"body": "explicit", "author": "Axiom"},
+    )
+    comments2 = client.get(f"/api/plugins/kanban/tasks/{t2['id']}").json()["comments"]
+    assert comments2[0]["author"] == "Axiom"
+
+    # Clearing the name reverts to the bare "dashboard" fallback.
+    client.put("/api/plugins/kanban/comment-author", json={"body": ""})
+    assert client.get("/api/plugins/kanban/comment-author").json() == {"author": ""}
+
 # ---------------------------------------------------------------------------
 # Dispatch nudge
 # ---------------------------------------------------------------------------

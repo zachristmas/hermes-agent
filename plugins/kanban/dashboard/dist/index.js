@@ -3531,19 +3531,25 @@
     // Ready/Block/Complete buttons feel like no-ops.  See #26744.
     const [patchErr, setPatchErr] = useState(null);
     const [newComment, setNewComment] = useState("");
-    // Display name for comments, persisted per browser. Sent as the comment
-    // author so board-channel pings show who wrote it instead of "dashboard".
-    const COMMENT_AUTHOR_LS_KEY = "hermesKanbanCommentAuthor";
-    const [commentAuthor, setCommentAuthor] = useState(function () {
-      try { return window.localStorage.getItem(COMMENT_AUTHOR_LS_KEY) || ""; }
-      catch (e) { return ""; }
-    });
+    // Display name for comments, persisted server-side (dashboard_settings.json)
+    // so it survives browsers and machines. Sent as the comment author so board
+    // notifications show who wrote it instead of "dashboard".
+    const [commentAuthor, setCommentAuthor] = useState("");
+    const commentAuthorLoaded = useRef(false);
+    useEffect(function () {
+      if (commentAuthorLoaded.current) return;
+      commentAuthorLoaded.current = true;
+      SDK.fetchJSON(`${API}/comment-author`, {})
+        .then(function (d) { setCommentAuthor(d.author || ""); })
+        .catch(function () { /* endpoint optional on older gateways */ });
+    }, []);
     function saveCommentAuthor(name) {
       setCommentAuthor(name);
-      try {
-        if (name) window.localStorage.setItem(COMMENT_AUTHOR_LS_KEY, name);
-        else window.localStorage.removeItem(COMMENT_AUTHOR_LS_KEY);
-      } catch (e) { /* storage unavailable: keep in-memory only */ }
+      SDK.fetchJSON(`${API}/comment-author`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: name }),
+      }).catch(function () { /* keep in-memory value if the save fails */ });
     }
     const [uploadBusy, setUploadBusy] = useState(false);
     const [uploadErr, setUploadErr] = useState(null);

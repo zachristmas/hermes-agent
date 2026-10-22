@@ -832,6 +832,54 @@ class CommentBody(BaseModel):
     author: Optional[str] = "dashboard"
 
 
+def _dashboard_settings_path() -> Path:
+    """Server-side persistence for dashboard UI settings (one shared JSON doc)."""
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()) / "kanban" / "dashboard_settings.json"
+
+
+def _read_dashboard_settings() -> dict:
+    try:
+        import json
+        return json.loads(_dashboard_settings_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_dashboard_settings(settings: dict) -> None:
+    import json
+
+    path = _dashboard_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+
+def _stored_comment_author() -> str:
+    return str(_read_dashboard_settings().get("comment_author") or "")
+
+
+@router.get("/comment-author")
+def get_comment_author():
+    """The persisted display name used to sign dashboard comments."""
+    return {"author": _stored_comment_author()}
+
+
+@router.put("/comment-author")
+def set_comment_author(payload: CommentBody):
+    """Persist the display name so it survives browsers and machines."""
+    name = (payload.body or "").strip()
+    if len(name) > 80:
+        raise HTTPException(status_code=400, detail="author is too long (max 80 chars)")
+    settings = _read_dashboard_settings()
+    if name:
+        settings["comment_author"] = name
+    else:
+        settings.pop("comment_author", None)
+    _write_dashboard_settings(settings)
+    return {"ok": True, "author": name}
+
+
 @router.post("/tasks/{task_id}/comments")
 def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query(None)):
     if not payload.body.strip():
@@ -840,7 +888,12 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
         _require_task(conn, task_id)
         # The UI surface (dashboard + desktop drawer) is the human channel: its comments are
         # queued for the assignee's reply. ``author`` is client-supplied, so provenance is not.
-        kanban_db.add_comment(conn, task_id, author=payload.author or "dashboard", body=payload.body, source="dashboard")
+        # A bare "dashboard" author falls back to the persisted display name so board
+        # notifications show who commented instead of a generic label.
+        author = (payload.author or "").strip()
+        if not author or author == "dashboard":
+            author = _stored_comment_author() or author or "dashboard"
+        kanban_db.add_comment(conn, task_id, author=author, body=payload.body, source="dashboard")
         return {"ok": True}
 
 
