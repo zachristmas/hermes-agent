@@ -406,26 +406,45 @@ def _fmt_completed(ev, n) -> tuple:
 
 
 def _fmt_commented(ev, n) -> tuple:
+    """Render only human comments, reading text from the canonical comment row."""
     payload = ev.payload or {}
-    author = _safe_review_reason(payload.get("author"), 48) or "someone"
+    if payload.get("source"):
+        return "", None, None
     comment_id = payload.get("comment_id")
-    body = ""
+    author = _safe_review_reason(payload.get("author"), 48)
+    if not author or re.search(r"(?i)(hermes|worker|dispatcher|system|gateway|agent|bot)", author):
+        return "", None, None
+    if comment_id is None:
+        return t("gateway.kanban.ping.comment_missing", head=n.head, author=author), None, None
     try:
-        from hermes_cli import kanban_db_connect as kbc
-        from hermes_cli.kanban_db import pin_first_board_resolution
-        with pin_first_board_resolution():
-            conn = kbc.connect(board=n.board_slug)
+        comment_id = int(comment_id)
+    except (TypeError, ValueError, OverflowError):
+        return t("gateway.kanban.ping.comment_missing", head=n.head, author=author), None, None
+    try:
+        from hermes_cli import kanban_db_connect
+
+        with _pin_first():
+            conn = kanban_db_connect.connect(board=n.board_slug)
             try:
                 row = conn.execute(
-                    "SELECT body FROM task_comments WHERE id = ? AND task_id = ?",
-                    (comment_id, n.task_id),
-                ).fetchone() if comment_id is not None else None
+                    "SELECT body FROM task_comments WHERE id=? AND task_id=?",
+                    (int(comment_id), n.task_id),
+                ).fetchone()
             finally:
                 conn.close()
-        if row:
-            body = _safe_review_reason(row["body"], 240)
     except Exception as exc:
-        logger.debug("kanban notifier: could not load comment %s for %s: %s", comment_id, n.task_id, exc)
+        logger.warning("kanban notifier: could not load comment %s for %s: %s", comment_id, n.task_id, exc)
+        row = None
+    if row is None:
+        return t("gateway.kanban.ping.comment_missing", head=n.head, author=author), None, None
+    from agent.redact import redact_sensitive_text
+
+    body = redact_sensitive_text(str(row["body"] or ""), force=True, redact_url_credentials=True)
+    body = re.sub(r"(?i)\b(token|api[_-]?key|password|secret)\s*[:=]\s*\S+", r"\1=[redacted]", body)
+    body = re.sub(r"(?i)\b(token|api[_-]?key|password|secret)\s*=\[redacted\]", "[redacted]", body)
+    body = " ".join(_LOCAL_PATH_RE.sub("[local path]", body).split())[:500]
+    if not body:
+        return t("gateway.kanban.ping.comment_missing", head=n.head, author=author), None, None
     return t("gateway.kanban.ping.commented", head=n.head, author=author, body=body), None, None
 
 
@@ -760,7 +779,7 @@ class _KanbanNotification:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
         for ev in self.d["events"]:
             msg = self.format_event(ev)
-            if msg is None:
+            if msg is None or not msg:
                 continue
             # Non-push adapters (api_server) always report SendResult(success=False)
             # from send(); treating that as failure would drop the sub forever and

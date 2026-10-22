@@ -104,11 +104,28 @@ def test_comment_event_is_delivered_to_board_subscriber(tmp_path, monkeypatch):
     assert "Please check the live delivery." in adapter.sent[0]["text"]
 
 
-def test_comment_event_notification_truncates_long_comment(tmp_path, monkeypatch):
-    """Comment notifications remain bounded for long Markdown bodies."""
+def test_comment_notification_suppresses_machine_authored_events(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comment-machine.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="machine comment", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_comment(conn, tid, author="hermes-bot", body="internal worker note")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == []
+
+
+def test_comment_event_notification_truncates_and_redacts_long_comment(tmp_path, monkeypatch):
+    """Comment notifications redact likely secrets and bound long bodies."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comment-notify-long.db"))
     kb.init_db()
-    body = "x" * 5000
+    body = "token=" + "x" * 700
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="large comment", assignee="worker")
@@ -122,8 +139,10 @@ def test_comment_event_notification_truncates_long_comment(tmp_path, monkeypatch
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert len(adapter.sent[0]["text"]) < 1000
-    assert "x" * 300 not in adapter.sent[0]["text"]
+    text = adapter.sent[0]["text"]
+    assert "token=" not in text
+    assert "x" * 700 not in text
+    assert len(text) < 700
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
