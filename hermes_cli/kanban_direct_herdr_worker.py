@@ -87,6 +87,7 @@ _DEFAULT_KIND = "claude"
 _CLI_TIMEOUT_S = 30
 _AGENT_START_TIMEOUT_S = 90
 _AGENT_PROMPT_TIMEOUT_S = 45
+_PROMPT_DELIVERY_GRACE_S = 45
 _AGENT_WAIT_TIMEOUT_S = 600
 # One ``agent wait`` slice is bounded by _AGENT_WAIT_TIMEOUT_S. A live agent that is still working
 # at the end of a slice is observed again (heartbeating the claim between slices) until this overall
@@ -729,10 +730,21 @@ def prompt_agent(name: str, text: str, *, machine_id: Optional[str] = None) -> N
         if exc.code == "agent_blocked":
             raise AgentBlockedError(f"agent {name} is already blocked on a dialog: {exc}") from exc
         if exc.code in ("agent_prompt_stalled", "timeout"):
-            status = agent_status(name, machine_id=machine_id)
-            if status in ("blocked", "busy", "working", "running"):
-                return  # delivered -- this call's job (handing the prompt off) is done
-            raise BridgeError(f"agent {name} prompt could not be confirmed delivered ({exc.code})") from exc
+            # rpi (GLM high reasoning) can sit in its first thinking pass long enough that no
+            # working-state report lands within herdr's 5s stall window, and its dylib reports
+            # ``done`` (not ``working``) once a short turn completes. Poll through a grace window
+            # instead of a single re-check; any of these states proves the prompt was delivered.
+            deadline = time.monotonic() + _PROMPT_DELIVERY_GRACE_S
+            while True:
+                status = agent_status(name, machine_id=machine_id)
+                if status in ("blocked", "busy", "working", "running", "done"):
+                    return  # delivered -- this call's job (handing the prompt off) is done
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(3)
+            raise BridgeError(
+                f"agent {name} prompt could not be confirmed delivered ({exc.code})"
+            ) from exc
         raise
 
 
