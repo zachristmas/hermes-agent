@@ -862,3 +862,48 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_board_channel_subscription_delivers_without_waking_origin_dm(
+    tmp_path, monkeypatch,
+):
+    """A routed board-channel subscription — the shape the origin auto-subscribe
+    writes when the creating chat differs from the board's configured
+    notification channel — delivers status pings to the channel and never wakes
+    the creating DM."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board-channel-route.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="tolaria migration",
+            assignee="worker",
+            session_id="agent:main:discord:dm:dm-123",  # creating DM provenance
+        )
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="board-channel-1",
+            chat_type="channel",
+            delivery_mode="notify",
+            delivery_metadata={"guild_id": "guild-1"},
+        )
+        kb.block_task(conn, tid, reason="needs attention")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "board-channel-1", (
+        "the passive ping must land on the board channel, not the creating DM"
+    )
+    assert tid in adapter.sent[0]["text"]
+    assert adapter.handled == [], (
+        "a routed board-channel subscription must not wake the origin DM"
+    )

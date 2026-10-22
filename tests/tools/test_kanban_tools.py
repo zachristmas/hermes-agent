@@ -1191,6 +1191,75 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def _write_channel_config(tmp_path, monkeypatch, slug, channel):
+    """Fresh HERMES_HOME whose config maps one board to a notification channel."""
+    home = tmp_path / "route-home" / ".hermes"
+    home.mkdir(parents=True)
+    body = f"      chat_id: {channel['chat_id']}\n"
+    if channel.get("guild_id"):
+        body += f"      guild_id: {channel['guild_id']}\n"
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  notification_channels:\n"
+        f"    {slug}:\n"
+        f"{body}"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+
+def test_create_routes_subscription_to_board_notification_channel(monkeypatch, worker_env, tmp_path):
+    """A board with a kanban.notification_channels entry gets the origin subscription
+    on the configured channel (chat_type=channel, passive notify) instead of the
+    creating DM — the DM must not be woken by the card's status changes."""
+    from tools import kanban_tools as kt
+    _write_channel_config(tmp_path, monkeypatch, "default",
+                          {"chat_id": 1562634275478831144, "guild_id": 1557800413682597888})
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "dm-123")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+    for var in ("HERMES_SESSION_THREAD_ID", "HERMES_SESSION_USER_ID",
+                "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    out = kt._handle_create({"title": "routed card", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["platform"] == "discord"
+    assert s["chat_id"] == "1562634275478831144", "numeric YAML ids must route like strings"
+    assert s["chat_type"] == "channel"
+    assert s["delivery_mode"] == "notify"
+    assert s["delivery_metadata"]["guild_id"] == "1557800413682597888"
+
+
+def test_create_keeps_notify_wake_when_origin_is_board_channel(monkeypatch, worker_env, tmp_path):
+    """When the creating chat IS the configured board channel, today's behavior is
+    already right: the origin subscription keeps notify+wake on that chat."""
+    from tools import kanban_tools as kt
+    _write_channel_config(tmp_path, monkeypatch, "default", {"chat_id": "board-channel-1"})
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "board-channel-1")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "channel")
+    for var in ("HERMES_SESSION_THREAD_ID", "HERMES_SESSION_USER_ID",
+                "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    out = kt._handle_create({"title": "channel-origin card", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["chat_id"] == "board-channel-1"
+    assert s["delivery_mode"] == "notify+wake"
+
+
 def test_create_tui_subscription_binds_to_live_session_after_compaction_fork(monkeypatch, worker_env, tmp_path):
     """#110068: the inherited HERMES_SESSION_KEY can name a session already superseded
     by a compaction fork. Auto-subscribe must bind to the live continuation tip resolved
