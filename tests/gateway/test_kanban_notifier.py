@@ -104,7 +104,8 @@ def test_comment_event_is_delivered_to_board_subscriber(tmp_path, monkeypatch):
     assert "Please check the live delivery." in adapter.sent[0]["text"]
 
 
-def test_comment_notification_suppresses_machine_authored_events(tmp_path, monkeypatch):
+def test_comment_notification_delivers_machine_authored_events(tmp_path, monkeypatch):
+    """Every comment reaches the channel, machine-authored ones included."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comment-machine.db"))
     kb.init_db()
     conn = kbc.connect()
@@ -118,7 +119,9 @@ def test_comment_notification_suppresses_machine_authored_events(tmp_path, monke
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
-    assert adapter.sent == []
+    assert len(adapter.sent) == 1
+    assert "hermes-bot" in adapter.sent[0]["text"]
+    assert "internal worker note" in adapter.sent[0]["text"]
 
 
 def test_comment_event_notification_truncates_and_redacts_long_comment(tmp_path, monkeypatch):

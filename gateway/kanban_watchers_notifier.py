@@ -406,14 +406,10 @@ def _fmt_completed(ev, n) -> tuple:
 
 
 def _fmt_commented(ev, n) -> tuple:
-    """Render only human comments, reading text from the canonical comment row."""
+    """Render every comment, reading text from the canonical comment row."""
     payload = ev.payload or {}
-    if payload.get("source"):
-        return "", None, None
     comment_id = payload.get("comment_id")
-    author = _safe_review_reason(payload.get("author"), 48)
-    if not author or re.search(r"(?i)(hermes|worker|dispatcher|system|gateway|agent|bot)", author):
-        return "", None, None
+    author = _safe_review_reason(payload.get("author"), 48) or "someone"
     if comment_id is None:
         return t("gateway.kanban.ping.comment_missing", head=n.head, author=author), None, None
     try:
