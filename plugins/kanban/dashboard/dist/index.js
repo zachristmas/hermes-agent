@@ -3531,6 +3531,20 @@
     // Ready/Block/Complete buttons feel like no-ops.  See #26744.
     const [patchErr, setPatchErr] = useState(null);
     const [newComment, setNewComment] = useState("");
+    // Display name for comments, persisted per browser. Sent as the comment
+    // author so board-channel pings show who wrote it instead of "dashboard".
+    const COMMENT_AUTHOR_LS_KEY = "hermesKanbanCommentAuthor";
+    const [commentAuthor, setCommentAuthor] = useState(function () {
+      try { return window.localStorage.getItem(COMMENT_AUTHOR_LS_KEY) || ""; }
+      catch (e) { return ""; }
+    });
+    function saveCommentAuthor(name) {
+      setCommentAuthor(name);
+      try {
+        if (name) window.localStorage.setItem(COMMENT_AUTHOR_LS_KEY, name);
+        else window.localStorage.removeItem(COMMENT_AUTHOR_LS_KEY);
+      } catch (e) { /* storage unavailable: keep in-memory only */ }
+    }
     const [uploadBusy, setUploadBusy] = useState(false);
     const [uploadErr, setUploadErr] = useState(null);
     const [editing, setEditing] = useState(false);
@@ -3573,7 +3587,7 @@
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/comments`, boardSlug), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify(commentAuthor.trim() ? { body, author: commentAuthor.trim() } : { body }),
       }).then(function () {
         setNewComment("");
         load();
@@ -3869,6 +3883,14 @@
               "Comments reach the worker on its next run or kanban_show() — no need to block the task first."),
           ),
           h("div", { className: "hermes-kanban-drawer-comment-row" },
+            h(Input, {
+              value: commentAuthor,
+              onChange: function (e) { saveCommentAuthor(e.target.value); },
+              placeholder: tx(t, "commentAuthorPlaceholder", "Your name"),
+              title: tx(t, "commentAuthorTitle",
+                "Shown as the author on comments and board notifications. Saved in this browser."),
+              className: "h-8 text-sm w-28 shrink-0",
+            }),
             h(Input, {
               value: newComment,
               onChange: function (e) { setNewComment(e.target.value); },
