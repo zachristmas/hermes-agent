@@ -44,7 +44,7 @@ def _pin_first():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested",
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "commented",
                   # Lifecycle enforcement (hermes_cli/kanban_settlement.py): holds that need an operator.
                   "recovery_hold_escalated", "settlement_escalated", "operator_pause", "reconciliation_escalated")
 # Kinds that hand a decision back to the origin, which must take a turn.
@@ -405,6 +405,30 @@ def _fmt_completed(ev, n) -> tuple:
     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
 
+def _fmt_commented(ev, n) -> tuple:
+    payload = ev.payload or {}
+    author = _safe_review_reason(payload.get("author"), 48) or "someone"
+    comment_id = payload.get("comment_id")
+    body = ""
+    try:
+        from hermes_cli import kanban_db_connect as kbc
+        from hermes_cli.kanban_db import pin_first_board_resolution
+        with pin_first_board_resolution():
+            conn = kbc.connect(board=n.board_slug)
+            try:
+                row = conn.execute(
+                    "SELECT body FROM task_comments WHERE id = ? AND task_id = ?",
+                    (comment_id, n.task_id),
+                ).fetchone() if comment_id is not None else None
+            finally:
+                conn.close()
+        if row:
+            body = _safe_review_reason(row["body"], 240)
+    except Exception as exc:
+        logger.debug("kanban notifier: could not load comment %s for %s: %s", comment_id, n.task_id, exc)
+    return t("gateway.kanban.ping.commented", head=n.head, author=author, body=body), None, None
+
+
 def _fmt_review_requested(ev, n) -> tuple:
     # Implementation done; task moved to the review lane. Carry the handoff
     # into the wake turn like ``completed`` so the reviewer needn't re-read the board.
@@ -493,6 +517,7 @@ def _fmt_timed_out(ev, n) -> tuple:
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
     "completed": _fmt_completed,
+    "commented": _fmt_commented,
     "blocked": lambda ev, n: (
         t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
         None, None,
