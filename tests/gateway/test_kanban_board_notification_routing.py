@@ -6,8 +6,8 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
-from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.session import SessionSource
+from gateway.slash_commands import GatewaySlashCommandsMixin
 from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kbn
 
 
@@ -23,11 +23,9 @@ async def test_board_destination_overrides_origin_and_uses_notify_only(tmp_path,
     runner = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
     runner._reply_metadata = lambda event: None
     runner._active_profile_name = lambda: "default"
-    runner.config = SimpleNamespace(extra={"kanban": {
-        "notification_channels": {"connect": {
-            "platform": "discord", "chat_id": "board-channel", "guild_id": "guild",
-        }},
-    }})
+    runner.config = SimpleNamespace(extra={"kanban": {"notification_channels": {
+        "connect": {"platform": "discord", "chat_id": "board-channel", "guild_id": "guild"},
+    }}})
     source = SessionSource(
         platform=Platform.DISCORD, chat_id="origin-dm", chat_type="dm", user_id="user",
         profile="default", scope_id="guild",

@@ -396,9 +396,19 @@ class GatewaySlashCommandsMixin(
         """
         source = event.source
         board_slug = str(requested_board or "").strip()
-        board_routes = (getattr(getattr(self, "config", None), "extra", {}) or {}).get("kanban", {})
-        board_routes = board_routes.get("notification_channels", {}) if isinstance(board_routes, dict) else {}
-        board_route = board_routes.get(board_slug, {}) if isinstance(board_routes, dict) and board_slug else {}
+        config = getattr(self, "config", None)
+        if config is not None:
+            config = getattr(config, "extra", {}) or {}
+        else:
+            from gateway.run import _load_gateway_config
+            config = _load_gateway_config()
+        board_routes = config.get("kanban", {}) if isinstance(config, dict) else {}
+        if not isinstance(board_routes, dict):
+            board_routes = {}
+        notification_channels = board_routes.get("notification_channels", {})
+        if not isinstance(notification_channels, dict):
+            notification_channels = {}
+        board_route = notification_channels.get(board_slug, {}) if board_slug else {}
         if not isinstance(board_route, dict):
             board_route = {}
 
