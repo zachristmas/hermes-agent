@@ -1,6 +1,5 @@
 """Tests for per-board passive Kanban notification routing."""
 
-import asyncio
 from types import SimpleNamespace
 
 import pytest
