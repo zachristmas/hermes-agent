@@ -635,6 +635,14 @@ def _herdr_agent_args(kind: str, model: str, effort: str) -> list[str]:
         return args
     if kind == "claude":
         return ["--model", model, "--effort", effort, "--dangerously-skip-permissions"]
+    if kind == "rpi":
+        # rpi accepts ``--model <pattern>[:<thinking>]``; its own config supplies
+        # the provider default when the board entry names a bare model id.
+        args = []
+        if model:
+            spec = f"{model}:{effort}" if effort else model
+            args += ["--model", spec]
+        return args
     return []
 
 

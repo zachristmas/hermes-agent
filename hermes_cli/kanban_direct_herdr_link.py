@@ -31,6 +31,10 @@ from typing import Callable, Optional
 _IDENTITY_WAIT_S = 20.0
 _IDENTITY_POLL_S = 0.5
 REF_TYPE = "herdr"
+# Harnesses whose current builds cannot report a native session id. They still
+# link by name, pane, and live kanban tags; continuation resumes the pane, not a
+# native session. Remove a label here once its harness reports sessions.
+_SESSIONLESS_AGENT_LABELS = {"rpi"}
 
 
 class LinkError(RuntimeError):
@@ -81,7 +85,8 @@ def resolve_executor(
         info = agent_info(name)
         if info is None:
             raise LinkError(f"agent {name} is not present")
-        if _native_session(info) or time.monotonic() >= deadline:
+        sessionless = str(info.get("agent") or "").lower() in _SESSIONLESS_AGENT_LABELS
+        if _native_session(info) or sessionless or time.monotonic() >= deadline:
             break
         time.sleep(_IDENTITY_POLL_S)
     if info.get("pane_id") not in (None, pane_id):
@@ -97,7 +102,7 @@ def resolve_executor(
     if any(listed_tokens.get(k) != v for k, v in want.items()):
         raise LinkError(f"pane {pane_id} is listed with tags {listed_tokens!r}, not {want!r}")
     native = _native_session(info)
-    if not native:
+    if not native and str(info.get("agent") or "").lower() not in _SESSIONLESS_AGENT_LABELS:
         raise LinkError(f"agent {name} has not reported its native session id after {wait_s:.0f}s")
     return Executor(
         host=socket.gethostname().split(".")[0], session=herdr_session(),
