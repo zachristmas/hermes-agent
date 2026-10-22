@@ -734,11 +734,18 @@ def prompt_agent(name: str, text: str, *, machine_id: Optional[str] = None) -> N
             # working-state report lands within herdr's 5s stall window, and its dylib reports
             # ``done`` (not ``working``) once a short turn completes. Poll through a grace window
             # instead of a single re-check; any of these states proves the prompt was delivered.
+            # The dylib also stays ``idle`` through whole thinking passes while the TUI already
+            # shows its Working spinner, so pane text is admissible delivery evidence too.
             deadline = time.monotonic() + _PROMPT_DELIVERY_GRACE_S
             while True:
                 status = agent_status(name, machine_id=machine_id)
                 if status in ("blocked", "busy", "working", "running", "done"):
                     return  # delivered -- this call's job (handing the prompt off) is done
+                try:
+                    if re.search(r"Working[….]| to interrupt\)", read_agent(name, machine_id=machine_id)):
+                        return
+                except (HerdrCliError, BridgeError):
+                    pass  # unreadable pane: keep polling status until the grace window closes
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(3)
