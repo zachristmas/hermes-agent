@@ -82,6 +82,50 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def test_comment_event_is_delivered_to_board_subscriber(tmp_path, monkeypatch):
+    """Human-readable comments should reach passive board subscribers."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comment-notify.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="review comment", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_comment(conn, tid, author="Zach", body="Please check the live delivery.")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "Zach" in adapter.sent[0]["text"]
+    assert "Please check the live delivery." in adapter.sent[0]["text"]
+
+
+def test_comment_event_notification_truncates_long_comment(tmp_path, monkeypatch):
+    """Comment notifications remain bounded for long Markdown bodies."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comment-notify-long.db"))
+    kb.init_db()
+    body = "x" * 5000
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="large comment", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_comment(conn, tid, author="Zach", body=body)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.sent[0]["text"]) < 1000
+    assert "x" * 300 not in adapter.sent[0]["text"]
+
+
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
