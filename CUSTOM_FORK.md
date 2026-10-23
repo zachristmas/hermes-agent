@@ -1,6 +1,6 @@
 # Zach's Hermes branch
 
-`stable/hermes` on <https://github.com/zachristmas/hermes-agent> is the shared
+`direct-herdr-dispatch-fold-in` on <https://github.com/zachristmas/hermes-agent> is the shared
 Mac/Windows source branch. Official updates come from
 <https://github.com/NousResearch/hermes-agent>, branch `main`.
 
@@ -22,7 +22,7 @@ expected branch or remotes differ. Do not merge feature branches wholesale.
 
 ```sh
 git remote -v
-git fetch https://github.com/zachristmas/hermes-agent.git stable/hermes
+git fetch https://github.com/zachristmas/hermes-agent.git direct-herdr-dispatch-fold-in
 git worktree add -b integration/upstream-YYYYMMDD /path/to/maintenance FETCH_HEAD
 cd /path/to/maintenance
 git fetch https://github.com/NousResearch/hermes-agent.git main
@@ -47,13 +47,13 @@ an ancestor of the tested merge. A concurrent update requires reconciliation
 and affected checks; never force-push:
 
 ```sh
-git fetch https://github.com/zachristmas/hermes-agent.git stable/hermes
+git fetch https://github.com/zachristmas/hermes-agent.git direct-herdr-dispatch-fold-in
 git merge-base --is-ancestor FETCH_HEAD HEAD
-git push git@github.com:zachristmas/hermes-agent.git HEAD:refs/heads/stable/hermes
-git ls-remote https://github.com/zachristmas/hermes-agent.git refs/heads/stable/hermes
+git push git@github.com:zachristmas/hermes-agent.git HEAD:refs/heads/direct-herdr-dispatch-fold-in
+git ls-remote https://github.com/zachristmas/hermes-agent.git refs/heads/direct-herdr-dispatch-fold-in
 ```
 
-Start new work on a feature branch from the published `stable/hermes` and
+Start new work on a feature branch from the published `direct-herdr-dispatch-fold-in` and
 merge reviewed/tested work back through the same publication step.
 
 Publication uses the Mac's existing personal SSH identity (`zachristmas`).
@@ -67,7 +67,7 @@ account before publishing from another host.
 On each host independently, require a clean checkout, record its HEAD and
 create a uniquely named recovery ref before changing the installed branch.
 Keep `origin` pointed at Zach's fork and `upstream` at the official repository.
-Fetch the fork and fast-forward `stable/hermes` to the exact published SHA;
+Fetch the fork and fast-forward `direct-herdr-dispatch-fold-in` to the exact published SHA;
 never discard local commits or use `reset --hard` on an installed checkout.
 If the branch is already checked out in a maintenance worktree, release that
 worktree's branch by detaching it first, preserving its commit and files.
@@ -78,10 +78,21 @@ configuration. The updater behavior has a disposable-checkout contract in
 when updating this custom source install:
 
 ```sh
-hermes update --branch stable/hermes
+hermes update --branch direct-herdr-dispatch-fold-in
 ```
 
-`stable/hermes` is a Git branch, not the official `stable` release channel.
+Persist each local branch's Git upstream as
+`origin/direct-herdr-dispatch-fold-in`, with `origin` pointing at Zach's fork.
+Keep both hosts on the same published SHA; reconcile changes in an independent
+maintenance checkout before publication. Local tracking metadata and
+`updates.parked_branch_strategy` do not persist a custom target for the CLI
+updater. Always include the explicit `--branch direct-herdr-dispatch-fold-in`
+argument in checks and updates, including existing automation. Without it,
+the inspected CLI selects the configured channel (main selects main), and
+`update_in_place` can merge that target into the custom branch. A passive
+Desktop/source check following the checkout is a separate behavior.
+
+`direct-herdr-dispatch-fold-in` is a Git branch, not the official `stable` release channel.
 Do not select the official stable channel as a substitute for this branch.
 Check the per-install update record and effective parked-branch strategy on
 both hosts; never copy configuration, databases, sessions or credentials
