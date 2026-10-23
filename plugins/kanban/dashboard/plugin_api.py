@@ -414,6 +414,15 @@ def get_task(
             "runs": [asdict(r) for r in kanban_db.list_runs(conn, task_id, state_type=run_state_type, state_name=run_state_name)]}
 
 
+@router.get("/tasks/{task_id}/refs")
+def list_task_refs_endpoint(task_id: str, board: Optional[str] = Query(None)):
+    """The task's typed references (``task_refs`` rows: herdr panes, branches, tickets, …).
+    The desktop drawer's Herdr pane section reads the ``herdr`` rows."""
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        return {"refs": kanban_db.list_task_refs(conn, task_id)}
+
+
 # --- POST /tasks ------------------------------------------------------------
 
 class CreateTaskBody(BaseModel):

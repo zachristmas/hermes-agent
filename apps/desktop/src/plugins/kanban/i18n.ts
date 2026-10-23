@@ -123,6 +123,17 @@ type KanbanMessages = {
   metaCreatedBy: string
   metaCreated: string
   metaWorkerPid: string
+  /** Linked Herdr pane (herdr task_refs): the drawer section + its row labels. */
+  herdrPane: string
+  herdrHost: string
+  herdrSession: string
+  herdrTab: string
+  herdrPaneId: string
+  herdrAgent: string
+  herdrRun: string
+  herdrNative: string
+  herdrReported: string
+  herdrNotReported: string
   /** #124391 — blocked-card detail: why it blocked and what it cost. */
   blockKindTip: (kind: string) => string
   blockReason: string
@@ -356,6 +367,16 @@ export const en: KanbanMessages = {
   metaCreatedBy: 'Created by',
   metaCreated: 'Created',
   metaWorkerPid: 'Worker pid',
+  herdrPane: 'Herdr pane',
+  herdrHost: 'Host',
+  herdrSession: 'Session',
+  herdrTab: 'Tab',
+  herdrPaneId: 'Pane',
+  herdrAgent: 'Agent',
+  herdrRun: 'Run',
+  herdrNative: 'Native session',
+  herdrReported: 'reported',
+  herdrNotReported: 'not reported',
   blockKindTip: kind =>
     kind === 'needs_input'
       ? 'The worker asked for human input.'
@@ -590,6 +611,16 @@ const ja: KanbanMessages = {
   metaCreatedBy: '作成者',
   metaCreated: '作成',
   metaWorkerPid: 'ワーカー PID',
+  herdrPane: 'Herdr ペイン',
+  herdrHost: 'ホスト',
+  herdrSession: 'セッション',
+  herdrTab: 'タブ',
+  herdrPaneId: 'ペイン',
+  herdrAgent: 'エージェント',
+  herdrRun: 'ラン',
+  herdrNative: 'ネイティブセッション',
+  herdrReported: '報告済み',
+  herdrNotReported: '未報告',
   blockKindTip: kind =>
     kind === 'needs_input'
       ? 'ワーカーが人間の入力を求めています。'
@@ -823,6 +854,16 @@ const zh: KanbanMessages = {
   metaCreatedBy: '创建者',
   metaCreated: '创建于',
   metaWorkerPid: '工作单元 PID',
+  herdrPane: 'Herdr 窗格',
+  herdrHost: '主机',
+  herdrSession: '会话',
+  herdrTab: '标签页',
+  herdrPaneId: '窗格',
+  herdrAgent: '代理',
+  herdrRun: '运行',
+  herdrNative: '原生会话',
+  herdrReported: '已上报',
+  herdrNotReported: '未上报',
   blockKindTip: kind =>
     kind === 'needs_input'
       ? '工作单元正在等待人工输入。'
@@ -1054,6 +1095,16 @@ const zhHant: KanbanMessages = {
   metaCreatedBy: '建立者',
   metaCreated: '建立於',
   metaWorkerPid: '工作單元 PID',
+  herdrPane: 'Herdr 窗格',
+  herdrHost: '主機',
+  herdrSession: '會話',
+  herdrTab: '標籤頁',
+  herdrPaneId: '窗格',
+  herdrAgent: '代理',
+  herdrRun: '執行',
+  herdrNative: '原生會話',
+  herdrReported: '已上報',
+  herdrNotReported: '未上報',
   blockKindTip: kind =>
     kind === 'needs_input'
       ? '工作單元正在等待人工輸入。'

@@ -14,9 +14,9 @@ import { registerPluginLocales } from '@/i18n/plugin-i18n'
 import { $notifications, clearNotifications } from '@/store/notifications'
 
 import { bindApi, taskKey } from './api'
-import { TaskDrawer } from './drawer'
+import { parseHerdrRef, TaskDrawer } from './drawer'
 import { en, KANBAN_LOCALES } from './i18n'
-import type { KanbanTaskDetail } from './types'
+import type { KanbanTaskDetail, KanbanTaskRef } from './types'
 
 vi.mock('@/hermes', () => ({ setApiRequestProfile: vi.fn() }))
 
@@ -29,6 +29,8 @@ const legacyDetail: Omit<KanbanTaskDetail, 'attachments'> = {
 }
 
 let detail: object
+let refs: KanbanTaskRef[]
+let refsEndpointMissing: boolean
 let client: QueryClient
 let disposeApi: () => void
 let disposeLocales: () => void
@@ -46,6 +48,14 @@ const rest = vi.fn(async (path: string, options?: PluginRestOptions): Promise<un
 
   if (path === '/tasks/t_example') {
     return detail
+  }
+
+  if (path === '/tasks/t_example/refs') {
+    if (refsEndpointMissing) {
+      throw new Error('404: no such route')
+    }
+
+    return { refs }
   }
 
   if (path.startsWith('/tasks/t_example/log?')) {
@@ -71,6 +81,8 @@ beforeEach(() => {
     { get: (_key, fallback) => fallback, set: vi.fn(), remove: vi.fn() },
     () => vi.fn()
   )
+  refs = []
+  refsEndpointMissing = false
 })
 
 afterEach(() => {
@@ -492,5 +504,127 @@ describe('blocked task detail', () => {
         expect.objectContaining({ method: 'PATCH', body: { status: 'ready' } })
       )
     )
+  })
+})
+
+// The ref row the direct-Herdr bridge writes (kanban_direct_herdr_link
+// persist_executor): ref = host/session/workspace/tab/pane, note names the
+// agent, its native session (or "not reported"), and the run fence.
+const herdrRef: KanbanTaskRef = {
+  id: 31,
+  task_id: 't_example',
+  ref_type: 'herdr',
+  ref: 'zchristmas-mbp/default/w1R/w1R:t35/w1R:p3A',
+  host: 'zchristmas-mbp',
+  note: 'agent clark; native session 8f2c91ab; run t_da6c6cae/run-171',
+  created_at: 0
+}
+
+describe('herdr pane section', () => {
+  it('renders a herdr ref as its five segments plus agent, run, and native-session state', async () => {
+    refs = [herdrRef]
+    openDrawer()
+
+    await screen.findByTestId('kanban-herdr-panes')
+    expect(screen.getByTestId('kanban-herdr-ref').textContent).toContain(
+      '#31 zchristmas-mbp/default/w1R/w1R:t35/w1R:p3A'
+    )
+    expect(screen.getByTestId('kanban-herdr-host').textContent).toContain('zchristmas-mbp')
+    expect(screen.getByTestId('kanban-herdr-session').textContent).toContain('default')
+    expect(screen.getByTestId('kanban-herdr-workspace').textContent).toContain('w1R')
+    expect(screen.getByTestId('kanban-herdr-tab').textContent).toContain('w1R:t35')
+    expect(screen.getByTestId('kanban-herdr-pane-id').textContent).toContain('w1R:p3A')
+    expect(screen.getByTestId('kanban-herdr-agent').textContent).toContain('clark')
+    expect(screen.getByTestId('kanban-herdr-run').textContent).toContain('t_da6c6cae/run-171')
+    expect(screen.getByTestId('kanban-herdr-native').textContent).toContain(en.herdrReported)
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeTruthy()
+  })
+
+  it('marks a sessionless harness as not reported instead of showing a session id', async () => {
+    refs = [{ ...herdrRef, note: 'agent rpi; native session not reported; run -' }]
+    openDrawer()
+
+    await screen.findByTestId('kanban-herdr-panes')
+    expect(screen.getByTestId('kanban-herdr-native').textContent).toContain(en.herdrNotReported)
+    // The agent line stays; the run line collapses on its "-" placeholder.
+    expect(screen.getByTestId('kanban-herdr-agent').textContent).toContain('rpi')
+    expect(screen.queryByTestId('kanban-herdr-run')).toBeNull()
+  })
+
+  it('hides entirely when the task has no herdr ref', async () => {
+    refs = []
+    openDrawer()
+
+    expect(await screen.findByRole('heading', { name: legacyDetail.task.title })).toBeTruthy()
+    expect(screen.queryByTestId('kanban-herdr-panes')).toBeNull()
+  })
+
+  it('renders one block per herdr ref and never shows other ref kinds', async () => {
+    refs = [
+      herdrRef,
+      { id: 30, task_id: 't_example', ref_type: 'branch', ref: 'feature/drawer', created_at: 0 },
+      {
+        id: 32,
+        task_id: 't_example',
+        ref_type: 'herdr',
+        ref: 'tolaria-win/default/w2R/w2R:t11/w2R:p9F',
+        host: 'tolaria-win',
+        note: 'agent axiom; native session b71c; run t_da6c6cae/run-172',
+        created_at: 1
+      }
+    ]
+    openDrawer()
+
+    await screen.findByTestId('kanban-herdr-panes')
+    const panes = screen.getAllByTestId('kanban-herdr-pane')
+    expect(panes).toHaveLength(2)
+    // Each block carries its own parsed fields — first pane's host is the Mac,
+    // the branch ref (and its id) never renders.
+    expect(panes[0].querySelector('[data-testid="kanban-herdr-ref"]')!.textContent).toContain('#31')
+    expect(panes[0].querySelector('[data-testid="kanban-herdr-host"]')!.textContent).toContain('zchristmas-mbp')
+    expect(panes[1].querySelector('[data-testid="kanban-herdr-ref"]')!.textContent).toContain('#32')
+    expect(panes[1].querySelector('[data-testid="kanban-herdr-host"]')!.textContent).toContain('tolaria-win')
+    expect(screen.queryByText('feature/drawer')).toBeNull()
+    expect(screen.queryByText('#30')).toBeNull()
+  })
+
+  it('recovers from a backend without the refs endpoint (404) by hiding the section', async () => {
+    refsEndpointMissing = true
+    openDrawer()
+
+    expect(await screen.findByRole('heading', { name: legacyDetail.task.title })).toBeTruthy()
+    expect(screen.queryByTestId('kanban-herdr-panes')).toBeNull()
+  })
+})
+
+describe('parseHerdrRef', () => {
+  it('parses the pane path and the note into fields', () => {
+    const pane = parseHerdrRef(herdrRef)
+
+    expect(pane).toEqual({
+      agent: 'clark',
+      fence: 't_da6c6cae/run-171',
+      host: 'zchristmas-mbp',
+      id: 31,
+      nativeSession: '8f2c91ab',
+      pane: 'w1R:p3A',
+      ref: 'zchristmas-mbp/default/w1R/w1R:t35/w1R:p3A',
+      reported: true,
+      session: 'default',
+      tab: 'w1R:t35',
+      workspace: 'w1R'
+    })
+  })
+
+  it('rejects non-herdr rows and refs that are not the five-segment pane path', () => {
+    expect(parseHerdrRef({ ...herdrRef, ref_type: 'branch' })).toBeNull()
+    expect(parseHerdrRef({ ...herdrRef, ref: null })).toBeNull()
+    expect(parseHerdrRef({ ...herdrRef, ref: 'zchristmas-mbp/default/w1R' })).toBeNull()
+    expect(parseHerdrRef({ ...herdrRef, note: null })).toMatchObject({
+      agent: null,
+      fence: null,
+      nativeSession: null,
+      reported: false
+    })
   })
 })

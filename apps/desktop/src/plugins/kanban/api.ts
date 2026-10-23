@@ -40,6 +40,7 @@ import type {
   KanbanProject,
   KanbanTask,
   KanbanTaskDetail,
+  KanbanTaskRef,
   OrchestrationSettings,
   TaskEstimate,
   WorkerLog
@@ -180,9 +181,11 @@ function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug 
 
   for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
     void queryClient.invalidateQueries({ queryKey: taskKey(scope, slug, taskId!) })
+    void queryClient.invalidateQueries({ queryKey: taskRefsKey(scope, slug, taskId!) })
 
     if (selectedSlug !== slug) {
       void queryClient.invalidateQueries({ queryKey: taskKey(scope, selectedSlug, taskId!) })
+      void queryClient.invalidateQueries({ queryKey: taskRefsKey(scope, selectedSlug, taskId!) })
     }
   }
 
@@ -378,6 +381,7 @@ export const boardKeyPrefix = (scope: string) => ['kanban', 'board', scope] as c
 export const boardKey = (scope: string, slug: string, archived: boolean) =>
   [...boardKeyPrefix(scope), slug, archived] as const
 export const taskKey = (scope: string, slug: string, id: string) => ['kanban', 'task', scope, slug, id] as const
+export const taskRefsKey = (scope: string, slug: string, id: string) => ['kanban', 'refs', scope, slug, id] as const
 export const logKey = (scope: string, slug: string, id: string) => ['kanban', 'log', scope, slug, id] as const
 export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
 export const profilesKey = (scope: string) => ['kanban', 'profiles', scope] as const
@@ -399,6 +403,11 @@ export const fetchTask = async (id: string) => {
 
 /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
 export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
+
+/** A task's typed refs (herdr panes, branches, tickets, …). Backends older
+ *  than the endpoint 404 — callers treat a failed fetch as "no refs" so the
+ *  drawer's Herdr section simply stays hidden. */
+export const fetchTaskRefs = (id: string) => call<{ refs: KanbanTaskRef[] }>(withBoard(`/tasks/${id}/refs`))
 
 export const fetchBoards = () => call<BoardsResponse>('/boards')
 

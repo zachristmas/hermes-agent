@@ -116,6 +116,22 @@ export interface KanbanLinkTask {
   status: string
 }
 
+/** One task_refs row (GET /tasks/:id/refs). `ref_type` is free-form (`herdr`,
+ *  `branch`, `pr-url`, …), never a closed enum. A `herdr` ref encodes the
+ *  linked Herdr pane as `host/session/workspace/tab/pane` in `ref` and names
+ *  the agent, its native session, and the run fence in `note` — see
+ *  `parseHerdrRef` in drawer.tsx. */
+export interface KanbanTaskRef {
+  id: number | string
+  task_id: string
+  ref_type: string
+  repo?: null | string
+  ref?: null | string
+  host?: null | string
+  note?: null | string
+  created_at: number
+}
+
 /** Fields present only on the detail endpoint (beyond the card's KanbanTask).
  *  `started_at`/`worker_pid`/`last_heartbeat_at` are inherited — they live on
  *  KanbanTask now that the board's liveness arc reads them. */

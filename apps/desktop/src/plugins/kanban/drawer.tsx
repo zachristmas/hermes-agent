@@ -49,6 +49,7 @@ import {
   fetchLog,
   fetchProfiles,
   fetchTask,
+  fetchTaskRefs,
   logKey,
   patchTask,
   profilesKey,
@@ -56,6 +57,7 @@ import {
   reclaimTask,
   routedToScope,
   taskKey,
+  taskRefsKey,
   uploadAttachment,
   useKanbanScope
 } from './api'
@@ -68,6 +70,7 @@ import {
   type KanbanEvent,
   type KanbanTask,
   type KanbanTaskDetail,
+  type KanbanTaskRef,
   SEVERITY_TONE,
   type TaskEstimate,
   type WorkerLog
@@ -207,6 +210,134 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
     <Section label={label}>
       <div className="min-w-0 text-[0.75rem] text-(--ui-text-secondary) [overflow-wrap:anywhere]">{children}</div>
     </Section>
+  )
+}
+
+/** One parsed `herdr` task_ref: the pane path's five segments (the `ref`
+ *  column) plus the identity the direct-Herdr bridge recorded in the `note`
+ *  column ("agent …; native session …; run …"). `id` is the task_refs row id,
+ *  the number `hermes kanban ref list` shows. */
+export interface HerdrPaneInfo {
+  agent: null | string
+  fence: null | string
+  host: string
+  id: number | string
+  nativeSession: null | string
+  pane: string
+  ref: string
+  reported: boolean
+  session: string
+  tab: string
+  workspace: string
+}
+
+const HERDR_NOTE_RE = /^agent\s+(.+?);\s*native session\s+(.+?);\s*run\s+(.+)$/s
+
+/** Split one task_refs row into drawer-displayable fields. Rows of another
+ *  ref_type (branch, pr-url, …), or herdr rows whose ref is not the
+ *  five-segment pane path the bridge writes, parse to null and render
+ *  nothing. A note that doesn't match just hides the agent/run/session rows.
+ *  "not reported" is the bridge's own marker for harnesses that never send a
+ *  native session id (see kanban_direct_herdr_link) — it means NOT reported. */
+export function parseHerdrRef(row: KanbanTaskRef): null | HerdrPaneInfo {
+  if (row.ref_type !== 'herdr' || typeof row.ref !== 'string') {
+    return null
+  }
+
+  const [host = '', session = '', workspace = '', tab = '', pane = ''] = row.ref.split('/')
+
+  if (!host || !session || !workspace || !tab || !pane) {
+    return null
+  }
+
+  const note = typeof row.note === 'string' ? row.note : ''
+  const m = HERDR_NOTE_RE.exec(note)
+  let nativeSession: null | string = null
+
+  if (m) {
+    const value = m[2].trim()
+    nativeSession = value && value !== 'not reported' ? value : null
+  }
+
+  const fence = m ? m[3].trim() : ''
+
+  return {
+    agent: m ? m[1].trim() : null,
+    fence: fence && fence !== '-' ? fence : null,
+    host,
+    id: row.id,
+    nativeSession,
+    pane,
+    ref: row.ref,
+    reported: nativeSession !== null,
+    session,
+    tab,
+    workspace
+  }
+}
+
+/** One labeled value inside a Herdr pane block — tiny label, mono value, wraps
+ *  anywhere so long pane ids and fences never clip the 16rem sidebar. */
+function HerdrField({ label, testid, value }: { label: string; testid: string; value: string }) {
+  return (
+    <span className="min-w-0 [overflow-wrap:anywhere]" data-testid={testid}>
+      <span className="text-(--ui-text-quaternary)">{label} </span>
+      <span className="font-mono text-(--ui-text-tertiary)">{value}</span>
+    </span>
+  )
+}
+
+/** The Herdr pane block(s): the ref path (copyable, the exact string
+ *  `hermes kanban ref list` prints) with each segment and the note's identity
+ *  called out on labeled rows. Compact by design — three/four wrapped lines. */
+function HerdrPaneValue({ panes }: { panes: HerdrPaneInfo[] }) {
+  const k = useKanban()
+
+  return (
+    <div className="flex flex-col gap-2" data-testid="kanban-herdr-panes">
+      {panes.map((pane, index) => (
+        <div
+          className="flex min-w-0 flex-col gap-0.5 text-[0.6875rem] leading-snug"
+          data-testid="kanban-herdr-pane"
+          key={typeof pane.id === 'number' || typeof pane.id === 'string' ? `${pane.id}:${index}` : index}
+        >
+          <div className="flex items-start gap-1.5">
+            <span
+              className="min-w-0 flex-1 font-mono text-(--ui-text-tertiary) [overflow-wrap:anywhere]"
+              data-selectable-text="true"
+              data-testid="kanban-herdr-ref"
+            >
+              <span className="text-(--ui-text-quaternary)">#{pane.id}</span> {pane.ref}
+            </span>
+            <CopyButton
+              appearance="icon"
+              buttonSize="icon-xs"
+              buttonVariant="ghost"
+              className="-mt-0.5 shrink-0"
+              text={pane.ref}
+            />
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <HerdrField label={k.herdrHost} testid="kanban-herdr-host" value={pane.host} />
+            <HerdrField label={k.herdrSession} testid="kanban-herdr-session" value={pane.session} />
+            <HerdrField label={k.workspace} testid="kanban-herdr-workspace" value={pane.workspace} />
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            <HerdrField label={k.herdrTab} testid="kanban-herdr-tab" value={pane.tab} />
+            <HerdrField label={k.herdrPaneId} testid="kanban-herdr-pane-id" value={pane.pane} />
+          </div>
+          <div className="flex flex-wrap gap-x-2">
+            {pane.agent && <HerdrField label={k.herdrAgent} testid="kanban-herdr-agent" value={pane.agent} />}
+            {pane.fence && <HerdrField label={k.herdrRun} testid="kanban-herdr-run" value={pane.fence} />}
+            <HerdrField
+              label={k.herdrNative}
+              testid="kanban-herdr-native"
+              value={pane.reported ? k.herdrReported : k.herdrNotReported}
+            />
+          </div>
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -1113,6 +1244,16 @@ export function TaskDrawer({
     refetchInterval: running ? 3_000 : 15_000
   })
 
+  // Linked Herdr pane(s) (herdr task_refs). Socket-invalidated alongside the
+  // detail; a backend without the refs endpoint 404s and the section below
+  // simply never renders.
+  const { data: refsData } = useQuery({
+    enabled: query => !!id && routedToScope(query),
+    queryFn: () => fetchTaskRefs(id!),
+    queryKey: taskRefsKey(scope, slug, id ?? ''),
+    refetchInterval: 30_000
+  })
+
   const invalidate = () => {
     void qc.invalidateQueries({ queryKey: taskKey(scope, slug, id!) })
     void qc.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
@@ -1198,6 +1339,12 @@ export function TaskDrawer({
   // Linked tasks resolved to titles by the backend (`link_tasks`); absent on
   // older backends, where the chips fall back to short ids.
   const linkTitles = new Map((detail?.link_tasks ?? []).map(linked => [linked.id, linked.title]))
+
+  // Herdr refs, parsed for the sidebar section — other ref kinds (branch,
+  // pr-url, …) and malformed rows drop out here.
+  const herdrPanes = (refsData?.refs ?? [])
+    .map((row: KanbanTaskRef) => parseHerdrRef(row))
+    .filter((pane): pane is HerdrPaneInfo => pane !== null)
 
   const move = (status: string) => {
     if (!task || status === task.status) {
@@ -1398,6 +1545,11 @@ export function TaskDrawer({
                 {task.workspace_path && (
                   <MetaRow label={k.workspace}>
                     <WorkspaceValue kind={task.workspace_kind} path={task.workspace_path} />
+                  </MetaRow>
+                )}
+                {herdrPanes.length > 0 && (
+                  <MetaRow label={k.herdrPane}>
+                    <HerdrPaneValue panes={herdrPanes} />
                   </MetaRow>
                 )}
                 <MetaRow label={k.model}>
