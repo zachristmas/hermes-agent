@@ -340,6 +340,72 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _board_notification_channel(board_slug: str) -> dict:
+    """``kanban.notification_channels.<board>`` entry, ``{}`` when unmapped or malformed.
+
+    Same user key the agent-tool path reads (``tools/kanban_tools.py::
+    _board_notification_channel``): a route without a ``chat_id`` is not a
+    routable destination and is ignored. Unreadable config keeps the create
+    silent (an outage must never break ``hermes kanban create``).
+    """
+    from hermes_cli.config import cfg_get, load_config
+    try:
+        channels = cfg_get(load_config(), "kanban", "notification_channels", default={})
+    except Exception:  # health: allow BLE001 -- config read boundary; unreadable config keeps the create silent
+        return {}
+    route = channels.get(board_slug) if isinstance(channels, dict) and board_slug else None
+    return route if isinstance(route, dict) and route.get("chat_id") else {}
+
+
+def _auto_subscribe_board_channel(conn, task_id: str) -> bool:
+    """Subscribe the board's configured notification channel to a CLI-created card
+    and arm the just-inserted row just below the ``created`` event, matching the
+    agent-tool path (``tools/kanban_tools.py::_maybe_auto_subscribe``) and the
+    slash path (``gateway/slash_commands.py::_kanban_auto_subscribe``). The CLI has
+    no origin chat, so this is channel-only: no ``kanban.notification_channels``
+    entry for the board -> silent skip. An idempotency-key re-create that returns
+    an existing card finds the row already there and never re-arms it (rewinding a
+    claimed row would replay the creation notice). Gated by
+    ``kanban.auto_subscribe_on_create`` (default True). Failures are logged and
+    swallowed: bookkeeping must never fail ``hermes kanban create``.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
+            return False
+        slug = kb.get_current_board()
+        route = _board_notification_channel(slug)
+        if not route:
+            return False
+        platform = str(route.get("platform") or "").lower()
+        if not platform:
+            return False
+        thread_id = str(route["thread_id"]) if route.get("thread_id") else None
+        if any(sub["platform"] == platform and sub["chat_id"] == str(route["chat_id"])
+               and (sub["thread_id"] or "") == (thread_id or "")
+               for sub in kbn.list_notify_subs(conn, task_id)):
+            # Row already there: an idempotent re-create returning an existing
+            # card. Never re-arm — rewinding a claimed row would replay
+            # (re-notify) the creation notice.
+            return True
+        kbn.add_notify_sub(
+            conn, task_id=task_id, platform=platform, chat_id=str(route["chat_id"]),
+            chat_type="channel", thread_id=thread_id, delivery_mode="notify",
+            # Same routing anchors the /kanban create slash path persists.
+            delivery_metadata={
+                key: str(route[key]) for key in ("guild_id", "parent_chat_id") if route.get(key)
+            } or None)
+        kbn.arm_created_notice_for_new_sub(
+            conn, task_id=task_id, platform=platform, chat_id=str(route["chat_id"]),
+            thread_id=thread_id)
+        return True
+    except Exception as exc:  # health: allow BLE001 -- bookkeeping must never fail the create
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "kanban create: board-channel auto-subscribe failed for %s: %r", task_id, exc)
+        return False
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -387,6 +453,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+        _auto_subscribe_board_channel(conn, task_id)
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
