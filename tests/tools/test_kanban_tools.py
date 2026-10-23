@@ -1556,3 +1556,133 @@ class TestDefaultTaskId:
         assert kt._default_task_id("") == worker_env
         assert kt._default_task_id("   ") == worker_env
         assert kt._default_task_id(None) == worker_env
+
+
+# ---------------------------------------------------------------------------
+# Card-created notices: a fresh routed board-channel row is armed just below
+# the just-appended ``created`` event so the notifier announces the card on the
+# board channel. Idempotent re-creates never re-arm an already-claimed row.
+# ---------------------------------------------------------------------------
+
+
+def _routed_dm_session(
+    monkeypatch, tmp_path, slug="default", channel="board-channel-9"
+):
+    """Channel config for one board + a Discord DM origin session."""
+    _write_channel_config(tmp_path, monkeypatch, slug, {"chat_id": channel})
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "dm-123")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+    for var in ("HERMES_SESSION_THREAD_ID", "HERMES_SESSION_USER_ID",
+                "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _events_by_id(task_id):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        return {e.kind: e.id for e in kb.list_events(conn, task_id)}
+    finally:
+        conn.close()
+
+
+def test_create_routes_created_notice_to_board_channel_from_dm(monkeypatch, worker_env, tmp_path):
+    """A DM-created card on a routed board gets its origin subscription on the
+    configured channel AND armed just below the ``created`` event, so the
+    board channel announces the card while the DM stays silent."""
+    from tools import kanban_tools as kt
+    _routed_dm_session(monkeypatch, tmp_path)
+
+    out = kt._handle_create({"title": "announced card", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+
+    events = _events_by_id(d["task_id"])
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["platform"] == "discord"
+    assert s["chat_id"] == "board-channel-9"
+    assert s["chat_type"] == "channel"
+    assert s["delivery_mode"] == "notify"
+    assert s["last_event_id"] == events["created"] - 1, (
+        "the fresh routed row must be armed just below the created event so the "
+        "next notifier tick delivers the card-created notice"
+    )
+
+
+def test_create_idempotent_duplicate_does_not_rearm_created_notice(
+    monkeypatch, worker_env, tmp_path
+):
+    """A re-create via idempotency_key that returns the existing card must not
+    rewind an already-claimed subscription back over the ``created`` event."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+    _routed_dm_session(monkeypatch, tmp_path)
+
+    out = kt._handle_create(
+        {"title": "dedup card", "assignee": "peer", "idempotency_key": "dup-key-1"})
+    d1 = json.loads(out)
+    assert d1["ok"] is True
+    created_id = _events_by_id(d1["task_id"])["created"]
+
+    # Simulate the notifier claiming the created event.
+    conn = kbc.connect()
+    try:
+        kbn.advance_notify_cursor(
+            conn, task_id=d1["task_id"], platform="discord", chat_id="board-channel-9",
+            new_cursor=created_id)
+    finally:
+        conn.close()
+
+    out2 = kt._handle_create(
+        {"title": "dedup card", "assignee": "peer", "idempotency_key": "dup-key-1"})
+    d2 = json.loads(out2)
+    assert d2["ok"] is True
+    assert d2["task_id"] == d1["task_id"], "the duplicate must return the existing card"
+
+    conn = kbc.connect()
+    try:
+        assert sum(1 for s in kbn.list_notify_subs(conn, d1["task_id"])) == 1
+        assert kbn.list_notify_subs(conn, d1["task_id"])[0]["last_event_id"] == created_id, (
+            "the duplicate create must not re-arm (re-notify) the claimed card"
+        )
+    finally:
+        conn.close()
+
+
+def test_create_without_channel_config_skips_created_notice_arming(monkeypatch, worker_env):
+    """A board without a configured channel keeps today's behavior: the origin
+    DM sub stays caught up, so the creation passes silently."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+    # worker_env's fresh HERMES_HOME has no config.yaml: no notification_channels.
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "dm-123")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+    for var in ("HERMES_SESSION_THREAD_ID", "HERMES_SESSION_USER_ID",
+                "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    out = kt._handle_create({"title": "quiet board", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+
+    max_event_id = max(_events_by_id(d["task_id"]).values())
+    conn = kbc.connect()
+    try:
+        subs = kbn.list_notify_subs(conn, d["task_id"])
+        assert len(subs) == 1
+        assert subs[0]["chat_id"] == "dm-123"
+        assert subs[0]["chat_type"] == "dm"
+        assert subs[0]["last_event_id"] == max_event_id, (
+            "unrouted boards keep the caught-up origin sub: no created notice anywhere"
+        )
+    finally:
+        conn.close()

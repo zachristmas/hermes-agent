@@ -236,6 +236,7 @@ gateway:
       review_detail: "Átnézési visszajelzés: {reason}\nNézd meg a meglévő kártyát és az aktuális átnézési futást; a munkát ugyanahhoz a megvalósítási feladathoz add vissza. Ezt a BLOCK-ot ne tekintsd jóváhagyásnak, és ne hozz létre duplikált feladatot."
       guidance: "Ez egy automatikus feladatállapot-értesítés, nem kérés a feladat újbóli felbontására. Nézd meg az aktuális táblát, mielőtt követő feladatokat hoznál létre; ne hozz létre újra már létező feladatokat vagy gráfokat."
     ping:
+      created: "🆕 {head} létrehozva — {title} (készítette: @{creator})"
       completed: "✔ {head} kész — {title}{handoff}"
       review_requested: "👀 {head} átnézésre kész — {title}{handoff}"
       changes_default_reason: "az átnéző visszajelzése módosítást kér"

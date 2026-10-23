@@ -1301,8 +1301,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, board: Optional[str] = None) 
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
     True). When the task's board has a ``kanban.notification_channels`` entry, the
     origin subscription is created for that channel instead of the creating chat
-    (passive ``notify``, no wake) — see ``_channel_sub_target``. Failures are logged
-    and swallowed: bookkeeping must never fail kanban_create."""
+    (passive ``notify``, no wake) — see ``_channel_sub_target`` — and the fresh row is
+    armed just below the just-appended ``created`` event so the board channel hears
+    the card-created notice. Failures are logged and swallowed: bookkeeping must
+    never fail kanban_create."""
     try:
         if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
             return False
@@ -1324,8 +1326,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str, board: Optional[str] = None) 
         if any(sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
                for sub in _kbn.list_notify_subs(conn, task_id)):
+            # Row already there: an inherited/explicit sub, or an idempotent
+            # re-create returning an existing card. Never re-arm — rewinding a
+            # claimed row would replay (re-notify) the creation notice.
             return True
         _kbn.add_notify_sub(conn, task_id=task_id, **target)
+        if route:
+            _kbn.arm_created_notice_for_new_sub(
+                conn, task_id=task_id, platform=target["platform"],
+                chat_id=target["chat_id"], thread_id=target.get("thread_id") or None)
         return True
     except Exception as _exc:
         logger.warning(

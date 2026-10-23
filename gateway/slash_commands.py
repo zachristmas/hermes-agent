@@ -452,6 +452,12 @@ class GatewaySlashCommandsMixin(
                     notifier_profile=_field("profile") or getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                     # Board routes are passive channel notifications; origin subscriptions preserve wake behavior.
                     delivery_mode=delivery_mode, delivery_metadata=delivery_metadata)
+                if routed_to_board:
+                    # Arm the fresh row just below the ``created`` event so the board
+                    # channel hears the card-created notice (channel-shaped subs only;
+                    # the duplicate-create regex path never re-subscribes here).
+                    _kbn.arm_created_notice_for_new_sub(
+                        conn, task_id=task_id, platform=platform_str, chat_id=chat_id, thread_id=thread_id)
             finally:
                 conn.close()
         await asyncio.to_thread(_sub)
