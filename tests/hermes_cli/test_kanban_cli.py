@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -291,5 +292,115 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# CLI create: board-channel auto-subscribe + created-notice arming (parity with
+# the agent-tool path's _maybe_auto_subscribe and the slash path's
+# _kanban_auto_subscribe)
+# ---------------------------------------------------------------------------
+
+def _write_channel_config(slug, channel, guild_id=None):
+    """Map one board to a notification channel in the (already isolated) HERMES_HOME."""
+    body = f"      chat_id: {channel}\n"
+    body += "      platform: discord\n"
+    if guild_id:
+        body += f"      guild_id: {guild_id}\n"
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  notification_channels:\n"
+        f"    {slug}:\n"
+        f"{body}"
+    )
+
+
+def _created_event_id(task_id):
+    with kbc.connect_closing() as conn:
+        return next(e.id for e in kb.list_events(conn, task_id) if e.kind == "created")
+
+
+def _subs_for_task(task_id):
+    from hermes_cli import kanban_db_notify as kbn
+    with kbc.connect_closing() as conn:
+        return [dict(s) if isinstance(s, dict) else s._asdict()
+                if hasattr(s, "_asdict") else vars(s)
+                for s in kbn.list_notify_subs(conn, task_id)]
+
+
+def test_cli_create_subscribes_board_channel_and_arms_created_notice(kanban_home):
+    """A CLI-created card on a routed board gets a channel-shaped subscription
+    armed just below the ``created`` event, so the board channel hears the
+    card-created notice (same behavior as the agent-tool and slash paths)."""
+    _write_channel_config("default", "board-channel-cli-1", guild_id="guild-77")
+
+    out = kc.run_slash("create 'cli announced card' --assignee peer --json")
+    task_id = json.loads(out)["id"]
+
+    subs = _subs_for_task(task_id)
+    assert len(subs) == 1, subs
+    s = subs[0]
+    assert s["platform"] == "discord"
+    assert s["chat_id"] == "board-channel-cli-1"
+    assert s["chat_type"] == "channel"
+    assert s["delivery_mode"] == "notify"
+    assert s["delivery_metadata"] and s["delivery_metadata"].get("guild_id") == "guild-77"
+    assert s["last_event_id"] == _created_event_id(task_id) - 1, (
+        "the fresh routed row must be armed just below the created event so the "
+        "next notifier tick delivers the card-created notice"
+    )
+
+
+def test_cli_create_idempotent_duplicate_does_not_rearm_created_notice(kanban_home):
+    """A re-create via --idempotency-key that returns the existing card must not
+    rewind an already-claimed subscription back over the ``created`` event."""
+    from hermes_cli import kanban_db_notify as kbn
+    _write_channel_config("default", "board-channel-cli-2")
+
+    out = kc.run_slash(
+        "create 'cli dedup card' --assignee peer --idempotency-key cli-dup-1 --json")
+    task_id = json.loads(out)["id"]
+    created_id = _created_event_id(task_id)
+
+    # Simulate the notifier claiming the created event.
+    with kbc.connect_closing() as conn:
+        kbn.advance_notify_cursor(
+            conn, task_id=task_id, platform="discord",
+            chat_id="board-channel-cli-2", new_cursor=created_id)
+
+    out2 = kc.run_slash(
+        "create 'cli dedup card' --assignee peer --idempotency-key cli-dup-1 --json")
+    assert json.loads(out2)["id"] == task_id, "the duplicate must return the existing card"
+
+    subs = _subs_for_task(task_id)
+    assert len(subs) == 1
+    assert subs[0]["last_event_id"] == created_id, (
+        "the duplicate create must not re-arm (re-notify) the claimed card"
+    )
+
+
+def test_cli_create_without_channel_config_skips_subscription(kanban_home):
+    """A board without a configured channel keeps the create silent: no
+    subscription row, nothing armed."""
+    out = kc.run_slash("create 'cli quiet card' --assignee peer --json")
+    task_id = json.loads(out)["id"]
+    assert _subs_for_task(task_id) == []
+
+
+def test_cli_create_auto_subscribe_disabled_skips_subscription(kanban_home):
+    """``kanban.auto_subscribe_on_create: false`` disables the CLI channel
+    auto-subscribe, matching the agent-tool path's gate."""
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  auto_subscribe_on_create: false\n"
+        "  notification_channels:\n"
+        "    default:\n"
+        "      chat_id: board-channel-cli-3\n"
+        "      platform: discord\n"
+    )
+    out = kc.run_slash("create 'cli gated card' --assignee peer --json")
+    task_id = json.loads(out)["id"]
+    assert _subs_for_task(task_id) == []
 
 
