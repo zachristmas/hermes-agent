@@ -51,6 +51,14 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "st
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected",
                 "recovery_hold_escalated", "settlement_escalated", "reconciliation_escalated")
+# Card-created notices are a passive board-channel ping, never a wake: the
+# ``created`` event joins the claimed kinds ONLY for channel-shaped
+# subscriptions (the board's configured notification_channels target written by
+# the create paths, chat_type=channel), so a routed board hears what just
+# entered it while DM/TUI origins stay silent. The create paths arm the fresh
+# row just below the ``created`` event (kanban_db_notify.arm_created_notice_for_new_sub);
+# every other subscription stays caught up and never claims history.
+CREATED_KIND = "created"
 
 
 def diagnostic_event(ev) -> bool:
@@ -144,6 +152,14 @@ def _warn_anchorless_thread_sub_once(sub: dict, platform: str) -> None:
 
 
 _UNROUTABLE_WARNED: set[tuple] = set()
+
+
+def _channel_shaped_sub(sub: dict) -> bool:
+    """True for the routed board-channel subscription shape (``chat_type`` ``channel``,
+    column or delivery_metadata) the create paths write for boards with a configured
+    ``notification_channels`` entry — the only shape that claims card-created notices."""
+    metadata = sub.get("delivery_metadata") or {}
+    return str(sub.get("chat_type") or metadata.get("chat_type") or "").strip().lower() == "channel"
 
 
 def _warn_unroutable_sub_once(sub: dict, platform: Any, message: str, *extra_args: Any) -> None:
@@ -317,7 +333,9 @@ class _Collector:
             return None
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
-            thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
+            thread_id=sub.get("thread_id") or "",
+            kinds=TERMINAL_KINDS
+            + ((CREATED_KIND,) if _channel_shaped_sub(sub) else ()),
         )
         if not events:
             return None
@@ -403,6 +421,17 @@ def _fmt_completed(ev, n) -> tuple:
         wake_handoff = _first_line(n.task.result, 160)
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
+
+
+def _fmt_created(ev, n) -> tuple:
+    """Card-created notice: ``head`` carries board/assignee/task id, the title and
+    the creating profile complete it so a human can tell what just entered the
+    board without opening the card. Sibling creation-time events (initial
+    ``blocked`` / ``dependency_wait``) are intentionally silent here — the created
+    payload already carries the initial status, and lifecycle pings keep their
+    own behavior for every non-creation batch."""
+    creator = getattr(n.task, "created_by", None) or "unknown"
+    return t("gateway.kanban.ping.created", head=n.head, title=n.title, creator=creator), None, None
 
 
 def _fmt_commented(ev, n) -> tuple:
@@ -532,6 +561,7 @@ def _fmt_timed_out(ev, n) -> tuple:
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
     "completed": _fmt_completed,
+    "created": _fmt_created,
     "commented": _fmt_commented,
     "blocked": lambda ev, n: (
         t("gateway.kanban.ping.blocked", head=n.head, reason=_clip(ev, "reason", "gateway.kanban.ping.reason_suffix", 160)),
@@ -580,6 +610,11 @@ class _KanbanNotification:
         mode = sub.get("delivery_mode") or "notify"
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
+        # A creation batch (the fresh row was armed just below ``created`` at
+        # create time) announces the card exactly once: the created formatter
+        # carries the initial state, so sibling creation-time events (initial
+        # ``blocked`` / ``dependency_wait``) neither ping nor wake.
+        self.creation_batch = any(ev.kind == CREATED_KIND for ev in d["events"])
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
@@ -627,6 +662,8 @@ class _KanbanNotification:
         formatter = _EVENT_FORMATTERS.get(ev.kind)
         if formatter is None:
             return None
+        if self.creation_batch and ev.kind != CREATED_KIND:
+            return None  # sibling creation-time events ride the created notice
         msg, handoff, review_detail = formatter(ev, self)
         if handoff is not None:
             self.wake_handoff = handoff
@@ -637,7 +674,12 @@ class _KanbanNotification:
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
+        events = self.d["events"]
+        if self.creation_batch:
+            # ``created`` is not wake-worthy; drop its creation-time siblings too
+            # so an armed row can never turn a card creation into a wake.
+            events = [ev for ev in events if ev.kind == CREATED_KIND]
+        self.wake_kinds = {ev.kind for ev in events if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
         self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
         if not self.wake_kinds:
             return

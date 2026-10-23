@@ -1175,7 +1175,7 @@ def _handle_create(args: dict, **kw) -> str:
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=_maybe_auto_subscribe(conn, new_tid, board=args.get("board")))
 
 
 def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
@@ -1250,11 +1250,61 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
         delivery_metadata=delivery_metadata or None)
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _board_notification_channel(board_slug: str) -> dict[str, Any]:
+    """``kanban.notification_channels.<board>`` raw entry, ``{}`` when unmapped or malformed.
+
+    Same user key the ``/kanban create`` auto-subscribe reads; a route without a
+    ``chat_id`` is not a routable destination and is ignored, mirroring
+    ``gateway/slash_commands.py::_kanban_auto_subscribe``. Unreadable config keeps the
+    origin-chat fallback (an outage must never break kanban_create).
+    """
+    try:
+        channels = cfg_get(load_config(), "kanban", "notification_channels", default={})
+    except Exception:  # health: allow BLE001 -- config read boundary; unreadable config keeps the origin-chat fallback (same shape as the auto_subscribe gate in _maybe_auto_subscribe)
+        return {}
+    route = channels.get(board_slug) if isinstance(channels, dict) and board_slug else None
+    return route if isinstance(route, dict) and route.get("chat_id") else {}
+
+
+def _channel_sub_target(target: dict[str, Any], route: dict[str, Any]) -> dict[str, Any]:
+    """Repoint an origin subscription at the board's configured notification channel.
+
+    The creating chat keeps today's subscription only when it IS the configured channel
+    (platform + chat_id + thread all equal; notify+wake on completion is right there).
+    Otherwise the sub lands on the channel as a passive destination — ``chat_type``
+    ``channel``, mode ``notify`` — so status pings stop going to (and waking) the DM.
+    Metadata carries the route's routing anchors (guild_id / parent_chat_id), the same
+    fields the ``/kanban create`` path persists. Config ids may be YAML ints, hence the
+    string comparisons.
+    """
+    route_platform = str(route.get("platform") or target.get("platform") or "").lower()
+    route_thread = str(route["thread_id"]) if route.get("thread_id") else ""
+    if (str(target.get("platform") or "").lower() == route_platform
+            and str(target.get("chat_id") or "") == str(route["chat_id"])
+            and (target.get("thread_id") or "") == route_thread):
+        return target
+    metadata = {key: str(route[key]) for key in ("guild_id", "parent_chat_id") if route.get(key)}
+    return {
+        **target,
+        "platform": route_platform,
+        "chat_id": str(route["chat_id"]),
+        "chat_type": "channel",
+        "thread_id": route_thread or None,
+        "delivery_mode": "notify",
+        "delivery_metadata": metadata or None,
+    }
+
+
+def _maybe_auto_subscribe(conn: Any, task_id: str, board: Optional[str] = None) -> bool:
     """Subscribe the calling session to completion/block events; True iff a row was
     written (surfaced as ``subscribed`` so an orchestrator can fall back to explicit
     ``kanban_notify-subscribe``). Gated by ``kanban.auto_subscribe_on_create`` (default
-    True). Failures are logged and swallowed: bookkeeping must never fail kanban_create."""
+    True). When the task's board has a ``kanban.notification_channels`` entry, the
+    origin subscription is created for that channel instead of the creating chat
+    (passive ``notify``, no wake) — see ``_channel_sub_target`` — and the fresh row is
+    armed just below the just-appended ``created`` event so the board channel hears
+    the card-created notice. Failures are logged and swallowed: bookkeeping must
+    never fail kanban_create."""
     try:
         if not cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True):
             return False
@@ -1265,14 +1315,26 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         target = _resolve_notify_target()
         if target is None:
             return False  # CLI / cron / test — no persistent channel
+        from hermes_cli import kanban_db as kb
+        slug = kb._slug_or_default(board) if board else kb.get_current_board()
+        route = _board_notification_channel(slug)
+        if route:
+            target = _channel_sub_target(target, route)
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
         # Auto-subscribe must not turn a passive destination into an agent wake.
         if any(sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
                for sub in _kbn.list_notify_subs(conn, task_id)):
+            # Row already there: an inherited/explicit sub, or an idempotent
+            # re-create returning an existing card. Never re-arm — rewinding a
+            # claimed row would replay (re-notify) the creation notice.
             return True
         _kbn.add_notify_sub(conn, task_id=task_id, **target)
+        if route:
+            _kbn.arm_created_notice_for_new_sub(
+                conn, task_id=task_id, platform=target["platform"],
+                chat_id=target["chat_id"], thread_id=target.get("thread_id") or None)
         return True
     except Exception as _exc:
         logger.warning(

@@ -70,3 +70,61 @@ async def test_unmapped_board_keeps_origin_notify_and_wake_behavior(tmp_path, mo
     assert len(subs) == 1
     assert subs[0]["chat_id"] == "origin-dm"
     assert subs[0]["delivery_mode"] == "notify+wake"
+
+
+@pytest.mark.asyncio
+async def test_board_destination_arms_created_notice_for_slash_creates(tmp_path, monkeypatch):
+    """The /kanban create slash path arms its fresh routed channel row just
+    below the ``created`` event, so the board channel announces the card."""
+    _initialize_test_home(monkeypatch, tmp_path)
+    runner = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
+    runner._reply_metadata = lambda event: None
+    runner._active_profile_name = lambda: "default"
+    runner.config = SimpleNamespace(extra={"kanban": {"notification_channels": {
+        "connect": {"platform": "discord", "chat_id": "board-channel", "guild_id": "guild"},
+    }}})
+    source = SessionSource(
+        platform=Platform.DISCORD, chat_id="origin-dm", chat_type="dm", user_id="user",
+        profile="default", scope_id="guild",
+    )
+    kb.create_board("connect")
+    with kbc.connect(board="connect") as conn:
+        task_id = kb.create_task(conn, title="connect work")
+        created_id = next(e.id for e in kb.list_events(conn, task_id) if e.kind == "created")
+
+    assert await runner._kanban_auto_subscribe(
+        MessageEvent(text="/kanban create", source=source), task_id, "connect")
+
+    with kbc.connect(board="connect") as conn:
+        sub = kbn.list_notify_subs(conn, task_id)[0]
+    assert sub["chat_id"] == "board-channel"
+    assert sub["last_event_id"] == created_id - 1, (
+        "the fresh routed row must be armed so the next notifier tick delivers "
+        "the card-created notice"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unmapped_board_leaves_new_sub_caught_up(tmp_path, monkeypatch):
+    """Without a configured channel there is no created notice anywhere: the
+    origin sub keeps its caught-up cursor."""
+    _initialize_test_home(monkeypatch, tmp_path)
+    runner = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
+    runner._reply_metadata = lambda event: None
+    runner._active_profile_name = lambda: "default"
+    runner.config = SimpleNamespace(extra={"kanban": {"notification_channels": {}}})
+    source = SessionSource(
+        platform=Platform.DISCORD, chat_id="origin-dm", chat_type="dm", user_id="user", profile="default",
+    )
+    kb.create_board("other")
+    with kbc.connect(board="other") as conn:
+        task_id = kb.create_task(conn, title="other work")
+        max_event_id = max(e.id for e in kb.list_events(conn, task_id))
+
+    assert await runner._kanban_auto_subscribe(
+        MessageEvent(text="/kanban create", source=source), task_id, "other")
+
+    with kbc.connect(board="other") as conn:
+        sub = kbn.list_notify_subs(conn, task_id)[0]
+    assert sub["chat_id"] == "origin-dm"
+    assert sub["last_event_id"] == max_event_id

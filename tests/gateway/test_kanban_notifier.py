@@ -862,3 +862,225 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_board_channel_subscription_delivers_without_waking_origin_dm(
+    tmp_path, monkeypatch,
+):
+    """A routed board-channel subscription — the shape the origin auto-subscribe
+    writes when the creating chat differs from the board's configured
+    notification channel — delivers status pings to the channel and never wakes
+    the creating DM."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board-channel-route.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="tolaria migration",
+            assignee="worker",
+            session_id="agent:main:discord:dm:dm-123",  # creating DM provenance
+        )
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="board-channel-1",
+            chat_type="channel",
+            delivery_mode="notify",
+            delivery_metadata={"guild_id": "guild-1"},
+        )
+        kb.block_task(conn, tid, reason="needs attention")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "board-channel-1", (
+        "the passive ping must land on the board channel, not the creating DM"
+    )
+    assert tid in adapter.sent[0]["text"]
+    assert adapter.handled == [], (
+        "a routed board-channel subscription must not wake the origin DM"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Card-created notices (any create, incl. triage / todo-with-unsatisfied-parents):
+# the ``created`` event is claimed ONLY by channel-shaped subscriptions — the
+# routed board channel the create paths write and arm — so the board hears what
+# just entered it while DM/TUI origins stay silent. Never a wake.
+# ---------------------------------------------------------------------------
+
+
+def _armed_channel_sub(conn, tid, *, platform="telegram", chat_id="board-channel-1"):
+    """The exact shape the create paths write for a routed board, plus the
+    created-notice arming (kanban_db_notify.arm_created_notice_for_new_sub)."""
+    kbn.add_notify_sub(
+        conn, task_id=tid, platform=platform, chat_id=chat_id,
+        chat_type="channel", delivery_mode="notify",
+        delivery_metadata={"guild_id": "guild-1"},
+    )
+    kbn.arm_created_notice_for_new_sub(
+        conn, task_id=tid, platform=platform, chat_id=chat_id)
+
+
+def _created_event_id(tid):
+    conn = kbc.connect()
+    try:
+        return next(e.id for e in kb.list_events(conn, tid) if e.kind == "created")
+    finally:
+        conn.close()
+
+
+def test_created_event_announces_card_to_board_channel(tmp_path, monkeypatch):
+    """A plain create pings the board channel with board, card id, title,
+    assignee and creator — and never wakes anything."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "created-notice.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="fresh card", assignee="worker", created_by="zach")
+        _armed_channel_sub(conn, tid)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "fresh card" in text
+    assert "zach" in text, "the creating profile must be named"
+    assert "[default]" in text, "the board must be named"
+    assert "@worker" in text, "the assignee must be named"
+    assert adapter.handled == [], "card-created notices are passive pings, never wakes"
+
+
+def test_triage_create_notifies_board_channel(tmp_path, monkeypatch):
+    """initial_status triage creates announce too — triage is a create, not a
+    lifecycle transition."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "created-triage.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="triage card", assignee="worker", triage=True)
+        assert kb.get_task(conn, tid).status == "triage"
+        _armed_channel_sub(conn, tid)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "triage card" in adapter.sent[0]["text"]
+    assert adapter.handled == []
+
+
+def test_creation_batch_delivers_only_the_created_notice(tmp_path, monkeypatch):
+    """Sibling creation-time events stay silent: a todo card parked behind an
+    open parent (created + dependency_wait) and a card created with
+    initial_status=blocked (created + blocked) each deliver exactly the created
+    notice, with the cursor advanced past every creation-time event."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "created-siblings.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        parent_tid = kb.create_task(conn, title="open parent", assignee="worker")
+        todo_tid = kb.create_task(
+            conn, title="gated card", assignee="worker", parents=(parent_tid,))
+        assert kb.get_task(conn, todo_tid).status == "todo"
+        blocked_tid = kb.create_task(
+            conn, title="parked card", assignee="worker", initial_status="blocked")
+        _armed_channel_sub(conn, todo_tid)
+        _armed_channel_sub(conn, blocked_tid)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 2, adapter.sent
+    by_title = {("gated card" in d["text"], "parked card" in d["text"]) for d in adapter.sent}
+    assert by_title == {(True, False), (False, True)}, adapter.sent
+    parked = next(d["text"] for d in adapter.sent if "parked card" in d["text"])
+    assert "created" in parked
+    # The blocked sibling rode the creation batch silently (no second ping, no
+    # wake); the cursor still advanced past every creation-time event.
+    assert "blocked" not in parked
+    conn = kbc.connect()
+    try:
+        cursor_by_task = {
+            s["task_id"]: s["last_event_id"] for s in kbn.list_notify_subs(conn)}
+        for tid in (todo_tid, blocked_tid):
+            created_id = next(e.id for e in kb.list_events(conn, tid) if e.kind == "created")
+            # The created notice was consumed: the cursor is at/above it, so it
+            # can never replay. (Kind-filtered bookkeeping events like
+            # dependency_wait legitimately stay below the cursor.)
+            assert cursor_by_task[tid] >= created_id
+    finally:
+        conn.close()
+    assert adapter.handled == []
+
+
+def test_created_event_is_skipped_for_dm_subscriptions(tmp_path, monkeypatch):
+    """A board without a configured channel keeps its DM-shaped origin sub, and a
+    DM-shaped sub never claims the created event: the creation passes silently,
+    while later lifecycle events still notify as before."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "created-dm-skip.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="quiet dm", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="dm-1")
+        # Even armed, a DM-shaped sub must not announce creations.
+        kbn.arm_created_notice_for_new_sub(
+            conn, task_id=tid, platform="telegram", chat_id="dm-1")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == [], "DM origins must not receive card-created notices"
+
+    conn = kbc.connect()
+    try:
+        kb.complete_task(conn, tid, summary="still works")
+    finally:
+        conn.close()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1, "lifecycle notifications keep their behavior"
+    assert "still works" in adapter.sent[0]["text"]
+
+
+def test_dm_created_card_announces_on_board_channel_never_wakes_dm(tmp_path, monkeypatch):
+    """A DM-origin create on a routed board announces the card on the board
+    channel; the creating DM gets nothing and is never woken."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "created-dm-origin.db"))
+    kb.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="dm-origin card", assignee="worker",
+            session_id="agent:main:discord:dm:dm-123",
+        )
+        _armed_channel_sub(conn, tid, platform="discord", chat_id="board-channel-1")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "board-channel-1"
+    assert tid in adapter.sent[0]["text"]
+    assert adapter.sent[0]["metadata"].get("guild_id") == "guild-1"
+    assert adapter.handled == [], "the creating DM must not be woken by the created notice"

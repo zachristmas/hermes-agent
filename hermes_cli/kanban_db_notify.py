@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -434,6 +435,47 @@ def rewind_notify_cursor(
     with _kb.write_txn(conn):
         cur = _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), old_cursor, claimed_cursor)
     return cur.rowcount > 0
+
+
+logger = logging.getLogger(__name__)
+
+
+def arm_created_notice_for_new_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> None:
+    """Point a JUST-INSERTED subscription just below the task's ``created`` event.
+
+    ``add_notify_sub`` starts rows caught up (``last_event_id`` =
+    ``MAX(task_events.id)``) so the notifier never replays history at boot — but
+    that also skips the ``created`` event ``create_task`` appended moments before
+    the create paths subscribed. Card-created notices (claimed only by
+    channel-shaped subscriptions, see the notifier's kinds gate) rely on this
+    rewind: ``kanban_create`` and the ``/kanban create`` slash auto-subscribe call
+    it right after inserting the routed board-channel row, so the next notifier
+    tick delivers the card-created notice.
+
+    Callers must invoke this only on a row the same create call inserted — the
+    duplicate-create paths early-return before subscribing, so an idempotent
+    re-create (``idempotency_key`` returning an existing card) never re-arms an
+    already-claimed row into replaying its creation notice. Best-effort:
+    bookkeeping must never fail the create, so failures are logged and swallowed.
+    """
+    try:
+        created = next((e for e in _kb.list_events(conn, task_id) if e.kind == "created"), None)
+        if created is None:
+            return
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = ? " + _SUB_KEY_WHERE,
+                (int(created.id) - 1, *_sub_key(task_id, platform, chat_id, thread_id)),
+            )
+    except Exception as exc:
+        logger.debug("kanban create: could not arm created notice for %s: %s", task_id, exc)
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
