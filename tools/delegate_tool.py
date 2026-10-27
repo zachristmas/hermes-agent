@@ -644,6 +644,7 @@ _DESCRIPTION_HEAD = (
     "While children run, `action` (list/steer/stop) controls them live.\n\n"
     "USE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams.\n"
     "DO NOT USE FOR (use these instead):\n"
+    "- Coding or long-running implementation work on a project -> Herdr dispatch (the herdr-dispatch skill / `herdr` CLI): spawn a named worker pane there instead of a subagent; delegate_task is for quick bounded subtasks only.\n"
     "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
     "- A single tool call -> call the tool directly\n"
     "- Tasks needing user interaction -> subagents cannot ask questions\n"
